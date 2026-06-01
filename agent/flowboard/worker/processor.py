@@ -648,6 +648,101 @@ async def _handle_gen_video_omni(params: dict) -> tuple[dict, Optional[str]]:
     )
 
 
+# ── Comic pipeline — Node 1: Import & Extract Panels ──────────────────────────
+# Pure-local CPU work (OpenCV XY-cut) — does NOT touch the Flow bridge. Each
+# detected panel crop is planted in the media cache as a local asset so the
+# downstream comic nodes (clean / enhance) can read its bytes and send them
+# through the bridge wrapper. The node result is shaped for the frontend to
+# patch into Node.data.panels (same contract as gen_image: handler returns,
+# frontend persists).
+
+async def _handle_extract_panels(params: dict) -> tuple[dict, Optional[str]]:
+    import uuid
+
+    from flowboard.services.comic import panels as panel_svc
+
+    folder = params.get("folder")
+    if not isinstance(folder, str) or not folder.strip():
+        return {}, "missing_folder"
+    # Strip surrounding whitespace + quotes — pasting a path from Finder /
+    # a shell often wraps it in single/double quotes, which would otherwise
+    # make it "not a directory".
+    folder = folder.strip().strip("'\"").strip()
+    debug = bool(params.get("debug"))
+    detector = params.get("detector") or "heuristic"
+    if detector not in ("heuristic", "ml", "auto"):
+        return {}, f"invalid_detector:{detector}"
+
+    try:
+        # extract_folder is CPU-bound (and ML detection is even heavier); keep
+        # the single-consumer worker loop responsive by running it off-thread.
+        page_results = await asyncio.to_thread(
+            panel_svc.extract_folder, folder, debug=debug, detector=detector
+        )
+    except (NotADirectoryError, FileNotFoundError) as exc:
+        return {}, str(exc)[:200]
+    except Exception as exc:  # noqa: BLE001
+        # MLUnavailable (detector="ml" without the optional deps) lands here —
+        # surface a clear, actionable message instead of a generic failure.
+        from flowboard.services.comic.panel_ml import MLUnavailable
+        if isinstance(exc, MLUnavailable):
+            return {}, f"ml_unavailable: {str(exc)[:160]}"
+        logger.exception("extract_panels failed for %s", folder)
+        return {}, f"extract_failed: {str(exc)[:160]}"
+
+    node_id = params.get("__node_id")
+    panels_out: list[dict] = []
+    pages_out: list[dict] = []
+    global_idx = 0
+    for pr in page_results:
+        debug_media_id: Optional[str] = None
+        if pr.overview_png:
+            debug_media_id = str(uuid.uuid4())
+            media_service.ingest_inline_bytes(
+                debug_media_id, pr.overview_png, kind="image", mime="image/png"
+            )
+        for crop in pr.panels:
+            media_id = str(uuid.uuid4())
+            ok = media_service.ingest_inline_bytes(
+                media_id, crop.png_bytes, kind="image", mime="image/png"
+            )
+            if not ok:
+                logger.warning("extract_panels: failed to cache crop %s/%d", crop.page_name, crop.panel_index)
+                continue
+            x, y, w, h = crop.box
+            panels_out.append({
+                "idx": global_idx,
+                "pageIndex": crop.page_index,
+                "pageName": crop.page_name,
+                "panelIndex": crop.panel_index,
+                "box": {"x": x, "y": y, "w": w, "h": h},
+                "mediaId": media_id,
+                "status": "extracted",
+            })
+            global_idx += 1
+        pages_out.append({
+            "pageIndex": pr.page_index,
+            "pageName": pr.page_name,
+            "panelCount": pr.panel_count,
+            "debugMediaId": debug_media_id,
+            "error": pr.error,
+        })
+
+    result = {
+        "panels": panels_out,
+        "pages": pages_out,
+        "page_count": len(page_results),
+        "panel_count": len(panels_out),
+        "detector": detector,
+        "node_id": node_id,
+    }
+    logger.info(
+        "extract_panels: %d page(s) → %d panel(s) from %s",
+        result["page_count"], result["panel_count"], folder,
+    )
+    return result, None
+
+
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
     "create_project": _handle_create_project,
@@ -655,6 +750,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "gen_video": _handle_gen_video,
     "gen_video_omni": _handle_gen_video_omni,
     "edit_image": _handle_edit_image,
+    "extract_panels": _handle_extract_panels,
 }
 
 

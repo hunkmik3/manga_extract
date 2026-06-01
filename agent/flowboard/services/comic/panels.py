@@ -1,0 +1,288 @@
+"""Node 1 — Import & Extract Panels (pure OpenCV XY-cut, no ML model).
+
+Loads every page image in a folder (sorted by filename) and splits each page
+into panels using a projection-profile / XY-cut: find horizontal content bands
+separated by white gutters, then within each band find vertical content
+columns. Works well on pages with clear white gutters; irregular / borderless
+layouts are left as a future hook for a learned detector (YOLO) — see the
+brief. The core ``content_runs`` / ``merge_close`` / ``detect_panels`` are the
+exact algorithm validated on real comic pages.
+
+This module is **pure** (no DB, no Flow, no network): it returns plain Python
+data + encoded PNG bytes so it can be unit-tested in isolation. The worker
+handler (``worker/processor._handle_extract_panels``) is what persists crops
+into the media cache and shapes the node result.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Read order matters → keep filename-sorted. Matches the brief's allowed set.
+PAGE_EXTS = (".webp", ".png", ".jpg", ".jpeg", ".bmp")
+
+Box = tuple[int, int, int, int]  # (x, y, w, h) in source-page pixels
+
+
+# ── XY-cut core (verbatim algorithm from the brief) ──────────────────────────
+
+def content_runs(empty_mask: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    """Return [(start, end)] of runs that HAVE content, dropping runs shorter
+    than ``min_len``."""
+    idx = np.where(~empty_mask)[0]
+    if len(idx) == 0:
+        return []
+    splits = np.where(np.diff(idx) > 1)[0]
+    groups = np.split(idx, splits + 1)
+    return [(int(g[0]), int(g[-1])) for g in groups if (g[-1] - g[0]) >= min_len]
+
+
+def merge_close(runs: list[tuple[int, int]], min_gap: int) -> list[tuple[int, int]]:
+    """Merge adjacent runs separated by less than ``min_gap`` (avoids a thin
+    white streak splitting one panel in two)."""
+    if not runs:
+        return runs
+    merged = [list(runs[0])]
+    for s, e in runs[1:]:
+        if s - merged[-1][1] < min_gap:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [tuple(m) for m in merged]
+
+
+_MAX_DEPTH = 12  # safety stop for the recursion
+
+# A gutter line is a full-span row/col that is almost entirely ONE flat colour —
+# near-white OR near-black. Detecting both makes the cut work whether the book
+# uses white or black gutters, and (unlike a corner-sampled background) it keeps
+# working when panels bleed into the page corners. Filled, coloured panel
+# content is neither near-white nor near-black, so it reads as content.
+GUTTER_WHITE = 230
+GUTTER_BLACK = 25
+GUTTER_UNIFORM_FRAC = 0.98
+
+
+def _separator_lines(
+    gray_region: np.ndarray, axis: int, white_thr: int, black_thr: int, uniform_frac: float
+) -> np.ndarray:
+    """Boolean per-line mask: True = a uniform near-white/near-black gutter line."""
+    white = gray_region >= white_thr
+    black = gray_region <= black_thr
+    if axis == 0:
+        wf = white.mean(axis=1)
+        bf = black.mean(axis=1)
+    else:
+        wf = white.mean(axis=0)
+        bf = black.mean(axis=0)
+    return (wf >= uniform_frac) | (bf >= uniform_frac)
+
+
+def _split_axis(
+    gray_region: np.ndarray, axis: int, min_run: int, min_gap: int,
+    white_thr: int, black_thr: int, uniform_frac: float,
+) -> list[tuple[int, int]]:
+    """Content runs along `axis` (0 = rows / vertical bands, 1 = cols), i.e. the
+    spans *between* gutter lines."""
+    sep = _separator_lines(gray_region, axis, white_thr, black_thr, uniform_frac)
+    return merge_close(content_runs(sep, min_run), min_gap)
+
+
+def _content_bbox(
+    gray_region: np.ndarray, ox: int, oy: int, white_thr: int, black_thr: int, uniform_frac: float
+) -> Optional[Box]:
+    """Tighten a leaf region to the rows/cols that aren't pure gutter."""
+    row_sep = _separator_lines(gray_region, 0, white_thr, black_thr, uniform_frac)
+    col_sep = _separator_lines(gray_region, 1, white_thr, black_thr, uniform_frac)
+    rows = np.where(~row_sep)[0]
+    cols = np.where(~col_sep)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    y0, y1 = int(rows[0]), int(rows[-1])
+    x0, x1 = int(cols[0]), int(cols[-1])
+    return (ox + x0, oy + y0, x1 - x0 + 1, y1 - y0 + 1)
+
+
+def _xy_cut(
+    gray_region: np.ndarray, ox: int, oy: int, prefer_axis: int,
+    H0: int, W0: int, min_run_frac: float, min_gap_frac: float,
+    white_thr: int, black_thr: int, uniform_frac: float,
+    out: list[Box], depth: int = 0,
+) -> None:
+    """Recursive XY-cut. Try to split the region on the preferred axis, then the
+    other; if either yields >1 content segment (separated by gutter lines),
+    recurse each segment with the axes swapped. When neither axis splits, emit
+    the region's tight content box as a leaf panel. Filled panels never
+    over-split; full-bleed pages with no gutters stay a single panel."""
+    h, w = gray_region.shape
+    if depth <= _MAX_DEPTH and h > 1 and w > 1:
+        for axis in (prefer_axis, 1 - prefer_axis):
+            dim = H0 if axis == 0 else W0
+            segs = _split_axis(
+                gray_region, axis, int(min_run_frac * dim), max(1, int(min_gap_frac * dim)),
+                white_thr, black_thr, uniform_frac,
+            )
+            if len(segs) > 1:
+                for s, e in segs:
+                    if axis == 0:
+                        _xy_cut(gray_region[s:e + 1, :], ox, oy + s, 1 - axis, H0, W0,
+                                min_run_frac, min_gap_frac, white_thr, black_thr, uniform_frac,
+                                out, depth + 1)
+                    else:
+                        _xy_cut(gray_region[:, s:e + 1], ox + s, oy, 1 - axis, H0, W0,
+                                min_run_frac, min_gap_frac, white_thr, black_thr, uniform_frac,
+                                out, depth + 1)
+                return
+    box = _content_bbox(gray_region, ox, oy, white_thr, black_thr, uniform_frac)
+    if box is not None:
+        out.append(box)
+
+
+def detect_panels(
+    gray: np.ndarray,
+    min_run_frac: float = 0.03,
+    min_gap_frac: float = 0.004,
+    white_thr: int = GUTTER_WHITE,
+    black_thr: int = GUTTER_BLACK,
+    uniform_frac: float = GUTTER_UNIFORM_FRAC,
+) -> list[Box]:
+    """Return [(x, y, w, h)] panel boxes, sorted top→bottom, left→right.
+
+    Recursive XY-cut whose gutters are detected as uniform near-white/near-black
+    full-span lines — handles white-gutter manga, black-gutter manhwa/webtoon,
+    and staggered (non-grid) layouts. Full-bleed / borderless art has no gutters
+    to cut on (stays one panel) and is the future YOLO hook (see brief)."""
+    H, W = gray.shape
+    out: list[Box] = []
+    _xy_cut(gray, 0, 0, 0, H, W, min_run_frac, min_gap_frac, white_thr, black_thr, uniform_frac, out)
+    out.sort(key=lambda b: (round(b[1] / (0.08 * H)), b[0]))
+    return out
+
+
+# ── Folder / page helpers ────────────────────────────────────────────────────
+
+def iter_page_paths(folder: str | Path) -> list[Path]:
+    """All supported page images in ``folder``, sorted by filename (the read
+    order). Non-recursive — one flat folder of pages, as the brief specifies."""
+    root = Path(folder)
+    if not root.is_dir():
+        raise NotADirectoryError(f"not a directory: {folder}")
+    paths = [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in PAGE_EXTS]
+    return sorted(paths, key=lambda p: p.name)
+
+
+def load_bgr(path: str | Path) -> np.ndarray:
+    """Load an image as BGR (cv2 reads .webp/.png/.jpg/.bmp natively)."""
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"could not read image: {path}")
+    return img
+
+
+def encode_png(bgr: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", bgr)
+    if not ok:
+        raise ValueError("PNG encode failed")
+    return buf.tobytes()
+
+
+def draw_overview(bgr: np.ndarray, boxes: list[Box]) -> np.ndarray:
+    """Copy of the page with numbered panel boxes drawn — the QA debug flag."""
+    out = bgr.copy()
+    for i, (x, y, w, h) in enumerate(boxes):
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 3)
+        cv2.putText(out, str(i + 1), (x + 6, y + 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (0, 0, 255), 2, cv2.LINE_AA)
+    return out
+
+
+# ── Structured results ───────────────────────────────────────────────────────
+
+@dataclass
+class PanelCrop:
+    page_index: int          # 0-based page order within the folder
+    page_name: str           # source filename
+    panel_index: int         # 0-based panel order within the page
+    box: Box                 # (x, y, w, h) in source-page pixels
+    png_bytes: bytes = field(repr=False)
+
+
+@dataclass
+class PageResult:
+    page_index: int
+    page_name: str
+    panel_count: int
+    panels: list[PanelCrop]
+    overview_png: Optional[bytes] = field(default=None, repr=False)
+    error: Optional[str] = None
+
+
+def detect_boxes(bgr: np.ndarray, detector: str = "heuristic") -> list[Box]:
+    """Detect panel boxes on a BGR page with the chosen backend:
+
+      * ``"heuristic"`` — pure-OpenCV XY-cut (default; no heavy deps).
+      * ``"ml"``        — YOLO frame detector (raises if the optional ML deps
+                          aren't installed).
+      * ``"auto"``      — run both and keep whichever finds more panels; falls
+                          back to heuristic if the ML backend is unavailable.
+                          Best aggregate quality (rescues dense/borderless pages
+                          the heuristic collapses to one panel).
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    if detector == "heuristic":
+        return detect_panels(gray)
+
+    from flowboard.services.comic import panel_ml
+
+    if detector == "ml":
+        return panel_ml.detect_panels_ml(bgr)
+    if detector == "auto":
+        heur = detect_panels(gray)
+        try:
+            ml = panel_ml.detect_panels_ml(bgr)
+        except panel_ml.MLUnavailable as exc:
+            logger.info("auto detector: ML unavailable, using heuristic (%s)", exc)
+            return heur
+        return ml if len(ml) > len(heur) else heur
+    raise ValueError(f"unknown detector: {detector!r}")
+
+
+def extract_page(
+    path: str | Path, page_index: int, *, debug: bool = False, detector: str = "heuristic"
+) -> PageResult:
+    """Split one page into panel crops. Never raises on a bad page — records the
+    error on the PageResult so a batch keeps going."""
+    name = Path(path).name
+    try:
+        bgr = load_bgr(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("extract_page: cannot read %s: %s", name, exc)
+        return PageResult(page_index, name, 0, [], error=str(exc)[:200])
+
+    boxes = detect_boxes(bgr, detector)
+    crops: list[PanelCrop] = []
+    for j, (x, y, w, h) in enumerate(boxes):
+        crop = bgr[y:y + h, x:x + w]
+        crops.append(PanelCrop(page_index, name, j, (x, y, w, h), encode_png(crop)))
+    overview = draw_overview(bgr, boxes) if debug else None
+    return PageResult(
+        page_index, name, len(crops), crops,
+        overview_png=encode_png(overview) if overview is not None else None,
+    )
+
+
+def extract_folder(
+    folder: str | Path, *, debug: bool = False, detector: str = "heuristic"
+) -> list[PageResult]:
+    """Extract panels from every page in ``folder`` (filename order)."""
+    pages = iter_page_paths(folder)
+    if not pages:
+        raise FileNotFoundError(f"no page images ({', '.join(PAGE_EXTS)}) in {folder}")
+    return [extract_page(p, i, debug=debug, detector=detector) for i, p in enumerate(pages)]

@@ -11,6 +11,9 @@ dependencies = [
     "websockets>=12.0",
     "python-multipart>=0.0.9",
     "httpx>=0.27",
+    # Comic pipeline — Node 1 panel extraction (pure OpenCV XY-cut, no model).
+    "opencv-python-headless>=4.9",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
@@ -18,6 +21,13 @@ dev = [
     "ruff>=0.6",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+]
+# Optional ML panel detector (Node 1, YOLO). Heavy — install only if you want
+# the learned detector for dense/borderless pages the heuristic can't cut.
+ml = [
+    "torch>=2.2",
+    "ultralytics>=8.3",
+    "huggingface_hub>=0.20",
 ]
 
 [build-system]

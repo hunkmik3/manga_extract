@@ -28,6 +28,7 @@ const nodeTypes = {
   note: NodeCard,
   visual_asset: NodeCard,
   Storyboard: NodeCard,
+  comic_import: NodeCard,
 };
 
 // Single edge type used for everything — VariantEdge renders the

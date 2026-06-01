@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import time
 import uuid
@@ -31,9 +32,15 @@ logger = logging.getLogger(__name__)
 
 
 # Google Flow's public API key — appears verbatim in every aisandbox-pa
-# request URL Flow web emits. Not a secret; documented here so we don't
-# need to plumb it through from the extension on every call.
-_FLOW_API_KEY = "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY"
+# request URL Flow web emits. It is a public client key (not a private
+# secret), but it's loaded from the FLOWBOARD_FLOW_API_KEY env var (see
+# .env / .env.example) so it isn't committed to the repo.
+_FLOW_API_KEY = os.getenv("FLOWBOARD_FLOW_API_KEY", "")
+if not _FLOW_API_KEY:
+    logger.warning(
+        "FLOWBOARD_FLOW_API_KEY is not set — Flow credits/paygate calls will fail. "
+        "Copy .env.example to .env and set it (see README)."
+    )
 _FLOW_CREDITS_URL = "https://aisandbox-pa.googleapis.com/v1/credits"
 # Minimum gap between paygate-tier refreshes when the same Bearer token
 # is re-delivered. Tier rarely changes; 60 s is fine for AccountPanel

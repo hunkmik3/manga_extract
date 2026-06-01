@@ -21,6 +21,10 @@ NodeType = Literal[
     # `image` for storage / dispatch — see frontend/src/lib/storyboardPrompt.ts
     # for the template that drives gen_image.
     "Storyboard",
+    # Comic pipeline nodes. Backend stores them generically (data JSON); their
+    # behavior lives in the worker tasks (extract_panels / edit_image) + the
+    # frontend NodeCard. comic_import = Node 1 (folder → panels via XY-cut).
+    "comic_import",
 ]
 NodeStatus = Literal["idle", "queued", "running", "done", "error"]
 

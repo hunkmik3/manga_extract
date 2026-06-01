@@ -110,7 +110,7 @@ export function getHealth() {
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
-export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard";
+export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard" | "comic_import";
 export type NodeStatus = "idle" | "queued" | "running" | "done" | "error";
 
 export interface Board {
@@ -420,6 +420,28 @@ export function createRequest(body: {
 
 export function getRequest(id: number) {
   return api<RequestDTO>(`/api/requests/${id}`);
+}
+
+/**
+ * Upload a set of comic page images (typically a whole folder picked via
+ * <input webkitdirectory>) and kick off panel extraction on the server.
+ * Returns the queued extract_panels request, polled like any other.
+ */
+export async function uploadComicPages(
+  files: File[],
+  opts: { nodeId?: number; debug?: boolean; detector?: string } = {},
+): Promise<RequestDTO> {
+  const form = new FormData();
+  if (opts.nodeId !== undefined) form.append("node_id", String(opts.nodeId));
+  form.append("debug", opts.debug ? "true" : "false");
+  form.append("detector", opts.detector ?? "heuristic");
+  for (const f of files) form.append("files", f);
+
+  const res = await fetch("/api/comic/upload-pages", { method: "POST", body: form });
+  if (!res.ok) {
+    throw new Error(await extractErrorMessage(res));
+  }
+  return res.json() as Promise<RequestDTO>;
 }
 
 // ── Plans + Pipeline runs ────────────────────────────────────────────────────

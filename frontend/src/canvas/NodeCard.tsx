@@ -9,6 +9,7 @@ import {
   normaliseStoryboardGrid,
   resolveStoryboardLayout,
 } from "../lib/storyboardPrompt";
+import { ComicImportBody } from "./ComicImportBody";
 
 const ICON: Record<string, string> = {
   character: "◎",
@@ -17,6 +18,7 @@ const ICON: Record<string, string> = {
   prompt: "✦",
   note: "✎",
   visual_asset: "◇",
+  comic_import: "▤",
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -1469,6 +1471,8 @@ function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
       return <VisualAssetBody rfId={rfId} data={data} />;
     case "Storyboard":
       return <StoryboardBody rfId={rfId} data={data} />;
+    case "comic_import":
+      return <ComicImportBody rfId={rfId} data={data} />;
   }
 }
 
