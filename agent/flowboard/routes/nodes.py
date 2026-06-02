@@ -31,6 +31,8 @@ NodeType = Literal[
     "comic_import",
     "comic_page",
     "comic_panel",
+    "comic_clean",    # Phase 4 — remove text/bubbles (+ optional 9:16) via bridge
+    "comic_enhance",  # Phase 5 — re-render as anime via bridge
     "comic_detect",
     "comic_panels",
 ]

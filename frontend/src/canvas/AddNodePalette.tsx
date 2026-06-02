@@ -14,6 +14,8 @@ interface Chip {
 // manhwa → panel extraction workflow.
 const CHIPS: Chip[] = [
   { type: "comic_import", icon: "▤", label: "Comic upload" },
+  { type: "comic_clean", icon: "✂", label: "Comic clean" },
+  { type: "comic_enhance", icon: "✧", label: "Comic enhance" },
 ];
 
 export function AddNodePalette() {

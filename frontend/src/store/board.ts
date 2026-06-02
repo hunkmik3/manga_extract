@@ -145,6 +145,8 @@ const TYPE_TITLE: Record<NodeType, string> = {
   comic_import: "Comic upload",
   comic_page: "Comic page",
   comic_panel: "Comic panel",
+  comic_clean: "Comic clean",
+  comic_enhance: "Comic enhance",
   comic_detect: "Comic detect",
   comic_panels: "Comic panels",
 };

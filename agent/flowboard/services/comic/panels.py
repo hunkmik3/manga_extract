@@ -194,6 +194,29 @@ def decode_bgr(data: bytes) -> np.ndarray:
     return img
 
 
+def pad_to_aspect(bgr: np.ndarray, w_ratio: int = 9, h_ratio: int = 16, *, mode: str = "constant") -> np.ndarray:
+    """Pad the image to an exact w:h aspect (default 9:16).
+
+    ``mode="constant"`` → black bars (a safety letterbox to guarantee the frame).
+    ``mode="replicate"`` → stretch edge pixels into the new area, a better seed
+    for the model to *outpaint* over than flat bars (used to pre-pad the canvas
+    before the 9:16 generate-extend step)."""
+    H, W = bgr.shape[:2]
+    target = w_ratio / h_ratio
+    cur = W / H
+    if abs(cur - target) < 0.02 * target:
+        return bgr
+    border = cv2.BORDER_REPLICATE if mode == "replicate" else cv2.BORDER_CONSTANT
+    kw = {} if mode == "replicate" else {"value": (0, 0, 0)}
+    if cur > target:  # too wide → grow height (top/bottom)
+        new_h = int(round(W / target))
+        pad = max(0, new_h - H)
+        return cv2.copyMakeBorder(bgr, pad // 2, pad - pad // 2, 0, 0, border, **kw)
+    new_w = int(round(H * target))  # too tall → grow width (left/right)
+    pad = max(0, new_w - W)
+    return cv2.copyMakeBorder(bgr, 0, 0, pad // 2, pad - pad // 2, border, **kw)
+
+
 def encode_png(bgr: np.ndarray) -> bytes:
     ok, buf = cv2.imencode(".png", bgr)
     if not ok:

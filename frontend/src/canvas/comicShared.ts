@@ -136,6 +136,45 @@ export function nodePosition(rfId: string): { x: number; y: number } {
   return n ? { x: n.position.x, y: n.position.y } : { x: 0, y: 0 };
 }
 
+/** Resolve the image feeding `rfId` from its single upstream node, as input
+ * for the bridge clean/enhance tasks: a comic_panel → (its page image + box),
+ * any node with a result mediaId (e.g. a clean node) → that media. */
+export interface UpstreamImage {
+  sourceMediaId?: string;
+  pageMediaId?: string;
+  box?: BoxItem;
+  label?: string;
+}
+export function resolveUpstreamImage(rfId: string): UpstreamImage | null {
+  const { nodes, edges } = useBoardStore.getState();
+  for (const e of edges) {
+    if (e.target !== rfId) continue;
+    const src = nodes.find((n) => n.id === e.source);
+    if (!src) continue;
+    const d = src.data;
+    if (d.type === "comic_panel") {
+      const pageMediaId = d.pageMediaId as string | undefined;
+      const boxId = d.boxId as string | undefined;
+      const pageNodeId = d.pageNodeId as string | undefined;
+      if (pageMediaId && boxId && pageNodeId) {
+        const pageNode = nodes.find((n) => n.id === pageNodeId);
+        const box = ((pageNode?.data.boxes as BoxItem[]) ?? []).find((b) => b.id === boxId);
+        if (box) return { pageMediaId, box, label: `${d.pageName ?? ""} #${((d.panelIndex as number) ?? 0) + 1}` };
+      }
+    }
+    if (typeof d.mediaId === "string" && d.mediaId) {
+      // carry the originating page (stored by the clean node) so enhance can
+      // still pass it as a consistency reference
+      return {
+        sourceMediaId: d.mediaId,
+        pageMediaId: typeof d.pageMediaId === "string" ? d.pageMediaId : undefined,
+        label: (d.title as string) ?? "image",
+      };
+    }
+  }
+  return null;
+}
+
 export interface DownstreamPage {
   dbId: number;
   data: FlowboardNodeData;

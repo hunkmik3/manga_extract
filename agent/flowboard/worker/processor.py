@@ -917,6 +917,164 @@ async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
     return result, None
 
 
+# ── Comic pipeline — Phase 4/5: Clean (9:16) + Enhance anime via Flow bridge ──
+# These call services.comic.bridge.edit_image (upload → Nano Banana Pro edit →
+# fetch) directly — NOT through this queue — so running inside a worker handler
+# is fine. Source bytes come from either an upstream image media_id, or a
+# (page_media_id + box) pair cropped on the fly (comic_panel is reference-only).
+
+def _source_image_bytes(params: dict) -> Optional[bytes]:
+    from flowboard.services.comic import panels as panel_svc
+
+    src = params.get("source_media_id")
+    if isinstance(src, str) and src:
+        p = media_service.cached_path(src)
+        if p is not None:
+            try:
+                return p.read_bytes()
+            except OSError:
+                return None
+    page = params.get("page_media_id")
+    box = params.get("box")
+    if isinstance(page, str) and isinstance(box, dict):
+        pp = media_service.cached_path(page)
+        if pp is None:
+            return None
+        try:
+            bgr = panel_svc.decode_bgr(pp.read_bytes())
+        except Exception:  # noqa: BLE001
+            return None
+        H, W = bgr.shape[0], bgr.shape[1]
+        x = max(0, int(box.get("x", 0)))
+        y = max(0, int(box.get("y", 0)))
+        x2 = min(W, x + int(box.get("w", 0)))
+        y2 = min(H, y + int(box.get("h", 0)))
+        if x2 > x and y2 > y:
+            return panel_svc.encode_png(bgr[y:y2, x:x2])
+    return None
+
+
+def _orientation_aspect(data: bytes) -> str:
+    from flowboard.services.comic import panels as panel_svc
+    try:
+        img = panel_svc.decode_bgr(data)
+        h, w = img.shape[0], img.shape[1]
+        return "IMAGE_ASPECT_RATIO_PORTRAIT" if h >= w else "IMAGE_ASPECT_RATIO_LANDSCAPE"
+    except Exception:  # noqa: BLE001
+        return "IMAGE_ASPECT_RATIO_LANDSCAPE"
+
+
+def _page_ref_bytes(params: dict) -> Optional[bytes]:
+    """The full source page (the panel was cropped from) — passed as a reference
+    image so the model knows the surrounding scene, character, and costume when
+    cleaning / extending / enhancing."""
+    page = params.get("page_media_id")
+    if not isinstance(page, str) or not page:
+        return None
+    p = media_service.cached_path(page)
+    if p is None:
+        return None
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
+async def _bridge_edit(
+    raw: bytes, prompt: str, *, project_id: str, aspect: str, image_model: Optional[str],
+    references: Optional[list[bytes]], pad_916: bool, node_id,
+) -> tuple[dict, Optional[str]]:
+    """Run bridge.edit_image(raw + refs, prompt) → (optional 9:16 letterbox) →
+    cache → return media_id + dims."""
+    from flowboard.services.comic import bridge, panels as panel_svc
+    import uuid
+
+    try:
+        out = await bridge.edit_image(
+            raw, prompt, reference_images=references,
+            project_id=project_id, aspect_ratio=aspect, image_model=image_model,
+        )
+    except bridge.BridgeEditError as exc:
+        return {}, f"bridge_failed: {exc.reason}"[:200]
+
+    if pad_916:
+        try:
+            out = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
+        except Exception:  # noqa: BLE001
+            pass
+
+    media_id = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(media_id, out, kind="image", mime="image/png")
+    w = h = 0
+    try:
+        img = panel_svc.decode_bgr(out)
+        h, w = int(img.shape[0]), int(img.shape[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"mediaId": media_id, "width": w, "height": h, "node_id": node_id}, None
+
+
+async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
+    from flowboard.services.comic import panels as panel_svc, prompts
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    raw = await asyncio.to_thread(_source_image_bytes, params)
+    if raw is None:
+        return {}, "no_source_image"
+    page_ref = await asyncio.to_thread(_page_ref_bytes, params)
+    refs = [page_ref] if page_ref else None
+    image_model = params.get("image_model")
+    image_model = image_model if isinstance(image_model, str) and image_model else None
+    extend = bool(params.get("extend_916"))
+
+    prompt = prompts.CLEAN_PROMPT
+    if extend:
+        prompt += prompts.EXTEND_9_16
+    if refs:
+        prompt += prompts.REFERENCE_CLAUSE
+
+    if extend:
+        # Pre-pad the cleaned panel's canvas to 9:16 (edge-replicated seed) so
+        # the model has empty-but-primed regions to OUTPAINT into, instead of
+        # returning flat bars. The page reference gives it the scene to extend.
+        try:
+            raw = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(raw), 9, 16, mode="replicate"))
+        except Exception:  # noqa: BLE001
+            pass
+        aspect = "IMAGE_ASPECT_RATIO_PORTRAIT"
+    else:
+        aspect = _orientation_aspect(raw)
+
+    return await _bridge_edit(
+        raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
+        references=refs, pad_916=extend, node_id=params.get("__node_id"),
+    )
+
+
+async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
+    from flowboard.services.comic import prompts
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    raw = await asyncio.to_thread(_source_image_bytes, params)
+    if raw is None:
+        return {}, "no_source_image"
+    page_ref = await asyncio.to_thread(_page_ref_bytes, params)
+    refs = [page_ref] if page_ref else None
+    image_model = params.get("image_model")
+    image_model = image_model if isinstance(image_model, str) and image_model else None
+
+    prompt = prompts.ENHANCE_PROMPT + (prompts.REFERENCE_CLAUSE if refs else "")
+    aspect = _orientation_aspect(raw)
+    return await _bridge_edit(
+        raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
+        references=refs, pad_916=False, node_id=params.get("__node_id"),
+    )
+
+
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
     "create_project": _handle_create_project,
@@ -928,6 +1086,8 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "import_pages": _handle_import_pages,
     "detect_page_panels": _handle_detect_page_panels,
     "crop_panels": _handle_crop_panels,
+    "clean_panel": _handle_clean_panel,
+    "enhance_panel": _handle_enhance_panel,
 }
 
 

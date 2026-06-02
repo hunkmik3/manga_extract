@@ -33,6 +33,8 @@ const nodeTypes = {
   comic_import: NodeCard,
   comic_page: NodeCard,
   comic_panel: NodeCard,
+  comic_clean: NodeCard,
+  comic_enhance: NodeCard,
   comic_detect: NodeCard,
   comic_panels: NodeCard,
 };
