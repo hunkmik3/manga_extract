@@ -8,15 +8,12 @@ interface Chip {
   label: string;
 }
 
+// Only the comic-pipeline entry node is offered. The page/panel nodes are
+// spawned by the upload node, not added manually; the inherited flowboard
+// node types (character/image/video/…) are hidden to keep this focused on the
+// manhwa → panel extraction workflow.
 const CHIPS: Chip[] = [
-  { type: "character", icon: "◎", label: "Character" },
-  { type: "image", icon: "▣", label: "Image" },
-  { type: "Storyboard", icon: "▦", label: "Storyboard" },
-  { type: "video", icon: "▶", label: "Video" },
-  { type: "visual_asset", icon: "◇", label: "Visual asset" },
-  { type: "prompt", icon: "✦", label: "Prompt" },
-  { type: "note", icon: "✎", label: "Note" },
-  { type: "comic_import", icon: "▤", label: "Comic import" },
+  { type: "comic_import", icon: "▤", label: "Comic upload" },
 ];
 
 export function AddNodePalette() {

@@ -110,7 +110,7 @@ export function getHealth() {
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
-export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard" | "comic_import";
+export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard" | "comic_import" | "comic_page" | "comic_panel" | "comic_detect" | "comic_panels";
 export type NodeStatus = "idle" | "queued" | "running" | "done" | "error";
 
 export interface Board {
@@ -228,6 +228,28 @@ export function patchNode(
   return api<NodeDTO>(`/api/nodes/${id}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
+  });
+}
+
+export interface BulkNodeInput {
+  type: NodeType;
+  x: number;
+  y: number;
+  w?: number;
+  h?: number;
+  data?: Record<string, unknown>;
+  status?: NodeStatus;
+  source_id?: number; // create an edge from this existing node id
+}
+export interface BulkCreateResult {
+  nodes: NodeDTO[];
+  edges: EdgeDTO[];
+}
+/** Create many nodes (+ optional edges from a source node) in one request. */
+export function createNodesBulk(board_id: number, nodes: BulkNodeInput[]): Promise<BulkCreateResult> {
+  return api<BulkCreateResult>("/api/nodes/bulk", {
+    method: "POST",
+    body: JSON.stringify({ board_id, nodes }),
   });
 }
 

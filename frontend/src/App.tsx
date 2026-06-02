@@ -4,19 +4,16 @@ import { Board } from "./canvas/Board";
 import { AddNodePalette } from "./canvas/AddNodePalette";
 import { StatusBar } from "./components/StatusBar";
 import { Toolbar } from "./components/Toolbar";
-// import { ChatSidebar } from "./components/ChatSidebar";
 import { ProjectSidebar } from "./components/ProjectSidebar";
-import { ReferencesPanel } from "./components/ReferencesPanel";
 import { Toaster } from "./components/Toaster";
-import { GenerationDialog } from "./components/GenerationDialog";
-import { ResultViewer } from "./components/ResultViewer";
-import { ForcedSetupGate } from "./components/ForcedSetupGate";
 import { useBoardStore } from "./store/board";
-import { useReferencesStore } from "./store/references";
+
+// Inherited flowboard surfaces (References panel, image/video Generation dialog,
+// Result viewer, AI-provider setup gate, chat) are intentionally not rendered —
+// this build is focused on the manhwa → panel extraction workflow.
 
 export function App() {
   const loadInitialBoard = useBoardStore((s) => s.loadInitialBoard);
-  const loadReferences = useReferencesStore((s) => s.load);
   const loading = useBoardStore((s) => s.loading);
   const boardId = useBoardStore((s) => s.boardId);
   const ran = useRef(false);
@@ -25,10 +22,7 @@ export function App() {
     if (ran.current) return;
     ran.current = true;
     loadInitialBoard();
-    // Fire-and-forget: panel renders the loading state inline and the
-    // app stays usable even if references fail to hydrate.
-    void loadReferences();
-  }, [loadInitialBoard, loadReferences]);
+  }, [loadInitialBoard]);
 
   return (
     <div className="app">
@@ -45,14 +39,9 @@ export function App() {
             </>
           )}
           <StatusBar />
-          <ReferencesPanel />
         </div>
       </ReactFlowProvider>
-      {/* <ChatSidebar /> */}
       <Toaster />
-      <GenerationDialog />
-      <ResultViewer />
-      <ForcedSetupGate />
     </div>
   );
 }

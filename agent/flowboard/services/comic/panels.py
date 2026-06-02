@@ -186,6 +186,14 @@ def load_bgr(path: str | Path) -> np.ndarray:
     return img
 
 
+def decode_bgr(data: bytes) -> np.ndarray:
+    """Decode image bytes (from the media cache) to BGR."""
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("could not decode image bytes")
+    return img
+
+
 def encode_png(bgr: np.ndarray) -> bytes:
     ok, buf = cv2.imencode(".png", bgr)
     if not ok:

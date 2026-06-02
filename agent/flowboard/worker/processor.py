@@ -743,6 +743,180 @@ async def _handle_extract_panels(params: dict) -> tuple[dict, Optional[str]]:
     return result, None
 
 
+# ── Comic pipeline — 3-node split (Upload → Detect → Panels) ──────────────────
+# Node 1 (import_pages): folder → ingest each FULL page as a media asset (no
+#   splitting). Node 2 (detect_page_panels): page media → panel boxes per page
+#   (auto; the frontend lets the user hand-edit the boxes after). Node 3
+#   (crop_panels): page media + (possibly hand-edited) boxes → individual panel
+#   crops. All pure-local; no Flow bridge.
+
+_EXT_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+             ".webp": "image/webp", ".bmp": "image/bmp"}
+
+
+def _read_page_bgr(media_id: str):
+    """Decode a cached page image (ingested by import_pages) to BGR, or None."""
+    from flowboard.services.comic import panels as panel_svc
+    path = media_service.cached_path(media_id)
+    if path is None:
+        return None
+    try:
+        return panel_svc.decode_bgr(path.read_bytes())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _handle_import_pages(params: dict) -> tuple[dict, Optional[str]]:
+    """Node 1 — ingest every page in a folder as a full-page media asset."""
+    import uuid
+
+    from flowboard.services.comic import panels as panel_svc
+
+    folder = params.get("folder")
+    if not isinstance(folder, str) or not folder.strip():
+        return {}, "missing_folder"
+    folder = folder.strip().strip("'\"").strip()
+
+    try:
+        paths = await asyncio.to_thread(panel_svc.iter_page_paths, folder)
+    except NotADirectoryError as exc:
+        return {}, str(exc)[:200]
+    if not paths:
+        return {}, f"no page images in {folder}"
+
+    pages_out: list[dict] = []
+    for i, p in enumerate(paths):
+        raw = p.read_bytes()
+        mime = _EXT_MIME.get(p.suffix.lower(), "image/png")
+        media_id = str(uuid.uuid4())
+        if not media_service.ingest_inline_bytes(media_id, raw, kind="image", mime=mime):
+            logger.warning("import_pages: failed to cache %s", p.name)
+            continue
+        h = w = 0
+        try:
+            img = panel_svc.decode_bgr(raw)
+            h, w = int(img.shape[0]), int(img.shape[1])
+        except Exception:  # noqa: BLE001
+            pass
+        pages_out.append({"idx": i, "name": p.name, "mediaId": media_id, "w": w, "h": h})
+
+    result = {"pages": pages_out, "page_count": len(pages_out), "node_id": params.get("__node_id")}
+    logger.info("import_pages: %d page(s) from %s", len(pages_out), folder)
+    return result, None
+
+
+async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Node 2 — auto-detect panel boxes for each upstream page."""
+    import uuid
+
+    from flowboard.services.comic import panels as panel_svc
+
+    pages_in = params.get("pages")
+    if not isinstance(pages_in, list) or not pages_in:
+        return {}, "missing_pages"
+    detector = params.get("detector") or "heuristic"
+    if detector not in ("heuristic", "ml", "auto"):
+        return {}, f"invalid_detector:{detector}"
+
+    def _run():
+        out = []
+        total = 0
+        for pg in pages_in:
+            if not isinstance(pg, dict):
+                continue
+            mid = pg.get("mediaId")
+            bgr = _read_page_bgr(mid) if isinstance(mid, str) else None
+            boxes = []
+            err = None
+            if bgr is None:
+                err = "page_unreadable"
+            else:
+                for (x, y, w, h) in panel_svc.detect_boxes(bgr, detector):
+                    boxes.append({"id": str(uuid.uuid4()), "x": x, "y": y, "w": w, "h": h})
+            total += len(boxes)
+            out.append({
+                "idx": pg.get("idx"), "name": pg.get("name"), "mediaId": mid,
+                "w": pg.get("w") or (bgr.shape[1] if bgr is not None else 0),
+                "h": pg.get("h") or (bgr.shape[0] if bgr is not None else 0),
+                "boxes": boxes, "error": err,
+            })
+        return out, total
+
+    try:
+        pages_out, total = await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        from flowboard.services.comic.panel_ml import MLUnavailable
+        if isinstance(exc, MLUnavailable):
+            return {}, f"ml_unavailable: {str(exc)[:160]}"
+        logger.exception("detect_page_panels failed")
+        return {}, f"detect_failed: {str(exc)[:160]}"
+
+    result = {
+        "pages": pages_out, "page_count": len(pages_out), "box_count": total,
+        "detector": detector, "node_id": params.get("__node_id"),
+    }
+    logger.info("detect_page_panels: %d page(s) → %d box(es) [%s]", len(pages_out), total, detector)
+    return result, None
+
+
+async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Node 3 — crop each (possibly hand-edited) box into a panel image."""
+    import uuid
+
+    from flowboard.services.comic import panels as panel_svc
+
+    pages_in = params.get("pages")
+    if not isinstance(pages_in, list) or not pages_in:
+        return {}, "missing_pages"
+
+    def _run():
+        panels_out = []
+        gidx = 0
+        for pg in pages_in:
+            if not isinstance(pg, dict):
+                continue
+            mid = pg.get("mediaId")
+            boxes = pg.get("boxes") or []
+            if not isinstance(mid, str) or not boxes:
+                continue
+            bgr = _read_page_bgr(mid)
+            if bgr is None:
+                continue
+            H, W = bgr.shape[0], bgr.shape[1]
+            for j, b in enumerate(boxes):
+                x = max(0, int(b.get("x", 0)))
+                y = max(0, int(b.get("y", 0)))
+                w = int(b.get("w", 0))
+                h = int(b.get("h", 0))
+                x2 = min(W, x + max(1, w))
+                y2 = min(H, y + max(1, h))
+                if x2 <= x or y2 <= y:
+                    continue
+                crop = bgr[y:y2, x:x2]
+                cid = str(uuid.uuid4())
+                if not media_service.ingest_inline_bytes(
+                    cid, panel_svc.encode_png(crop), kind="image", mime="image/png"
+                ):
+                    continue
+                panels_out.append({
+                    "idx": gidx, "pageIndex": pg.get("idx"), "pageName": pg.get("name"),
+                    "panelIndex": j, "box": {"x": x, "y": y, "w": x2 - x, "h": y2 - y},
+                    "mediaId": cid, "status": "extracted",
+                })
+                gidx += 1
+        return panels_out
+
+    try:
+        panels_out = await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("crop_panels failed")
+        return {}, f"crop_failed: {str(exc)[:160]}"
+
+    result = {"panels": panels_out, "panel_count": len(panels_out), "node_id": params.get("__node_id")}
+    logger.info("crop_panels: %d panel(s)", len(panels_out))
+    return result, None
+
+
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
     "create_project": _handle_create_project,
@@ -751,6 +925,9 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "gen_video_omni": _handle_gen_video_omni,
     "edit_image": _handle_edit_image,
     "extract_panels": _handle_extract_panels,
+    "import_pages": _handle_import_pages,
+    "detect_page_panels": _handle_detect_page_panels,
+    "crop_panels": _handle_crop_panels,
 }
 
 

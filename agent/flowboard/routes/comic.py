@@ -165,12 +165,13 @@ async def upload_pages(
             detail=f"no usable page images (allowed: {', '.join(PAGE_EXTS)})",
         )
 
-    det = detector if detector in ("heuristic", "ml", "auto") else "heuristic"
+    # Node 1 only ingests the full pages; panel detection happens in Node 2.
+    # (detector/debug form fields are accepted for backward-compat but unused.)
     with get_session() as s:
         req = Request(
             node_id=node_id,
-            type="extract_panels",
-            params={"folder": str(batch_dir), "debug": bool(debug), "detector": det},
+            type="import_pages",
+            params={"folder": str(batch_dir)},
             status="queued",
         )
         s.add(req)

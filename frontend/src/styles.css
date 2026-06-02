@@ -1212,6 +1212,46 @@ button:disabled {
   transform: translateY(-1px);
 }
 
+/* Comic pipeline nodes need more room than the default 240px card. */
+.node-card:has(.node-body--comic-import),
+.node-card:has(.node-body--comic-detect),
+.node-card:has(.node-body--comic-page) {
+  width: 300px;
+}
+.node-card:has(.node-body--comic-panel) {
+  width: 160px;
+}
+
+/* Full-width text buttons inside comic node bodies (NOT the 22x22 header icon
+   button — reusing that class made the labels overlap). */
+.comic-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-high);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.comic-btn:hover {
+  background: var(--border);
+}
+.comic-btn[disabled] {
+  opacity: 0.5;
+  cursor: default;
+}
+.comic-btn--sm {
+  width: auto;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
 .node-card--selected {
   outline: 2px solid rgba(124, 92, 255, 0.8);
   outline-offset: 1px;

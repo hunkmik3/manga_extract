@@ -142,8 +142,33 @@ const TYPE_TITLE: Record<NodeType, string> = {
   note: "Note",
   visual_asset: "Visual asset",
   Storyboard: "Storyboard",
-  comic_import: "Comic import",
+  comic_import: "Comic upload",
+  comic_page: "Comic page",
+  comic_panel: "Comic panel",
+  comic_detect: "Comic detect",
+  comic_panels: "Comic panels",
 };
+
+/** Map a node DTO into ReactFlow's node shape. Spreads ALL of `data` so node
+ * types with custom fields (e.g. comic pages/boxes/panels) survive a reload —
+ * the computed fields (type/shortId/title/status) are layered on top. */
+function nodeFromDto(n: {
+  id: number; type: NodeType; x: number; y: number; short_id: string;
+  data: Record<string, unknown>; status: NodeStatus;
+}): FlowNode {
+  return {
+    id: String(n.id),
+    type: n.type,
+    position: { x: n.x, y: n.y },
+    data: {
+      ...n.data,
+      type: n.type,
+      shortId: n.short_id,
+      title: (n.data["title"] as string | undefined) ?? TYPE_TITLE[n.type],
+      status: n.status,
+    } as FlowboardNodeData,
+  };
+}
 
 // ── Persisted active-board id ─────────────────────────────────────────────
 // Survives page reloads so refreshing on project #4 doesn't kick the user
@@ -232,6 +257,12 @@ interface BoardState {
   updateEdgeData(edgeId: string, partial: Partial<FlowboardEdgeData>): void;
   setNodes(nodes: FlowNode[]): void;
   setEdges(edges: Edge[]): void;
+  /** Append bulk-created nodes + edges (DTOs from POST /api/nodes/bulk) to the
+   * canvas, mapping them through the same helpers as a board load. */
+  appendNodesBulk(
+    nodes: Array<{ id: number; type: NodeType; x: number; y: number; short_id: string; data: Record<string, unknown>; status: NodeStatus }>,
+    edges: Array<{ id: number; source_id: number; target_id: number; source_variant_idx?: number | null }>,
+  ): void;
   clearError(): void;
 }
 
@@ -261,31 +292,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
       }
       const detail = await getBoard(board.id);
 
-      const nodes: FlowNode[] = detail.nodes.map((n) => ({
-        id: String(n.id),
-        type: n.type,
-        position: { x: n.x, y: n.y },
-        data: {
-          type: n.type,
-          shortId: n.short_id,
-          title: (n.data["title"] as string | undefined) ?? TYPE_TITLE[n.type],
-          status: n.status,
-          prompt: n.data["prompt"] as string | undefined,
-          thumbnailUrl: n.data["thumbnailUrl"] as string | undefined,
-          mediaId: n.data["mediaId"] as string | undefined,
-          mediaIds: n.data["mediaIds"] as (string | null)[] | undefined,
-          slotErrors: n.data["slotErrors"] as (string | null)[] | undefined,
-          variantCount: n.data["variantCount"] as number | undefined,
-          aspectRatio: n.data["aspectRatio"] as string | undefined,
-          aiBrief: n.data["aiBrief"] as string | undefined,
-          imageModel: n.data["imageModel"] as string | undefined,
-          videoQuality: n.data["videoQuality"] as string | undefined,
-          charCountry: n.data["charCountry"] as string | undefined,
-          charVibe: n.data["charVibe"] as string | undefined,
-          charGender: n.data["charGender"] as string | undefined,
-          storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
-        },
-      }));
+      const nodes: FlowNode[] = detail.nodes.map(nodeFromDto);
 
       const edges: Edge[] = detail.edges.map(edgeFromDto);
 
@@ -317,31 +324,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const detail = await getBoard(id);
-      const nodes: FlowNode[] = detail.nodes.map((n) => ({
-        id: String(n.id),
-        type: n.type,
-        position: { x: n.x, y: n.y },
-        data: {
-          type: n.type,
-          shortId: n.short_id,
-          title: (n.data["title"] as string | undefined) ?? TYPE_TITLE[n.type],
-          status: n.status,
-          prompt: n.data["prompt"] as string | undefined,
-          thumbnailUrl: n.data["thumbnailUrl"] as string | undefined,
-          mediaId: n.data["mediaId"] as string | undefined,
-          mediaIds: n.data["mediaIds"] as (string | null)[] | undefined,
-          slotErrors: n.data["slotErrors"] as (string | null)[] | undefined,
-          variantCount: n.data["variantCount"] as number | undefined,
-          aspectRatio: n.data["aspectRatio"] as string | undefined,
-          aiBrief: n.data["aiBrief"] as string | undefined,
-          imageModel: n.data["imageModel"] as string | undefined,
-          videoQuality: n.data["videoQuality"] as string | undefined,
-          charCountry: n.data["charCountry"] as string | undefined,
-          charVibe: n.data["charVibe"] as string | undefined,
-          charGender: n.data["charGender"] as string | undefined,
-          storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
-        },
-      }));
+      const nodes: FlowNode[] = detail.nodes.map(nodeFromDto);
       const edges: Edge[] = detail.edges.map(edgeFromDto);
       set({
         boardId: detail.board.id,
@@ -682,5 +665,10 @@ export const useBoardStore = create<BoardState>((set, get) => ({
     })),
   setNodes: (nodes) => set({ nodes }),
   setEdges: (edges) => set({ edges }),
+  appendNodesBulk: (nodeDtos, edgeDtos) =>
+    set((s) => ({
+      nodes: [...s.nodes, ...nodeDtos.map(nodeFromDto)],
+      edges: [...s.edges, ...edgeDtos.map(edgeFromDto)],
+    })),
   clearError: () => set({ error: null }),
 }));

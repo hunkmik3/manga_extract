@@ -10,6 +10,10 @@ import {
   resolveStoryboardLayout,
 } from "../lib/storyboardPrompt";
 import { ComicImportBody } from "./ComicImportBody";
+import { ComicDetectBody } from "./ComicDetectBody";
+import { ComicPanelsBody } from "./ComicPanelsBody";
+import { ComicPageBody } from "./ComicPageBody";
+import { ComicPanelBody } from "./ComicPanelBody";
 
 const ICON: Record<string, string> = {
   character: "◎",
@@ -19,6 +23,10 @@ const ICON: Record<string, string> = {
   note: "✎",
   visual_asset: "◇",
   comic_import: "▤",
+  comic_page: "▥",
+  comic_panel: "▦",
+  comic_detect: "▥",
+  comic_panels: "▦",
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -1473,6 +1481,14 @@ function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
       return <StoryboardBody rfId={rfId} data={data} />;
     case "comic_import":
       return <ComicImportBody rfId={rfId} data={data} />;
+    case "comic_detect":
+      return <ComicDetectBody rfId={rfId} data={data} />;
+    case "comic_panels":
+      return <ComicPanelsBody rfId={rfId} data={data} />;
+    case "comic_page":
+      return <ComicPageBody rfId={rfId} data={data} />;
+    case "comic_panel":
+      return <ComicPanelBody rfId={rfId} data={data} />;
   }
 }
 

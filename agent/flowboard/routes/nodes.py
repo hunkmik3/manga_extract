@@ -21,10 +21,18 @@ NodeType = Literal[
     # `image` for storage / dispatch — see frontend/src/lib/storyboardPrompt.ts
     # for the template that drives gen_image.
     "Storyboard",
-    # Comic pipeline nodes. Backend stores them generically (data JSON); their
-    # behavior lives in the worker tasks (extract_panels / edit_image) + the
-    # frontend NodeCard. comic_import = Node 1 (folder → panels via XY-cut).
+    # Comic pipeline nodes (3-node split). Backend stores them generically
+    # (data JSON); behavior lives in the worker tasks + frontend NodeCard.
+    #   comic_import = upload/ingest full pages, spawns the chain below
+    #   comic_page   = ONE page (with editable panel boxes) — fan-out per page
+    #   comic_panel  = ONE extracted panel image (leaf) — fan-out per panel
+    #   comic_detect / comic_panels = legacy single-node variants (kept so old
+    #     boards still render; not offered in the palette)
     "comic_import",
+    "comic_page",
+    "comic_panel",
+    "comic_detect",
+    "comic_panels",
 ]
 NodeStatus = Literal["idle", "queued", "running", "done", "error"]
 
@@ -173,4 +181,72 @@ def delete_node(node_id: int):
             "deleted_edges": [e.id for e in edges],
             "detached_requests": len(orphan_requests),
             "detached_assets": len(orphan_assets),
+        }
+
+
+# ── Bulk create (comic fan-out) ───────────────────────────────────────────────
+# Create many nodes (and optional edges from an existing source node) in one
+# transaction. The comic pipeline uses this to spawn one node per page / per
+# panel without hundreds of round-trips. Returns created nodes + edges.
+
+_BULK_MAX = 2000
+
+
+class BulkNode(BaseModel):
+    type: NodeType
+    x: float = Field(default=0.0, ge=_COORD_MIN, le=_COORD_MAX)
+    y: float = Field(default=0.0, ge=_COORD_MIN, le=_COORD_MAX)
+    w: float = Field(default=240.0, gt=0, le=_SIZE_MAX)
+    h: float = Field(default=160.0, gt=0, le=_SIZE_MAX)
+    data: dict = {}
+    status: NodeStatus = "done"
+    # If set, create an edge from this EXISTING node id to the new node.
+    source_id: Optional[int] = None
+
+
+class BulkCreate(BaseModel):
+    board_id: int
+    nodes: list[BulkNode]
+
+
+@router.post("/bulk")
+def create_nodes_bulk(body: BulkCreate):
+    if not body.nodes:
+        raise HTTPException(400, "no nodes")
+    if len(body.nodes) > _BULK_MAX:
+        raise HTTPException(400, f"too many nodes (>{_BULK_MAX})")
+    with get_session() as s:
+        if not s.get(Board, body.board_id):
+            raise HTTPException(404, "board not found")
+        src_ids = {n.source_id for n in body.nodes if n.source_id is not None}
+        for sid in src_ids:
+            src = s.get(Node, sid)
+            if src is None or src.board_id != body.board_id:
+                raise HTTPException(400, f"invalid source_id {sid}")
+
+        created_nodes: list[Node] = []
+        created_edges: list[Edge] = []
+        for bn in body.nodes:
+            node = Node(
+                board_id=body.board_id,
+                short_id=generate_unique_short_id(s, body.board_id),
+                type=bn.type, x=bn.x, y=bn.y, w=bn.w, h=bn.h,
+                data=bn.data, status=bn.status,
+            )
+            s.add(node)
+            s.flush()  # assign node.id without committing each row
+            created_nodes.append(node)
+            if bn.source_id is not None:
+                edge = Edge(board_id=body.board_id, source_id=bn.source_id, target_id=node.id)
+                s.add(edge)
+                s.flush()
+                created_edges.append(edge)
+        s.commit()
+        for n in created_nodes:
+            s.refresh(n)
+        for e in created_edges:
+            s.refresh(e)
+        return {
+            "nodes": [n.model_dump() for n in created_nodes],
+            "edges": [e.model_dump() for e in created_edges],
         }

@@ -5,6 +5,7 @@ import {
   Controls,
   MiniMap,
   ReactFlow,
+  SelectionMode,
   applyEdgeChanges,
   applyNodeChanges,
   useReactFlow,
@@ -16,6 +17,7 @@ import {
 } from "@xyflow/react";
 
 import { useBoardStore, type FlowNode, type NodeType } from "../store/board";
+import { COMIC_TYPES, relayoutComicChains } from "./comicShared";
 import { NodeCard } from "./NodeCard";
 import { VariantEdge } from "./VariantEdge";
 import { useGenerationStore } from "../store/generation";
@@ -29,6 +31,10 @@ const nodeTypes = {
   visual_asset: NodeCard,
   Storyboard: NodeCard,
   comic_import: NodeCard,
+  comic_page: NodeCard,
+  comic_panel: NodeCard,
+  comic_detect: NodeCard,
+  comic_panels: NodeCard,
 };
 
 // Single edge type used for everything — VariantEdge renders the
@@ -176,12 +182,33 @@ export function Board() {
       // backend never heard about it). Calling deleteNodeByRfId here
       // covers both cases; the action is idempotent server-side (404 on
       // the second call is silently swallowed).
+      let comicRemoved = false;
+      const cascade = new Set<string>(); // panels orphaned by a deleted page
+      const snapshot = useBoardStore.getState();
       for (const c of changes) {
         if (c.type === "remove") {
+          const n = snapshot.nodes.find((nn) => nn.id === c.id);
+          if (n && COMIC_TYPES.has(n.data.type)) comicRemoved = true;
+          if (n && n.data.type === "comic_page") {
+            // Cascade: a page's panels are crops of it — delete them too.
+            for (const e of snapshot.edges) {
+              if (e.source !== c.id) continue;
+              const t = snapshot.nodes.find((nn) => nn.id === e.target);
+              if (t && t.data.type === "comic_panel") cascade.add(e.target);
+            }
+          }
           void deleteNodeByRfId(c.id);
         }
       }
-      setNodes(applyNodeChanges(changes, useBoardStore.getState().nodes) as FlowNode[]);
+      let next = applyNodeChanges(changes, useBoardStore.getState().nodes) as FlowNode[];
+      if (cascade.size > 0) {
+        next = next.filter((n) => !cascade.has(n.id));
+        cascade.forEach((id) => void deleteNodeByRfId(id));
+      }
+      setNodes(next);
+      // Deleting a comic node leaves a gap — re-pack the chain so the nodes
+      // below "run up" to fill it.
+      if (comicRemoved) setTimeout(() => relayoutComicChains(), 0);
     },
     [setNodes, deleteNodeByRfId],
   );
@@ -361,6 +388,11 @@ export function Board() {
         onEdgesDelete={onEdgesDelete}
         onNodeDoubleClick={onNodeDoubleClick}
         deleteKeyCode={["Backspace", "Delete"]}
+        // Hold Ctrl (Win) / Cmd (Mac) + drag to marquee-select a region, then
+        // Backspace/Delete to bulk-delete. Without the key, drag pans as usual.
+        selectionKeyCode={["Meta", "Control"]}
+        multiSelectionKeyCode={["Meta", "Control"]}
+        selectionMode={SelectionMode.Partial}
         defaultEdgeOptions={defaultEdgeOptions}
         // Larger connection-drop radius so users don't have to land
         // pixel-perfect on the handle to complete an edge.
