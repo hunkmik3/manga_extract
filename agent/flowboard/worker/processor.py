@@ -1053,6 +1053,52 @@ async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
     )
 
 
+def _match_and_load_char_refs(panel_bytes: bytes, chars: list) -> list[bytes]:
+    """Auto-pick the character in this panel (CCIP match against the character
+    DB's samples) and return that character's reference-crop bytes."""
+    from flowboard.services.comic import characters as char_svc, panels as panel_svc
+
+    try:
+        panel_bgr = panel_svc.decode_bgr(panel_bytes)
+    except Exception:  # noqa: BLE001
+        return []
+    samples: list[tuple[str, object]] = []
+    for c in chars:
+        if not isinstance(c, dict):
+            continue
+        sid = c.get("sampleMediaId")
+        if not isinstance(sid, str):
+            continue
+        p = media_service.cached_path(sid)
+        if p is None:
+            continue
+        try:
+            samples.append((str(c.get("id")), panel_svc.decode_bgr(p.read_bytes())))
+        except Exception:  # noqa: BLE001
+            continue
+    if not samples:
+        return []
+    try:
+        matched = char_svc.match_character(panel_bgr, samples)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 — MLUnavailable / inference errors → skip refs
+        return []
+    if matched is None:
+        return []
+    char = next((c for c in chars if isinstance(c, dict) and str(c.get("id")) == matched), None)
+    refs: list[bytes] = []
+    for mid in (char or {}).get("refMediaIds", [])[:3]:
+        if not isinstance(mid, str):
+            continue
+        p = media_service.cached_path(mid)
+        if p is None:
+            continue
+        try:
+            refs.append(p.read_bytes())
+        except OSError:
+            continue
+    return refs
+
+
 async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     from flowboard.services.comic import prompts
 
@@ -1063,16 +1109,87 @@ async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     if raw is None:
         return {}, "no_source_image"
     page_ref = await asyncio.to_thread(_page_ref_bytes, params)
-    refs = [page_ref] if page_ref else None
+    refs: list[bytes] = []
+    if page_ref:
+        refs.append(page_ref)
+    # Auto-match the panel's character → add its reference crops for consistency.
+    chars = params.get("characters")
+    if isinstance(chars, list) and chars:
+        refs.extend(await asyncio.to_thread(_match_and_load_char_refs, raw, chars))
+    refs = refs[:5]  # cap multi-image input
+
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
-
     prompt = prompts.ENHANCE_PROMPT + (prompts.REFERENCE_CLAUSE if refs else "")
     aspect = _orientation_aspect(raw)
     return await _bridge_edit(
         raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
-        references=refs, pad_916=False, node_id=params.get("__node_id"),
+        references=refs or None, pad_916=False, node_id=params.get("__node_id"),
     )
+
+
+# ── Comic pipeline — character tracking (build per-character reference sets) ──
+# Detect character bodies across all pages (manga109) + cluster by identity
+# (CCIP), then ingest the top crops per character as reference media. Those
+# refs get fed to enhance so a character looks consistent across the comic.
+
+async def _handle_build_character_db(params: dict) -> tuple[dict, Optional[str]]:
+    import uuid
+
+    from flowboard.services.comic import characters as char_svc
+    from flowboard.services.comic.panel_ml import MLUnavailable
+
+    pages_in = params.get("pages")
+    if not isinstance(pages_in, list) or not pages_in:
+        return {}, "missing_pages"
+    conf = params.get("conf")
+    conf = float(conf) if isinstance(conf, (int, float)) else 0.30
+
+    page_tuples: list[tuple[str, int, bytes]] = []
+    for pg in pages_in:
+        if not isinstance(pg, dict):
+            continue
+        mid = pg.get("mediaId")
+        if not isinstance(mid, str):
+            continue
+        p = media_service.cached_path(mid)
+        if p is None:
+            continue
+        try:
+            page_tuples.append((str(pg.get("name") or ""), int(pg.get("idx") or 0), p.read_bytes()))
+        except OSError:
+            continue
+    if not page_tuples:
+        return {}, "no_readable_pages"
+
+    try:
+        clusters = await asyncio.to_thread(char_svc.build_clusters, page_tuples, conf)
+    except MLUnavailable as exc:
+        return {}, f"ml_unavailable: {str(exc)[:160]}"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("build_character_db failed")
+        return {}, f"characters_failed: {str(exc)[:160]}"
+
+    characters: list[dict] = []
+    for i, cl in enumerate(clusters):
+        ref_ids: list[str] = []
+        for png in cl["ref_png"]:
+            cid = str(uuid.uuid4())
+            if media_service.ingest_inline_bytes(cid, png, kind="image", mime="image/png"):
+                ref_ids.append(cid)
+        if not ref_ids:
+            continue
+        characters.append({
+            "id": f"char_{i}",
+            "name": f"Character {i + 1}",
+            "count": cl["count"],
+            "refMediaIds": ref_ids,
+            "sampleMediaId": ref_ids[0],
+            "pages": cl.get("pages", []),
+        })
+
+    logger.info("build_character_db: %d page(s) → %d character(s)", len(page_tuples), len(characters))
+    return {"characters": characters, "character_count": len(characters), "node_id": params.get("__node_id")}, None
 
 
 _DEFAULT_HANDLERS: dict[str, Handler] = {
@@ -1088,6 +1205,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "crop_panels": _handle_crop_panels,
     "clean_panel": _handle_clean_panel,
     "enhance_panel": _handle_enhance_panel,
+    "build_character_db": _handle_build_character_db,
 }
 
 

@@ -35,6 +35,7 @@ const nodeTypes = {
   comic_panel: NodeCard,
   comic_clean: NodeCard,
   comic_enhance: NodeCard,
+  comic_chars: NodeCard,
   comic_detect: NodeCard,
   comic_panels: NodeCard,
 };

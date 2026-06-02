@@ -16,6 +16,7 @@ const CHIPS: Chip[] = [
   { type: "comic_import", icon: "▤", label: "Comic upload" },
   { type: "comic_clean", icon: "✂", label: "Comic clean" },
   { type: "comic_enhance", icon: "✧", label: "Comic enhance" },
+  { type: "comic_chars", icon: "☻", label: "Character DB" },
 ];
 
 export function AddNodePalette() {

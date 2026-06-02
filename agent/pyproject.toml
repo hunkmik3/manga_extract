@@ -28,6 +28,10 @@ ml = [
     "torch>=2.2",
     "ultralytics>=8.3",
     "huggingface_hub>=0.20",
+    # Character tracking: manga109 detection (ultralytics, above) + CCIP
+    # anime-character identity embedding/clustering (onnxruntime).
+    "dghs-imgutils>=0.4",
+    "onnxruntime>=1.17",
 ]
 
 [build-system]

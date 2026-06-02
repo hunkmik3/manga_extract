@@ -15,6 +15,7 @@ import { ComicPanelsBody } from "./ComicPanelsBody";
 import { ComicPageBody } from "./ComicPageBody";
 import { ComicPanelBody } from "./ComicPanelBody";
 import { ComicEditBody } from "./ComicEditBody";
+import { ComicCharsBody } from "./ComicCharsBody";
 
 const ICON: Record<string, string> = {
   character: "◎",
@@ -28,6 +29,7 @@ const ICON: Record<string, string> = {
   comic_panel: "▦",
   comic_clean: "✂",
   comic_enhance: "✧",
+  comic_chars: "☻",
   comic_detect: "▥",
   comic_panels: "▦",
 };
@@ -1496,6 +1498,8 @@ function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
       return <ComicEditBody rfId={rfId} data={data} kind="clean" />;
     case "comic_enhance":
       return <ComicEditBody rfId={rfId} data={data} kind="enhance" />;
+    case "comic_chars":
+      return <ComicCharsBody rfId={rfId} data={data} />;
   }
 }
 

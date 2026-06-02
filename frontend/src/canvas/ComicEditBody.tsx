@@ -1,6 +1,6 @@
 import { ensureBoardProject, mediaUrl } from "../api/client";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
-import { createRequest, patchComicNode, resolveUpstreamImage, runComicRequest } from "./comicShared";
+import { createRequest, findCharacterDb, patchComicNode, resolveUpstreamImage, runComicRequest } from "./comicShared";
 
 /**
  * Phase 4/5 node — runs the Flow bridge (Nano Banana Pro) on the upstream image:
@@ -50,6 +50,11 @@ export function ComicEditBody({
       params.box = up!.box;
     }
     if (kind === "clean") params.extend_916 = extend916;
+    if (kind === "enhance") {
+      // auto-feed the board's character DB so enhance keeps identity consistent
+      const chars = findCharacterDb();
+      if (chars) params.characters = chars;
+    }
     const pageMediaId = up!.pageMediaId; // persist so a downstream enhance can reference it
 
     runComicRequest(

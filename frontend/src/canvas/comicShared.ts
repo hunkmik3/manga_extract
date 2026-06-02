@@ -175,6 +175,26 @@ export function resolveUpstreamImage(rfId: string): UpstreamImage | null {
   return null;
 }
 
+export interface CharacterItem {
+  id: string;
+  name: string;
+  count: number;
+  refMediaIds: string[];
+  sampleMediaId: string;
+  pages?: number[];
+}
+/** The character DB from the (single) comic_chars node on the board, if built.
+ * Passed to enhance so it can auto-match each panel's character. */
+export function findCharacterDb(): CharacterItem[] | null {
+  const { nodes } = useBoardStore.getState();
+  for (const n of nodes) {
+    if (n.data.type === "comic_chars" && Array.isArray(n.data.characters) && n.data.characters.length) {
+      return n.data.characters as CharacterItem[];
+    }
+  }
+  return null;
+}
+
 export interface DownstreamPage {
   dbId: number;
   data: FlowboardNodeData;
