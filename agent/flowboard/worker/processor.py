@@ -1192,6 +1192,45 @@ async def _handle_build_character_db(params: dict) -> tuple[dict, Optional[str]]
     return {"characters": characters, "character_count": len(characters), "node_id": params.get("__node_id")}, None
 
 
+# ── Comic pipeline — combine 4 panels into one 2×2 9:16 storyboard image ──────
+# Pre-stitch the 4 panels (reading order) into a rough 2×2 composite, then send
+# that single "ground truth" image to the bridge with COMBINE_2X2_PROMPT → the
+# model removes text, keeps characters faithful, extends backgrounds to 9:16.
+
+async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
+    from flowboard.services.comic import panels as panel_svc, prompts
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+    image_model = params.get("image_model")
+    image_model = image_model if isinstance(image_model, str) and image_model else None
+
+    def _build() -> Optional[bytes]:
+        bgrs: list = []
+        for s in specs[:4]:
+            raw = _source_image_bytes(s) if isinstance(s, dict) else None
+            try:
+                bgrs.append(panel_svc.decode_bgr(raw) if raw else None)
+            except Exception:  # noqa: BLE001
+                bgrs.append(None)
+        if all(b is None for b in bgrs):
+            return None
+        return panel_svc.encode_png(panel_svc.stitch_2x2(bgrs))
+
+    composite = await asyncio.to_thread(_build)
+    if composite is None:
+        return {}, "no_source_image"
+    return await _bridge_edit(
+        composite, prompts.COMBINE_2X2_PROMPT, project_id=project_id.strip(),
+        aspect="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+        references=None, pad_916=True, node_id=params.get("__node_id"),
+    )
+
+
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
     "create_project": _handle_create_project,
@@ -1206,6 +1245,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "clean_panel": _handle_clean_panel,
     "enhance_panel": _handle_enhance_panel,
     "build_character_db": _handle_build_character_db,
+    "combine_panels": _handle_combine_panels,
 }
 
 

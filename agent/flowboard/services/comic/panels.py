@@ -194,6 +194,29 @@ def decode_bgr(data: bytes) -> np.ndarray:
     return img
 
 
+def stitch_2x2(
+    panels_bgr: list[Optional[np.ndarray]], cell_w: int = 540, cell_h: int = 960,
+    fill: tuple[int, int, int] = (235, 235, 235),
+) -> np.ndarray:
+    """Arrange up to 4 panels into a 2×2 grid on a 9:16 canvas (default
+    1080×1920) in reading order (TL, TR, BL, BR). Each panel is contain-fit
+    (letterboxed, no cropping → characters preserved); the neutral fill is empty
+    space for the model to outpaint. Missing panels leave an empty cell."""
+    canvas = np.full((cell_h * 2, cell_w * 2, 3), fill, np.uint8)
+    for i, pn in enumerate(panels_bgr[:4]):
+        if pn is None or pn.size == 0:
+            continue
+        ph, pw = pn.shape[:2]
+        s = min(cell_w / pw, cell_h / ph)
+        nw, nh = max(1, int(pw * s)), max(1, int(ph * s))
+        resized = cv2.resize(pn, (nw, nh))
+        r, c = divmod(i, 2)
+        x0 = c * cell_w + (cell_w - nw) // 2
+        y0 = r * cell_h + (cell_h - nh) // 2
+        canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
+
+
 def pad_to_aspect(bgr: np.ndarray, w_ratio: int = 9, h_ratio: int = 16, *, mode: str = "constant") -> np.ndarray:
     """Pad the image to an exact w:h aspect (default 9:16).
 

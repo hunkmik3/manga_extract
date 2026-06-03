@@ -34,6 +34,7 @@ NodeType = Literal[
     "comic_clean",    # Phase 4 — remove text/bubbles (+ optional 9:16) via bridge
     "comic_enhance",  # Phase 5 — re-render as anime via bridge
     "comic_chars",    # character DB — detect+cluster characters for enhance refs
+    "comic_combine",  # combine 4 panels → one 2×2 9:16 storyboard image
     "comic_detect",
     "comic_panels",
 ]

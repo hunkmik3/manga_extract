@@ -16,6 +16,7 @@ import {
   PANEL_COLS,
   PANEL_CELL_H,
   ROW_GAP,
+  type BoxItem,
   type PageItem,
 } from "./comicShared";
 
@@ -38,7 +39,7 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
   const isImporting = status === "queued" || status === "running";
 
   const [draftFolder, setDraftFolder] = useState(folder);
-  const [busy, setBusy] = useState<null | "pages" | "panels">(null);
+  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine">(null);
   const [spawnErr, setSpawnErr] = useState<string | undefined>();
   const dirInputRef = useRef<HTMLInputElement | null>(null);
   const rf = useReactFlow();
@@ -147,6 +148,52 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
     }
   }
 
+  // ③ flatten panels in reading order → groups of 4 → one Combine (2×2) node each
+  async function spawnCombine() {
+    if (busy) return;
+    const boardId = useBoardStore.getState().boardId;
+    if (boardId == null) return;
+    const uploadDb = parseInt(rfId, 10);
+    const pageNodes = downstreamPageNodes(rfId);
+    if (pageNodes.length === 0) { setSpawnErr("Create page nodes first"); return; }
+    setSpawnErr(undefined);
+    setBusy("combine");
+    try {
+      const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
+      const flat: Array<Record<string, unknown>> = [];
+      for (const pn of sorted) {
+        const boxes = (pn.data.boxes as BoxItem[]) ?? [];
+        boxes.forEach((b, j) =>
+          flat.push({
+            pageMediaId: pn.data.pageMediaId, box: b, w: pn.data.w, h: pn.data.h,
+            pageName: pn.data.pageName, panelIndex: j,
+          }),
+        );
+      }
+      if (flat.length === 0) { setSpawnErr("No panel boxes — detect/draw first"); return; }
+      const pos = nodePosition(rfId);
+      const bulk: BulkNodeInput[] = [];
+      for (let i = 0; i < flat.length; i += 4) {
+        bulk.push({
+          type: "comic_combine",
+          x: pos.x + PAGE_GAP_X + 820,
+          y: pos.y + (i / 4) * 700,
+          w: 300,
+          h: 560,
+          data: { panels: flat.slice(i, i + 4), title: `2x2 #${i / 4 + 1}` },
+          source_id: uploadDb,
+        });
+      }
+      const res = await createNodesBulk(boardId, bulk);
+      useBoardStore.getState().appendNodesBulk(res.nodes, res.edges);
+      focusNew(res.nodes);
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <div className="node-body node-body--comic-import" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       <label style={{ fontSize: 11, opacity: 0.75 }}>1 · Upload comic pages</label>
@@ -180,6 +227,9 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
           </button>
           <button className="comic-btn" onClick={spawnPanels} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Crop every page's boxes into individual panel nodes">
             {busy === "panels" ? "Creating panels…" : "② Create all panel nodes"}
+          </button>
+          <button className="comic-btn" onClick={spawnCombine} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Group panels in reading order into 2×2 storyboard images (4 per group)">
+            {busy === "combine" ? "Creating combine…" : "③ Combine 2×2 (groups of 4)"}
           </button>
         </>
       )}

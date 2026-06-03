@@ -53,3 +53,136 @@ REFERENCE_CLAUSE = (
     " Use the additional reference images to keep character designs, costumes, and the "
     "setting consistent."
 )
+
+# Combine 4 panels (pre-stitched into a rough 2×2) into one clean vertical 9:16
+# storyboard image: remove text, keep characters 100% faithful, extend only
+# backgrounds. Sent with the stitched composite as the single source image.
+COMBINE_2X2_PROMPT = """Convert the source comic/manga/manhwa page into a single vertical 9:16 image containing four story panels arranged in a 2×2 grid layout.
+
+LAYOUT
+
+[ Panel 1 ] [ Panel 2 ]
+[ Panel 3 ] [ Panel 4 ]
+
+The entire composition must fit inside one vertical 9:16 canvas.
+
+All four panels should have equal visual weight and occupy approximately the same amount of screen space.
+
+Panels must be arranged according to the original reading order:
+top-left → top-right → bottom-left → bottom-right.
+
+CRITICAL RULE: STAY 100% FAITHFUL TO THE ORIGINAL ARTWORK
+
+Treat the source image as the ground truth.
+
+Do NOT redesign, reinterpret, regenerate, or alter any character.
+
+Preserve exactly:
+- Character identity
+- Facial features
+- Face proportions
+- Eye shape
+- Hair shape
+- Hair silhouette
+- Hair color
+- Anatomy
+- Body proportions
+- Clothing
+- Accessories
+- Expressions
+- Poses
+- Art style
+- Linework
+- Rendering style
+- Color palette
+
+The characters must remain identical to the source image.
+
+No face changes.
+No anatomy changes.
+No costume changes.
+No hairstyle changes.
+No expression changes.
+
+PANEL SELECTION
+
+Analyze the page and identify the four most important narrative beats following the original reading flow.
+
+Select the strongest moments based on:
+- emotional impact
+- character reactions
+- action
+- reveals
+- dramatic dialogue moments
+- important story progression
+
+TEXT REMOVAL
+
+Remove:
+- Speech bubbles
+- Dialogue balloons
+- Narration boxes
+- Captions
+- Sound effects
+- Onomatopoeia
+- Watermarks
+- Page numbers
+- All text
+
+Reconstruct the hidden artwork behind removed elements.
+
+No traces of text or bubble outlines should remain.
+
+REFRAMING RULES
+
+The objective is reframing, not redrawing.
+
+Prioritize:
+1. Smart cropping
+2. Recomposition
+3. Canvas extension
+4. Background outpainting
+
+Avoid regenerating existing artwork.
+
+Do not redraw faces.
+
+Do not redraw bodies.
+
+Do not modify poses.
+
+Do not alter character proportions.
+
+EXTENSION RULES
+
+If additional space is required to fit the composition:
+
+Only extend:
+- Backgrounds
+- Environment
+- Architecture
+- Walls
+- Floors
+- Ceilings
+- Sky
+- Atmospheric effects
+- Empty surrounding space
+
+Never modify the original character artwork.
+
+All generated content should feel like a natural continuation of the original scene.
+
+VISUAL STYLE
+
+Maintain:
+- Original comic/manhwa style
+- Original rendering
+- Original colors
+- Original lighting
+- Original storytelling intent
+
+FINAL GOAL
+
+Create a single mobile-friendly 9:16 image containing four story panels arranged in a clean 2×2 grid.
+
+The final image should feel like an official storyboard adaptation of the original page, with all text removed, all characters preserved exactly, and the artwork expanded only where necessary to fit the new layout."""

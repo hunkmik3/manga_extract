@@ -110,7 +110,7 @@ export function getHealth() {
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
-export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard" | "comic_import" | "comic_page" | "comic_panel" | "comic_clean" | "comic_enhance" | "comic_chars" | "comic_detect" | "comic_panels";
+export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard" | "comic_import" | "comic_page" | "comic_panel" | "comic_clean" | "comic_enhance" | "comic_chars" | "comic_combine" | "comic_detect" | "comic_panels";
 export type NodeStatus = "idle" | "queued" | "running" | "done" | "error";
 
 export interface Board {

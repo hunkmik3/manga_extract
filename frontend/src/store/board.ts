@@ -148,6 +148,7 @@ const TYPE_TITLE: Record<NodeType, string> = {
   comic_clean: "Comic clean",
   comic_enhance: "Comic enhance",
   comic_chars: "Character DB",
+  comic_combine: "Combine 2×2",
   comic_detect: "Comic detect",
   comic_panels: "Comic panels",
 };
