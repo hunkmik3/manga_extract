@@ -2,6 +2,10 @@
   <img src="docs/assets/logo-wordmark.svg" alt="Flowboard" width="480" />
 </p>
 
+> **Comic pipeline build** — this fork adds a manhwa → cleaned-panels / 2×2 anime
+> storyboard workflow. **To clone & run it, see [COMIC_PIPELINE.md](COMIC_PIPELINE.md).**
+> The rest of this README is the upstream Flowboard documentation.
+
 <p align="center">
   <a href="#license"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white" alt="Python 3.11+"/>
