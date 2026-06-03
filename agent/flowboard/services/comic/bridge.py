@@ -74,21 +74,33 @@ async def _upload(
 ) -> str:
     """Push one image into the Flow project, return its ``media_id``.
 
-    Raises ``BridgeEditError`` (attempts=0) on failure — an upload that fails
-    is not worth retrying the generate step over.
+    Retries transient failures (e.g. ``extension_disconnected`` while the
+    extension is reconnecting after an agent reload) with backoff. Raises
+    ``BridgeEditError`` (attempts=0) only after exhausting retries.
     """
-    resp = await sdk.upload_image(
-        image_base64=base64.b64encode(image_bytes).decode("ascii"),
-        mime_type=mime,
-        project_id=project_id,
-        file_name=file_name,
-    )
-    if resp.get("error"):
-        raise BridgeEditError(f"upload_failed: {str(resp['error'])[:200]}", attempts=0)
-    media_id = resp.get("media_id")
-    if not isinstance(media_id, str) or not media_service.is_valid_media_id(media_id):
-        raise BridgeEditError("upload returned no valid media_id", attempts=0)
-    return media_id
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    last = "unknown"
+    for attempt in range(1, DEFAULT_MAX_ATTEMPTS + 1):
+        try:
+            resp = await sdk.upload_image(
+                image_base64=b64, mime_type=mime, project_id=project_id, file_name=file_name,
+            )
+        except Exception as exc:  # noqa: BLE001 — transport errors are retryable
+            last = f"upload_raised: {exc}"
+            logger.warning("upload attempt %d/%d raised: %s", attempt, DEFAULT_MAX_ATTEMPTS, exc)
+            await _backoff(attempt, DEFAULT_MAX_ATTEMPTS)
+            continue
+        if isinstance(resp, dict) and resp.get("error"):
+            last = f"upload_failed: {str(resp['error'])[:200]}"
+            logger.warning("upload attempt %d/%d error: %s", attempt, DEFAULT_MAX_ATTEMPTS, last)
+            await _backoff(attempt, DEFAULT_MAX_ATTEMPTS)
+            continue
+        media_id = resp.get("media_id") if isinstance(resp, dict) else None
+        if isinstance(media_id, str) and media_service.is_valid_media_id(media_id):
+            return media_id
+        last = "upload returned no valid media_id"
+        await _backoff(attempt, DEFAULT_MAX_ATTEMPTS)
+    raise BridgeEditError(last, attempts=0)
 
 
 async def edit_image(
