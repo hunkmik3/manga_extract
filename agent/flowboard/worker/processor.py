@@ -1220,20 +1220,24 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     if all(r is None for r in raws):
         return {}, "no_source_image"
 
+    # Clean + extend EVERY panel to the same 9:16 portrait so all four cells are
+    # uniformly filled (no white letterbox on the landscape panels).
+    cell_prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16
     cleaned: list = []
     for raw in raws:
         if raw is None:
             cleaned.append(None)
             continue
-        aspect = _orientation_aspect(raw)
         try:
             out = await bridge.edit_image(
-                raw, prompts.CLEAN_PROMPT, project_id=pid, aspect_ratio=aspect, image_model=image_model,
+                raw, cell_prompt, project_id=pid,
+                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
             )
         except bridge.BridgeEditError as exc:
             return {}, f"bridge_failed: {exc.reason}"[:200]
         try:
-            cleaned.append(panel_svc.decode_bgr(out))
+            # guarantee exact 9:16 even if the model returned a slightly off size
+            cleaned.append(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
         except Exception:  # noqa: BLE001
             cleaned.append(None)
 

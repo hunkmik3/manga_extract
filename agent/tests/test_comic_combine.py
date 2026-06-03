@@ -45,9 +45,9 @@ async def test_combine_cleans_each_panel_then_code_stitches():
 
     assert err is None
     from flowboard.services.comic import prompts
-    # the bridge cleaned EACH panel (4×) with the CLEAN prompt — not one combine call
+    # the bridge cleaned+extended EACH panel (4×) to 9:16 — not one combine call
     assert len(prompts_seen) == 4
-    assert all(p == prompts.CLEAN_PROMPT for p in prompts_seen)
+    assert all(p == prompts.CLEAN_PROMPT + prompts.EXTEND_9_16 for p in prompts_seen)
     assert result["panels_cleaned"] == 4
     assert result["width"] == 540 * 2 + 16 * 3   # code-stitched 2×2
     assert media_service.status(result["mediaId"]).get("available") is True
