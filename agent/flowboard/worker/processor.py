@@ -1244,19 +1244,79 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     if all(c is None for c in cleaned):
         return {}, "all_panels_failed"
 
-    def _finish() -> tuple[bytes, int, int]:
+    def _enc() -> tuple[list, bytes, int, int]:
+        cell_pngs = [None if c is None else panel_svc.encode_png(c) for c in cleaned]
         comp = panel_svc.stitch_2x2(cleaned)
-        return panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+        return cell_pngs, panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
 
-    composite, w, h = await asyncio.to_thread(_finish)
-    import uuid
-    media_id = str(uuid.uuid4())
-    media_service.ingest_inline_bytes(media_id, composite, kind="image", mime="image/png")
+    cell_pngs, composite, w, h = await asyncio.to_thread(_enc)
+    cells = _ingest_pngs(cell_pngs)
+    media_id = _ingest_png(composite)
     return {
-        "mediaId": media_id, "width": w, "height": h,
+        "mediaId": media_id, "cells": cells, "width": w, "height": h,
         "panels_cleaned": sum(1 for c in cleaned if c is not None),
         "node_id": params.get("__node_id"),
     }, None
+
+
+def _ingest_png(png: bytes) -> str:
+    import uuid
+    cid = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(cid, png, kind="image", mime="image/png")
+    return cid
+
+
+def _ingest_pngs(pngs: list) -> list:
+    return [None if p is None else _ingest_png(p) for p in pngs]
+
+
+async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
+    """Re-clean ONE panel of a combine group and re-stitch the 2×2, reusing the
+    other (already-cleaned) cells. Lets the user fix the one cell that came out
+    wrong without re-running all four."""
+    from flowboard.services.comic import bridge, panels as panel_svc, prompts
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    panel = params.get("panel")
+    cells = params.get("cells")
+    index = params.get("index")
+    if not isinstance(panel, dict):
+        return {}, "missing_panel"
+    if not isinstance(cells, list) or not cells:
+        return {}, "missing_cells"
+    if not isinstance(index, int) or index < 0 or index >= len(cells):
+        return {}, "bad_index"
+    image_model = params.get("image_model")
+    image_model = image_model if isinstance(image_model, str) and image_model else None
+
+    raw = await asyncio.to_thread(_source_image_bytes, panel)
+    if raw is None:
+        return {}, "no_source_image"
+    try:
+        out = await bridge.edit_image(
+            raw, prompts.CLEAN_PROMPT + prompts.EXTEND_9_16, project_id=project_id.strip(),
+            aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+        )
+    except bridge.BridgeEditError as exc:
+        return {}, f"bridge_failed: {exc.reason}"[:200]
+
+    def _rebuild() -> tuple[list, bytes, int, int]:
+        new_cells = list(cells)
+        new_cells[index] = _ingest_png(panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16)))
+        bgrs = []
+        for cid in new_cells[:4]:
+            path = media_service.cached_path(cid) if isinstance(cid, str) else None
+            try:
+                bgrs.append(panel_svc.decode_bgr(path.read_bytes()) if path else None)
+            except Exception:  # noqa: BLE001
+                bgrs.append(None)
+        comp = panel_svc.stitch_2x2(bgrs)
+        return new_cells, panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+
+    new_cells, composite, w, h = await asyncio.to_thread(_rebuild)
+    return {"mediaId": _ingest_png(composite), "cells": new_cells, "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
 _DEFAULT_HANDLERS: dict[str, Handler] = {
@@ -1274,6 +1334,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "enhance_panel": _handle_enhance_panel,
     "build_character_db": _handle_build_character_db,
     "combine_panels": _handle_combine_panels,
+    "regen_cell": _handle_regen_cell,
 }
 
 
