@@ -31,25 +31,25 @@ def test_stitch_handles_missing_panels():
 
 
 @pytest.mark.asyncio
-async def test_combine_panels_stitches_and_calls_bridge_with_combine_prompt():
+async def test_combine_cleans_each_panel_then_code_stitches():
     page = str(uuid.uuid4())
     media_service.ingest_inline_bytes(page, _png(900, 1200), kind="image", mime="image/png")
     specs = [{"page_media_id": page, "box": {"x": 10, "y": 10 + i * 200, "w": 400, "h": 180}} for i in range(4)]
 
-    captured = {}
+    prompts_seen = []
     async def fake_edit(image_bytes, prompt, **kw):
-        captured["bytes"] = image_bytes
-        captured["prompt"] = prompt
-        return _png(1080, 1920)
+        prompts_seen.append(prompt)
+        return _png(400, 300)  # a "cleaned" panel
     with patch("flowboard.services.comic.bridge.edit_image", side_effect=fake_edit):
         result, err = await _handle_combine_panels({"project_id": "p", "panels": specs})
 
     assert err is None
     from flowboard.services.comic import prompts
-    assert captured["prompt"] == prompts.COMBINE_2X2_PROMPT
-    comp = cv2.imdecode(np.frombuffer(captured["bytes"], np.uint8), cv2.IMREAD_COLOR)
-    assert comp.shape[1] == 540 * 2 + 16 * 3        # tight 2×2 composite sent
-    assert result["width"] / result["height"] == pytest.approx(9 / 16, abs=0.03)
+    # the bridge cleaned EACH panel (4×) with the CLEAN prompt — not one combine call
+    assert len(prompts_seen) == 4
+    assert all(p == prompts.CLEAN_PROMPT for p in prompts_seen)
+    assert result["panels_cleaned"] == 4
+    assert result["width"] == 540 * 2 + 16 * 3   # code-stitched 2×2
     assert media_service.status(result["mediaId"]).get("available") is True
 
 

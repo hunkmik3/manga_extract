@@ -1198,7 +1198,11 @@ async def _handle_build_character_db(params: dict) -> tuple[dict, Optional[str]]
 # model removes text, keeps characters faithful, extends backgrounds to 9:16.
 
 async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
-    from flowboard.services.comic import panels as panel_svc, prompts
+    """Clean each of the up-to-4 panels INDIVIDUALLY via the bridge (remove
+    text/bubbles + reconstruct art), then code-stitch the cleaned panels into a
+    clean 2×2 grid. The model never does the layout — code does — so the grid is
+    exact (no re-selecting/rearranging/invented panels)."""
+    from flowboard.services.comic import bridge, panels as panel_svc, prompts
 
     project_id = params.get("project_id")
     if not isinstance(project_id, str) or not project_id.strip():
@@ -1208,27 +1212,47 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "missing_panels"
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
+    pid = project_id.strip()
 
-    def _build() -> Optional[bytes]:
-        bgrs: list = []
-        for s in specs[:4]:
-            raw = _source_image_bytes(s) if isinstance(s, dict) else None
-            try:
-                bgrs.append(panel_svc.decode_bgr(raw) if raw else None)
-            except Exception:  # noqa: BLE001
-                bgrs.append(None)
-        if all(b is None for b in bgrs):
-            return None
-        return panel_svc.encode_png(panel_svc.stitch_2x2(bgrs))
-
-    composite = await asyncio.to_thread(_build)
-    if composite is None:
-        return {}, "no_source_image"
-    return await _bridge_edit(
-        composite, prompts.COMBINE_2X2_PROMPT, project_id=project_id.strip(),
-        aspect="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
-        references=None, pad_916=True, node_id=params.get("__node_id"),
+    raws = await asyncio.to_thread(
+        lambda: [(_source_image_bytes(s) if isinstance(s, dict) else None) for s in specs[:4]]
     )
+    if all(r is None for r in raws):
+        return {}, "no_source_image"
+
+    cleaned: list = []
+    for raw in raws:
+        if raw is None:
+            cleaned.append(None)
+            continue
+        aspect = _orientation_aspect(raw)
+        try:
+            out = await bridge.edit_image(
+                raw, prompts.CLEAN_PROMPT, project_id=pid, aspect_ratio=aspect, image_model=image_model,
+            )
+        except bridge.BridgeEditError as exc:
+            return {}, f"bridge_failed: {exc.reason}"[:200]
+        try:
+            cleaned.append(panel_svc.decode_bgr(out))
+        except Exception:  # noqa: BLE001
+            cleaned.append(None)
+
+    if all(c is None for c in cleaned):
+        return {}, "all_panels_failed"
+
+    def _finish() -> tuple[bytes, int, int]:
+        comp = panel_svc.stitch_2x2(cleaned)
+        return panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+
+    composite, w, h = await asyncio.to_thread(_finish)
+    import uuid
+    media_id = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(media_id, composite, kind="image", mime="image/png")
+    return {
+        "mediaId": media_id, "width": w, "height": h,
+        "panels_cleaned": sum(1 for c in cleaned if c is not None),
+        "node_id": params.get("__node_id"),
+    }, None
 
 
 _DEFAULT_HANDLERS: dict[str, Handler] = {
