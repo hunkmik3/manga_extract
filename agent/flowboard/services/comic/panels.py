@@ -195,24 +195,32 @@ def decode_bgr(data: bytes) -> np.ndarray:
 
 
 def stitch_2x2(
-    panels_bgr: list[Optional[np.ndarray]], cell_w: int = 540, cell_h: int = 960,
-    fill: tuple[int, int, int] = (235, 235, 235),
+    panels_bgr: list[Optional[np.ndarray]], cell_w: int = 540, gutter: int = 16,
+    fill: tuple[int, int, int] = (255, 255, 255),
 ) -> np.ndarray:
-    """Arrange up to 4 panels into a 2×2 grid on a 9:16 canvas (default
-    1080×1920) in reading order (TL, TR, BL, BR). Each panel is contain-fit
-    (letterboxed, no cropping → characters preserved); the neutral fill is empty
-    space for the model to outpaint. Missing panels leave an empty cell."""
-    canvas = np.full((cell_h * 2, cell_w * 2, 3), fill, np.uint8)
+    """Arrange up to 4 panels into a tight 2×2 grid (reading order TL, TR, BL,
+    BR) with thin white gutters. Cell height tracks the panels' median aspect so
+    each panel fills its cell with minimal empty margin (a big improvement over
+    fixed 9:16 cells, which left huge bands the model would fill with junk).
+    Panels are contain-fit (no cropping → characters preserved). The model then
+    cleans text + extends backgrounds into the gutters and reframes to 9:16."""
+    present = [p for p in panels_bgr[:4] if p is not None and getattr(p, "size", 0)]
+    aspects = sorted(p.shape[1] / p.shape[0] for p in present) if present else [1.4]
+    cell_ar = aspects[len(aspects) // 2]  # median width/height
+    cell_h = max(1, int(round(cell_w / cell_ar)))
+    W = cell_w * 2 + gutter * 3
+    H = cell_h * 2 + gutter * 3
+    canvas = np.full((H, W, 3), fill, np.uint8)
     for i, pn in enumerate(panels_bgr[:4]):
-        if pn is None or pn.size == 0:
+        if pn is None or getattr(pn, "size", 0) == 0:
             continue
         ph, pw = pn.shape[:2]
         s = min(cell_w / pw, cell_h / ph)
         nw, nh = max(1, int(pw * s)), max(1, int(ph * s))
         resized = cv2.resize(pn, (nw, nh))
         r, c = divmod(i, 2)
-        x0 = c * cell_w + (cell_w - nw) // 2
-        y0 = r * cell_h + (cell_h - nh) // 2
+        cx, cy = gutter + c * (cell_w + gutter), gutter + r * (cell_h + gutter)
+        x0, y0 = cx + (cell_w - nw) // 2, cy + (cell_h - nh) // 2
         canvas[y0:y0 + nh, x0:x0 + nw] = resized
     return canvas
 

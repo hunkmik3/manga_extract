@@ -57,19 +57,20 @@ REFERENCE_CLAUSE = (
 # Combine 4 panels (pre-stitched into a rough 2×2) into one clean vertical 9:16
 # storyboard image: remove text, keep characters 100% faithful, extend only
 # backgrounds. Sent with the stitched composite as the single source image.
-COMBINE_2X2_PROMPT = """Convert the source comic/manga/manhwa page into a single vertical 9:16 image containing four story panels arranged in a 2×2 grid layout.
+COMBINE_2X2_PROMPT = """The source image is ALREADY a 2×2 grid of four chosen comic/manga/manhwa panels in reading order (top-left → top-right → bottom-left → bottom-right), separated by plain margins.
+
+YOUR TASK — do ONLY these two things:
+1. Remove all text/bubbles/SFX and reconstruct the artwork hidden behind them.
+2. Seamlessly extend each panel's own background into the surrounding plain/empty margin areas so the four panels merge into one clean, gap-free vertical 9:16 image.
+
+DO NOT re-select, swap, reorder, move, resize, crop out, duplicate, or redraw any panel. DO NOT invent new panels, new characters, or extra sub-images. Keep exactly these four panels in these exact 2×2 positions. The plain margin areas are empty space to fill by extending the adjacent panel's background ONLY — never place new subjects there.
 
 LAYOUT
 
 [ Panel 1 ] [ Panel 2 ]
 [ Panel 3 ] [ Panel 4 ]
 
-The entire composition must fit inside one vertical 9:16 canvas.
-
-All four panels should have equal visual weight and occupy approximately the same amount of screen space.
-
-Panels must be arranged according to the original reading order:
-top-left → top-right → bottom-left → bottom-right.
+The final composition is one vertical 9:16 canvas, four panels of roughly equal visual weight, in the original reading order above.
 
 CRITICAL RULE: STAY 100% FAITHFUL TO THE ORIGINAL ARTWORK
 

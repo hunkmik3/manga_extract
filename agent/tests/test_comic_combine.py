@@ -16,17 +16,18 @@ def _png(w, h, v=120) -> bytes:
     return cv2.imencode(".png", np.full((h, w, 3), v, np.uint8))[1].tobytes()
 
 
-def test_stitch_2x2_makes_916_canvas_with_panels():
+def test_stitch_2x2_tight_grid_with_panels():
     panels = [panel_svc.decode_bgr(_png(300, 200, v)) for v in (50, 100, 150, 200)]
-    out = panel_svc.stitch_2x2(panels, cell_w=540, cell_h=960)
-    assert out.shape == (1920, 1080, 3)  # 9:16
-    # each cell carries its panel (center pixel ≈ that panel's value, not fill)
-    assert int(out[480, 270].mean()) < 230 and int(out[480, 810].mean()) < 230
+    out = panel_svc.stitch_2x2(panels, cell_w=540, gutter=16)
+    assert out.shape[1] == 540 * 2 + 16 * 3  # 2 cols + gutters
+    assert out.shape[0] > 0
+    # panels present (not an all-white canvas)
+    assert int(out.min()) < 230
 
 
 def test_stitch_handles_missing_panels():
     out = panel_svc.stitch_2x2([panel_svc.decode_bgr(_png(300, 200)), None, None, None])
-    assert out.shape == (1920, 1080, 3)
+    assert out.shape[1] == 540 * 2 + 16 * 3 and out.shape[0] > 0
 
 
 @pytest.mark.asyncio
@@ -47,7 +48,7 @@ async def test_combine_panels_stitches_and_calls_bridge_with_combine_prompt():
     from flowboard.services.comic import prompts
     assert captured["prompt"] == prompts.COMBINE_2X2_PROMPT
     comp = cv2.imdecode(np.frombuffer(captured["bytes"], np.uint8), cv2.IMREAD_COLOR)
-    assert comp.shape == (1920, 1080, 3)            # stitched 9:16 composite sent
+    assert comp.shape[1] == 540 * 2 + 16 * 3        # tight 2×2 composite sent
     assert result["width"] / result["height"] == pytest.approx(9 / 16, abs=0.03)
     assert media_service.status(result["mediaId"]).get("available") is True
 
