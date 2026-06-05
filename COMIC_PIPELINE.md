@@ -21,7 +21,7 @@ make install            # agent venv (agent/.venv) + frontend npm install
 # (or `make install-dev` to also get pytest/ruff for running tests)
 
 # OPTIONAL — ML extras (YOLO panel detector + CCIP character tracking). Heavy (torch ~hundreds of MB):
-cd agent && .venv/bin/pip install -e ".[ml]" && cd ..
+cd agent && uv pip install --python .venv/bin/python -e ".[ml]" && cd ..
 ```
 Without `[ml]`, panel detection still works (the pure-OpenCV heuristic); the
 "YOLO"/"Auto" detector and the Character DB need `[ml]`.
@@ -75,6 +75,42 @@ Notes:
 ```bash
 cd agent && .venv/bin/python -m pytest
 ```
+
+## Windows desktop build (single-process `.exe`)
+
+Instead of running two dev servers, the agent can serve the compiled UI itself
+so the whole app is **one process on one port** (auto-opens the browser). That
+single process is what gets packaged into a Windows bundle.
+
+**What it is / isn't:** the bundle starts a local server and opens the UI in
+your default browser (Chrome/Edge) — it is *not* a native desktop window, and
+it does **not** include the Chrome bridge extension. Generation still needs the
+`extension/` loaded + a signed-in Flow tab, exactly like the dev setup.
+
+### Get it from CI (recommended)
+GitHub Actions (`.github/workflows/build-exe.yml`, `windows-latest`) builds the
+**full** bundle (CPU-only torch → YOLO/Auto detector + Character DB work):
+- **Actions → build-exe → Run workflow** → download the `flowboard-full-windows` artifact, **or**
+- push a tag `vX.Y.Z` → the zip is also attached to the GitHub Release.
+
+Unzip → run `flowboard\flowboard.exe`. Data (DB + cached media) is written to a
+`storage/` folder next to the exe.
+
+### Build it yourself
+```bash
+# 1. compile the frontend (the agent serves dist/ same-origin)
+cd frontend && npm ci && npm run build && cd ..
+# 2. install PyInstaller into the agent venv
+uv pip install --python agent/.venv/bin/python pyinstaller
+# 3a. lite bundle (~180 MB, heuristic detector only — no YOLO/Character DB):
+agent/.venv/bin/pyinstaller packaging/flowboard.spec --noconfirm
+# 3b. or full bundle (needs the [ml] extras installed; large):
+FLOWBOARD_BUNDLE_ML=1 agent/.venv/bin/pyinstaller packaging/flowboard.spec --noconfirm
+# → dist/flowboard/flowboard(.exe)
+```
+> No-build single-process launcher (dev): `agent/.venv/bin/python agent/run_app.py`
+> runs the agent without `--reload` and opens the UI — keeps the extension
+> connection stable.
 
 ## What's NOT in the repo (gitignored)
 - `.env` (your key), `agent/.venv`, `frontend/node_modules`, `storage/` (the

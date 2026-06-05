@@ -39,6 +39,10 @@ coverage/
 .turbo/
 **/tsconfig.tsbuildinfo
 
+# PyInstaller desktop build (packaging/flowboard.spec → dist/ + build/, ignored
+# above) + the zipped bundle produced locally or in CI
+flowboard-*.zip
+
 # OMC ephemeral state (session caches, runtime checkpoints) — plans/ kept
 .omc/state/
 
