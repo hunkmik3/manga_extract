@@ -133,3 +133,38 @@ async def ext_callback(
 
     matched = flow_client.resolve_callback(payload)
     return {"ok": matched}
+
+
+# ── Serve the bundled frontend (single-process / packaged exe) ──────────────
+# Mounted LAST so every API/media route registered above wins; only unmatched
+# GET paths fall through to the SPA. Skipped entirely in dev when there's no
+# build (Vite serves :5173 and the agent stays API-only).
+from fastapi.responses import FileResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+from flowboard.config import frontend_dist_dir  # noqa: E402
+
+_DIST = frontend_dist_dir()
+if _DIST is not None:
+    _DIST_RESOLVED = _DIST.resolve()
+    _ASSETS = _DIST / "assets"
+    if _ASSETS.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_ASSETS)), name="assets")
+
+    logger.info("serving bundled frontend from %s", _DIST)
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa(full_path: str) -> FileResponse:
+        # Never shadow the API / media / ws surface — let those 404 naturally.
+        if full_path.startswith(("api/", "media/", "ws", "assets/")):
+            raise HTTPException(status_code=404, detail="not found")
+        # Serve a real static file (favicon, vite.svg, …) when it exists and is
+        # safely under dist/; otherwise hand back index.html for client routing.
+        candidate = (_DIST / full_path).resolve()
+        try:
+            candidate.relative_to(_DIST_RESOLVED)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="not found")
+        if full_path and candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(_DIST / "index.html"))

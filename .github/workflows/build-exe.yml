@@ -1,0 +1,79 @@
+name: build-exe
+
+# Builds the full (ML-enabled) single-process Windows desktop bundle:
+#   FastAPI agent + extension WS + worker + compiled React UI, packaged with
+#   PyInstaller (onedir) and zipped. CPU-only torch keeps it runnable on any
+#   Windows machine (no GPU/CUDA required).
+#
+# Triggers:
+#   - manual (Actions → build-exe → Run workflow)  → downloadable artifact
+#   - pushing a tag like v1.2.3                     → also attached to a Release
+#
+# NOTE: the Chrome "Flowboard Bridge" extension is NOT in the bundle — load it
+# from ./extension and sign in to Flow to enable generation.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to attach the zip to a Release on tag pushes
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── build the frontend (served same-origin by the agent) ──────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      # ── python deps: base agent + ML stack (CPU torch) + pyinstaller ──────
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install agent + ML deps (CPU-only torch)
+        working-directory: agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install ultralytics onnxruntime dghs-imgutils huggingface_hub scikit-learn
+          pip install pyinstaller
+
+      # ── package (onedir) ──────────────────────────────────────────────────
+      - name: PyInstaller (full ML)
+        env:
+          FLOWBOARD_BUNDLE_ML: "1"
+        run: pyinstaller packaging/flowboard.spec --noconfirm
+
+      - name: Zip bundle
+        run: Compress-Archive -Path dist/flowboard -DestinationPath flowboard-full-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowboard-full-windows
+          path: flowboard-full-windows.zip
+          if-no-files-found: error
+
+      # ── attach to the Release when this run is for a tag ──────────────────
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: flowboard-full-windows.zip
