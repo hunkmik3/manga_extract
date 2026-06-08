@@ -52,6 +52,13 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   const [regenVariants, setRegenVariants] = useState(1); // "x4" on Flow — N candidates per ↻
   const [regenning, setRegenning] = useState<number[]>([]); // cells queued/in-flight
   const [cellCandidates, setCellCandidates] = useState<Record<number, (string | null)[]>>({}); // cell → variants awaiting a pick
+  const [showHistory, setShowHistory] = useState(false);
+  // Every image ever produced for each cell (combine + all re-gen candidates),
+  // keyed by cell index as a string. Persisted on the node so the user can
+  // re-pick an earlier result from the history panel.
+  const cellHistory = (data.cellHistory && typeof data.cellHistory === "object"
+    ? (data.cellHistory as Record<string, (string | null)[]>)
+    : {});
   const queueRef = useRef<number[]>([]);
   const processingRef = useRef(false);
   const panels = (Array.isArray(data.panels) ? data.panels : []) as PanelSpec[];
@@ -88,8 +95,27 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     runComicRequest(
       rfId,
       () => createRequest({ type: "combine_panels", node_id: parseInt(rfId, 10), params }),
-      (result) => ({ mediaId: (result.mediaId as string) ?? "", cells: (result.cells as (string | null)[]) ?? [], width: result.width, height: result.height }),
+      (result) => {
+        const newCells = (result.cells as (string | null)[]) ?? [];
+        // A fresh combine resets history to the cells it just produced.
+        const hist: Record<string, (string | null)[]> = {};
+        newCells.forEach((c, i) => { if (typeof c === "string" && c) hist[String(i)] = [c]; });
+        return { mediaId: (result.mediaId as string) ?? "", cells: newCells, width: result.width, height: result.height, cellHistory: hist };
+      },
     );
+  }
+
+  // Append image ids to a cell's history (dedup, cap), reading the freshest
+  // value from the store so concurrent re-gens don't clobber each other.
+  function pushHistory(index: number, ids: (string | null)[]) {
+    const node = useBoardStore.getState().nodes.find((n) => n.id === rfId);
+    const cur = ((node?.data?.cellHistory as Record<string, (string | null)[]>) ?? {});
+    const key = String(index);
+    const merged = Array.isArray(cur[key]) ? [...cur[key]] : [];
+    for (const id of ids) {
+      if (typeof id === "string" && id && !merged.includes(id)) merged.push(id);
+    }
+    patchComicNode(rfId, { cellHistory: { ...cur, [key]: merged.slice(-24) } });
   }
 
   // Queue a cell for re-gen. Several can be queued at once; they run one at a
@@ -133,6 +159,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
           // x4: stash the candidates for this cell — the user picks one (pickCandidate).
           const ids = result.candidates as (string | null)[];
           setCellCandidates((prev) => ({ ...prev, [i]: ids }));
+          pushHistory(i, ids); // keep every candidate in the cell's history
         } else {
           working = (result.cells as (string | null)[]) ?? working;
           patchComicNode(rfId, {
@@ -143,6 +170,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
             status: "done",
             error: undefined,
           });
+          pushHistory(i, [working[i]]); // single re-gen → record the new image
         }
       } catch (err) {
         patchComicNode(rfId, { status: "error", error: `cell ${i + 1}: ${String(err)}` });
@@ -376,6 +404,54 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
             </button>
           )}
         </div>
+      )}
+
+      {Object.values(cellHistory).some((h) => Array.isArray(h) && h.length > 1) && (
+        <>
+          <button
+            className="comic-btn"
+            onClick={() => setShowHistory((v) => !v)}
+            title="Show every image generated for each cell — click one to restore it"
+          >
+            🕘 {showHistory ? "Hide history" : "History"}
+          </button>
+          {showHistory && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {[0, 1, 2, 3].map((i) => {
+                const hist = (cellHistory[String(i)] ?? []).filter(
+                  (x): x is string => typeof x === "string" && !!x,
+                );
+                if (hist.length === 0) return null;
+                return (
+                  <div key={i}>
+                    <p style={{ fontSize: 9, opacity: 0.55, margin: "0 0 2px" }}>Cell {i + 1} · {hist.length}</p>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 3 }}>
+                      {hist.map((cid, k) => {
+                        const isCurrent = cells[i] === cid;
+                        return (
+                          <img
+                            key={k}
+                            src={mediaUrl(cid)}
+                            alt={`cell ${i + 1} v${k + 1}`}
+                            loading="lazy"
+                            onClick={() => { if (!isCurrent) void pickCandidate(i, cid); }}
+                            title={isCurrent ? "Current" : "Restore this version"}
+                            style={{
+                              width: "100%", borderRadius: 3, display: "block",
+                              cursor: isCurrent ? "default" : "pointer", background: "var(--border)",
+                              outline: isCurrent ? "2px solid #6aa3ff" : "1px solid transparent",
+                              outlineOffset: -2, opacity: isCurrent ? 1 : 0.85,
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
 
       <button className="comic-btn" onClick={run} disabled={isBusy || regenning.length > 0 || panels.length === 0} title="Clean each panel then stitch a 2×2 9:16">
