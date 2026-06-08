@@ -9,7 +9,11 @@ import pytest
 
 from flowboard.services import media as media_service
 from flowboard.services.comic import panels as panel_svc
-from flowboard.worker.processor import _handle_combine_panels, _handle_regen_cell
+from flowboard.worker.processor import (
+    _handle_combine_panels,
+    _handle_regen_cell,
+    _handle_restitch_cells,
+)
 
 
 def _png(w, h, v=120) -> bytes:
@@ -113,6 +117,44 @@ async def test_regen_cell_recleans_one_and_restitches():
     assert result["cells"][1] != cells[1]                  # cell 1 replaced
     assert result["cells"][0] == cells[0] and result["cells"][2] == cells[2]  # others reused
     assert media_service.status(result["mediaId"]).get("available") is True
+
+
+@pytest.mark.asyncio
+async def test_regen_cell_variant_count_returns_candidates_without_committing():
+    """x4: regen returns 4 candidates for the cell and does NOT touch the grid
+    (no mediaId/cells) — the user picks one, then restitch_cells commits it."""
+    page = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(page, _png(900, 1200), kind="image", mime="image/png")
+    cells = [_ingest(_png(400, 711)) for _ in range(4)]
+    panel = {"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 200}}
+
+    variants = AsyncMock(return_value=[_png(400, 711) for _ in range(4)])
+    with patch("flowboard.services.comic.bridge.edit_image_variants", variants):
+        result, err = await _handle_regen_cell(
+            {"project_id": "p", "panel": panel, "cells": cells, "index": 2, "variant_count": 4}
+        )
+    assert err is None
+    assert variants.await_args.kwargs["variant_count"] == 4
+    assert result.get("index") == 2
+    assert len(result["candidates"]) == 4
+    assert "mediaId" not in result and "cells" not in result  # grid untouched
+    for mid in result["candidates"]:
+        assert media_service.status(mid).get("available") is True
+
+
+@pytest.mark.asyncio
+async def test_restitch_cells_builds_composite_from_cells():
+    cells = [_ingest(_png(400, 711)) for _ in range(4)]
+    result, err = await _handle_restitch_cells({"cells": cells})
+    assert err is None
+    assert result["cells"] == cells
+    assert media_service.status(result["mediaId"]).get("available") is True
+    assert result["width"] > 0 and result["height"] > 0
+
+
+@pytest.mark.asyncio
+async def test_restitch_cells_errors_without_cells():
+    assert (await _handle_restitch_cells({}))[1] == "missing_cells"
 
 
 @pytest.mark.asyncio

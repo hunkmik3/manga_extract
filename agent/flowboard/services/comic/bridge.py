@@ -117,14 +117,39 @@ async def edit_image(
 ) -> bytes:
     """Edit one image through the Flow bridge and return the result bytes.
 
-    Uploads ``image_bytes`` (and each of ``reference_images``) into the board's
-    Flow project, runs ``edit_image`` with ``prompt`` (Nano Banana Pro by
-    default), ingests the result URL and downloads the bytes back. The generate
-    step is retried up to ``max_attempts`` times; uploads are done once and
-    reused. Raises ``BridgeEditError`` if no usable image comes back.
+    Thin wrapper over :func:`edit_image_variants` for the common single-output
+    case — returns the first (only) variant's bytes.
+    """
+    outs = await edit_image_variants(
+        image_bytes, prompt, reference_images,
+        project_id=project_id, aspect_ratio=aspect_ratio, image_model=image_model,
+        paygate_tier=paygate_tier, mime=mime, max_attempts=max_attempts, variant_count=1,
+    )
+    return outs[0]
 
-    The order of inputs to Flow is BASE_IMAGE (``image_bytes``) first, then the
-    references — handled inside ``flow_sdk.edit_image``.
+
+async def edit_image_variants(
+    image_bytes: bytes,
+    prompt: str,
+    reference_images: Optional[Sequence[bytes]] = None,
+    *,
+    project_id: str,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    image_model: Optional[str] = None,
+    paygate_tier: Optional[str] = None,
+    mime: str = "image/png",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    variant_count: int = 1,
+) -> list[bytes]:
+    """Edit one image and return up to ``variant_count`` result candidates.
+
+    Uploads ``image_bytes`` (and each of ``reference_images``) into the board's
+    Flow project once, then runs Nano Banana Pro with ``variant_count`` (1-4)
+    replicated seeds — the "x4" on the Flow UI — and downloads every candidate
+    back. The generate step is retried up to ``max_attempts`` times (uploads are
+    reused). Returns the candidates that downloaded (≥1); raises
+    ``BridgeEditError`` if none come back. The order of inputs to Flow is
+    BASE_IMAGE (``image_bytes``) first, then the references.
     """
     if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) == 0:
         raise ValueError("image_bytes must be non-empty bytes")
@@ -170,6 +195,7 @@ async def edit_image(
                 aspect_ratio=aspect_ratio,
                 paygate_tier=tier,
                 image_model=image_model,
+                variant_count=variant_count,
             )
         except Exception as exc:  # noqa: BLE001 — transport/bridge errors are retryable
             last_reason = f"sdk_raised: {exc}"
@@ -199,20 +225,22 @@ async def edit_image(
         except Exception:  # noqa: BLE001 — caching bookkeeping must not abort the edit
             logger.exception("ingest_urls failed (continuing to fetch result)")
 
-        result_id = entries[0]["media_id"]
-        fetched = await media_service.fetch_and_cache(result_id)
-        if fetched is None:
-            last_reason = f"fetch_failed: {result_id}"
+        outs: list[bytes] = []
+        for e in entries:
+            fetched = await media_service.fetch_and_cache(e["media_id"])
+            if fetched is not None:
+                outs.append(fetched[0])
+        if not outs:
+            last_reason = f"fetch_failed: {entries[0]['media_id']}"
             logger.warning("edit_image attempt %d/%d: %s", attempt, max_attempts, last_reason)
             await _backoff(attempt, max_attempts)
             continue
 
-        out_bytes = fetched[0]
         logger.info(
-            "edit_image ok on attempt %d/%d: %d bytes (media_id=%s)",
-            attempt, max_attempts, len(out_bytes), result_id,
+            "edit_image ok on attempt %d/%d: %d/%d variant(s) (%d bytes first)",
+            attempt, max_attempts, len(outs), len(entries), len(outs[0]),
         )
-        return out_bytes
+        return outs
 
     raise BridgeEditError(last_reason, attempts=max_attempts)
 

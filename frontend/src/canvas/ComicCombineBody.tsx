@@ -49,7 +49,9 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   const lastHeightRef = useRef(0);
   const relayoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [regenPrompt, setRegenPrompt] = useState("");
+  const [regenVariants, setRegenVariants] = useState(1); // "x4" on Flow — N candidates per ↻
   const [regenning, setRegenning] = useState<number[]>([]); // cells queued/in-flight
+  const [cellCandidates, setCellCandidates] = useState<Record<number, (string | null)[]>>({}); // cell → variants awaiting a pick
   const queueRef = useRef<number[]>([]);
   const processingRef = useRef(false);
   const panels = (Array.isArray(data.panels) ? data.panels : []) as PanelSpec[];
@@ -62,8 +64,8 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   const useCharacterRefs = Boolean(data.useCharacterRefs);
 
   // Keep the freshest values for the async re-gen queue (avoids stale closures).
-  const latestRef = useRef({ panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt });
-  latestRef.current = { panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt };
+  const latestRef = useRef({ panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt, regenVariants });
+  latestRef.current = { panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt, regenVariants };
 
   async function project(): Promise<string | null> {
     const boardId = useBoardStore.getState().boardId;
@@ -124,17 +126,24 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       const params: Record<string, unknown> = { project_id: projectId, panel, cells: working, index: i };
       if (L.useCharacterRefs && L.characterRefs?.length) params.characters = L.characterRefs;
       if (L.regenPrompt.trim()) params.prompt = L.regenPrompt.trim();
+      if (L.regenVariants > 1) params.variant_count = L.regenVariants;
       try {
         const result = await runRequestToResult(createRequest({ type: "regen_cell", node_id: parseInt(rfId, 10), params }));
-        working = (result.cells as (string | null)[]) ?? working;
-        patchComicNode(rfId, {
-          mediaId: (result.mediaId as string) ?? L.mediaId,
-          cells: working,
-          width: result.width,
-          height: result.height,
-          status: "done",
-          error: undefined,
-        });
+        if (Array.isArray(result.candidates)) {
+          // x4: stash the candidates for this cell — the user picks one (pickCandidate).
+          const ids = result.candidates as (string | null)[];
+          setCellCandidates((prev) => ({ ...prev, [i]: ids }));
+        } else {
+          working = (result.cells as (string | null)[]) ?? working;
+          patchComicNode(rfId, {
+            mediaId: (result.mediaId as string) ?? L.mediaId,
+            cells: working,
+            width: result.width,
+            height: result.height,
+            status: "done",
+            error: undefined,
+          });
+        }
       } catch (err) {
         patchComicNode(rfId, { status: "error", error: `cell ${i + 1}: ${String(err)}` });
       } finally {
@@ -142,6 +151,32 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       }
     }
     processingRef.current = false;
+  }
+
+  // Commit a chosen re-gen candidate into the grid, then re-stitch the 2×2.
+  async function pickCandidate(index: number, chosen: string) {
+    const next = [...latestRef.current.cells];
+    next[index] = chosen;
+    setCellCandidates((prev) => {
+      const copy = { ...prev };
+      delete copy[index];
+      return copy;
+    });
+    try {
+      const result = await runRequestToResult(
+        createRequest({ type: "restitch_cells", node_id: parseInt(rfId, 10), params: { cells: next } }),
+      );
+      patchComicNode(rfId, {
+        mediaId: (result.mediaId as string) ?? mediaId,
+        cells: (result.cells as (string | null)[]) ?? next,
+        width: result.width,
+        height: result.height,
+        status: "done",
+        error: undefined,
+      });
+    } catch (err) {
+      patchComicNode(rfId, { status: "error", error: `restitch: ${String(err)}` });
+    }
   }
 
   function triggerDownload(url: string, name: string) {
@@ -264,10 +299,22 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
             spellCheck={false}
             style={{ width: "100%", boxSizing: "border-box", fontSize: 10, padding: "4px 6px", resize: "vertical", fontFamily: "inherit" }}
           />
+          <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10 }} title="Candidates per ↻ (Flow x1–x4). >1 lets you pick the best.">
+            <span style={{ opacity: 0.7 }}>Variants</span>
+            {[1, 2, 3, 4].map((k) => (
+              <button
+                key={k}
+                className="comic-btn comic-btn--sm"
+                onClick={() => setRegenVariants(k)}
+                style={{ flex: 1, opacity: regenVariants === k ? 1 : 0.5, fontWeight: regenVariants === k ? 700 : 400 }}
+              >x{k}</button>
+            ))}
+          </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
             {[0, 1, 2, 3].map((i) => {
               const busyCell = regenning.includes(i);
               const waiting = queueRef.current.includes(i); // still in queue = not the active one
+              const cand = cellCandidates[i];
               return (
                 <div key={i} style={{ position: "relative" }}>
                   {cells[i] ? (
@@ -281,11 +328,29 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                       <span>{waiting ? "queued…" : "re-generating…"}</span>
                     </div>
                   )}
+                  {cand && (
+                    <div className="comic-cell-regen" style={{ gap: 3, padding: 3, display: "grid", gridTemplateColumns: "1fr 1fr", alignContent: "center", overflow: "auto" }}>
+                      <span style={{ gridColumn: "1 / -1", textAlign: "center" }}>pick one:</span>
+                      {cand.map((cid, k) =>
+                        cid ? (
+                          <img
+                            key={k}
+                            src={mediaUrl(cid)}
+                            alt={`candidate ${k + 1}`}
+                            loading="lazy"
+                            onClick={() => pickCandidate(i, cid)}
+                            title={`Use candidate ${k + 1}`}
+                            style={{ width: "100%", borderRadius: 2, display: "block", cursor: "pointer" }}
+                          />
+                        ) : null
+                      )}
+                    </div>
+                  )}
                   <button
                     className="comic-btn comic-btn--sm"
                     onClick={() => regenCell(i)}
-                    disabled={isBusy || busyCell || !panels[i]}
-                    title={regenPrompt.trim() ? `Re-gen cell ${i + 1} with your custom prompt` : `Re-gen cell ${i + 1} (default clean + extend)`}
+                    disabled={isBusy || busyCell || !!cand || !panels[i]}
+                    title={regenVariants > 1 ? `Re-gen cell ${i + 1} → ${regenVariants} candidates to pick` : regenPrompt.trim() ? `Re-gen cell ${i + 1} with your custom prompt` : `Re-gen cell ${i + 1} (default clean + extend)`}
                     style={{ position: "absolute", top: 2, right: 2, padding: "1px 6px", fontSize: 11, background: "rgba(0,0,0,0.55)" }}
                   >↻</button>
                 </div>

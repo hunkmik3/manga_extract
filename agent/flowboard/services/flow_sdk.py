@@ -894,16 +894,22 @@ class FlowSDK:
         aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
         paygate_tier: Optional[str] = None,
         image_model: Optional[str] = None,
+        variant_count: int = 1,
     ) -> dict[str, Any]:
         """Refine an existing image with an optional list of reference media.
 
         Order of ``imageInputs`` matters — flowkit puts BASE_IMAGE first so
         Flow knows which is the canonical source.
 
+        ``variant_count`` (1-4) replicates the request item with distinct seeds
+        so Flow returns several edited candidates in one dispatch (the "x4" on
+        the Flow UI). ``media_entries`` holds one entry per variant.
+
         ``paygate_tier`` is required. See ``gen_video`` for rationale.
         """
         if paygate_tier is None:
             raise ValueError("paygate_tier is required — caller must resolve before dispatch")
+        n = max(1, min(int(variant_count), MAX_VARIANT_COUNT))
         ts = int(time.time() * 1000)
         ctx = _client_context(project_id, paygate_tier)
         model_name = resolve_image_model(image_model)
@@ -917,19 +923,21 @@ class FlowSDK:
                     {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
                 )
 
-        request_item = {
-            "clientContext": {**ctx, "sessionId": f";{ts}"},
-            "seed": ts % 1_000_000,
-            "structuredPrompt": {"parts": [{"text": prompt}]},
-            "imageAspectRatio": aspect_ratio,
-            "imageModelName": model_name,
-            "imageInputs": image_inputs,
-        }
+        requests_arr: list[dict[str, Any]] = []
+        for i in range(n):
+            requests_arr.append({
+                "clientContext": {**ctx, "sessionId": f";{ts + i}"},
+                "seed": (ts + i * 9973) % 1_000_000,  # distinct seed per variant
+                "structuredPrompt": {"parts": [{"text": prompt}]},
+                "imageAspectRatio": aspect_ratio,
+                "imageModelName": model_name,
+                "imageInputs": list(image_inputs),
+            })
         body = {
             "clientContext": ctx,
             "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
             "useNewMedia": True,
-            "requests": [request_item],
+            "requests": requests_arr,
         }
 
         resp = await self._client.api_request(

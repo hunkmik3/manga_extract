@@ -982,36 +982,48 @@ def _page_ref_bytes(params: dict) -> Optional[bytes]:
 
 async def _bridge_edit(
     raw: bytes, prompt: str, *, project_id: str, aspect: str, image_model: Optional[str],
-    references: Optional[list[bytes]], pad_916: bool, node_id,
+    references: Optional[list[bytes]], pad_916: bool, node_id, variant_count: int = 1,
 ) -> tuple[dict, Optional[str]]:
     """Run bridge.edit_image(raw + refs, prompt) → (optional 9:16 letterbox) →
-    cache → return media_id + dims."""
+    cache → return media_id + dims. With ``variant_count`` > 1, return every
+    candidate in ``mediaIds`` (the "x4" on Flow) — ``mediaId`` is the first."""
     from flowboard.services.comic import bridge, panels as panel_svc
     import uuid
 
+    n = max(1, min(int(variant_count or 1), 4))
     try:
-        out = await bridge.edit_image(
-            raw, prompt, reference_images=references,
-            project_id=project_id, aspect_ratio=aspect, image_model=image_model,
-        )
+        if n == 1:
+            outs = [await bridge.edit_image(
+                raw, prompt, reference_images=references,
+                project_id=project_id, aspect_ratio=aspect, image_model=image_model,
+            )]
+        else:
+            outs = await bridge.edit_image_variants(
+                raw, prompt, reference_images=references,
+                project_id=project_id, aspect_ratio=aspect, image_model=image_model,
+                variant_count=n,
+            )
     except bridge.BridgeEditError as exc:
         return {}, f"bridge_failed: {exc.reason}"[:200]
 
-    if pad_916:
-        try:
-            out = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
-        except Exception:  # noqa: BLE001
-            pass
-
-    media_id = str(uuid.uuid4())
-    media_service.ingest_inline_bytes(media_id, out, kind="image", mime="image/png")
+    media_ids: list[str] = []
     w = h = 0
-    try:
-        img = panel_svc.decode_bgr(out)
-        h, w = int(img.shape[0]), int(img.shape[1])
-    except Exception:  # noqa: BLE001
-        pass
-    return {"mediaId": media_id, "width": w, "height": h, "node_id": node_id}, None
+    for out in outs:
+        if pad_916:
+            try:
+                out = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
+            except Exception:  # noqa: BLE001
+                pass
+        mid = str(uuid.uuid4())
+        media_service.ingest_inline_bytes(mid, out, kind="image", mime="image/png")
+        media_ids.append(mid)
+        if w == 0:
+            try:
+                img = panel_svc.decode_bgr(out)
+                h, w = int(img.shape[0]), int(img.shape[1])
+            except Exception:  # noqa: BLE001
+                pass
+    return {"mediaId": media_ids[0], "mediaIds": media_ids, "width": w, "height": h, "node_id": node_id}, None
 
 
 async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
@@ -1050,6 +1062,7 @@ async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
     return await _bridge_edit(
         raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
         references=refs, pad_916=extend, node_id=params.get("__node_id"),
+        variant_count=params.get("variant_count") or 1,
     )
 
 
@@ -1133,6 +1146,7 @@ async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     return await _bridge_edit(
         raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
         references=refs or None, pad_916=False, node_id=params.get("__node_id"),
+        variant_count=params.get("variant_count") or 1,
     )
 
 
@@ -1289,10 +1303,26 @@ def _ingest_pngs(pngs: list) -> list:
     return [None if p is None else _ingest_png(p) for p in pngs]
 
 
+def _stitch_cells(cells: list) -> tuple[bytes, int, int]:
+    """Code-stitch the 2×2 composite from up to 4 cell media ids (each already a
+    cleaned 9:16 cell). Missing/unreadable cells become blank slots."""
+    from flowboard.services.comic import panels as panel_svc
+    bgrs = []
+    for cid in cells[:4]:
+        path = media_service.cached_path(cid) if isinstance(cid, str) else None
+        try:
+            bgrs.append(panel_svc.decode_bgr(path.read_bytes()) if path else None)
+        except Exception:  # noqa: BLE001
+            bgrs.append(None)
+    comp = panel_svc.stitch_2x2(bgrs)
+    return panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+
+
 async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     """Re-clean ONE panel of a combine group and re-stitch the 2×2, reusing the
     other (already-cleaned) cells. Lets the user fix the one cell that came out
-    wrong without re-running all four."""
+    wrong without re-running all four. With ``variant_count`` > 1, returns
+    ``candidates`` for the cell instead of committing — the user picks one."""
     from flowboard.services.comic import bridge, panels as panel_svc, prompts
 
     project_id = params.get("project_id")
@@ -1323,31 +1353,54 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     custom = custom.strip() if isinstance(custom, str) else ""
     base = custom or (prompts.CLEAN_PROMPT + prompts.EXTEND_9_16)
     prompt = base + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
+    n = max(1, min(int(params.get("variant_count") or 1), 4))
     try:
-        out = await bridge.edit_image(
-            raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
-            aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
-        )
+        if n == 1:
+            outs = [await bridge.edit_image(
+                raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
+                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+            )]
+        else:
+            outs = await bridge.edit_image_variants(
+                raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
+                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                variant_count=n,
+            )
     except bridge.BridgeEditError as exc:
         return {}, f"bridge_failed: {exc.reason}"[:200]
 
+    def _pad_ingest(b: bytes) -> str:
+        return _ingest_png(panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(b), 9, 16)))
+
+    if n > 1:
+        # x4: return the candidates for this cell — the user picks one, then the
+        # frontend commits it via restitch_cells. Don't change the grid yet.
+        candidates = await asyncio.to_thread(lambda: [_pad_ingest(o) for o in outs])
+        return {"candidates": candidates, "index": index, "node_id": params.get("__node_id")}, None
+
     def _rebuild() -> tuple[list, bytes, int, int]:
         new_cells = list(cells)
-        bgr = panel_svc.decode_bgr(out)
-        bgr = panel_svc.pad_to_aspect(bgr, 9, 16)
-        new_cells[index] = _ingest_png(panel_svc.encode_png(bgr))
-        bgrs = []
-        for cid in new_cells[:4]:
-            path = media_service.cached_path(cid) if isinstance(cid, str) else None
-            try:
-                bgrs.append(panel_svc.decode_bgr(path.read_bytes()) if path else None)
-            except Exception:  # noqa: BLE001
-                bgrs.append(None)
-        comp = panel_svc.stitch_2x2(bgrs)
-        return new_cells, panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+        new_cells[index] = _pad_ingest(outs[0])
+        composite, w, h = _stitch_cells(new_cells)
+        return new_cells, composite, w, h
 
     new_cells, composite, w, h = await asyncio.to_thread(_rebuild)
     return {"mediaId": _ingest_png(composite), "cells": new_cells, "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_restitch_cells(params: dict) -> tuple[dict, Optional[str]]:
+    """Re-stitch the 2×2 from given cell media ids — used after the user picks a
+    re-gen candidate for one cell. Pure local (no bridge call)."""
+    cells = params.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return {}, "missing_cells"
+
+    def _do() -> tuple[str, int, int]:
+        composite, w, h = _stitch_cells(cells)
+        return _ingest_png(composite), w, h
+
+    mid, w, h = await asyncio.to_thread(_do)
+    return {"mediaId": mid, "cells": cells[:4], "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
 _DEFAULT_HANDLERS: dict[str, Handler] = {
@@ -1366,6 +1419,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "build_character_db": _handle_build_character_db,
     "combine_panels": _handle_combine_panels,
     "regen_cell": _handle_regen_cell,
+    "restitch_cells": _handle_restitch_cells,
 }
 
 
