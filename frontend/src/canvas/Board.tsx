@@ -189,22 +189,28 @@ export function Board() {
       let comicRemoved = false;
       const cascade = new Set<string>(); // panels orphaned by a deleted page
       const snapshot = useBoardStore.getState();
+      const removedIds: string[] = [];
       for (const c of changes) {
-        if (c.type === "remove") {
-          const n = snapshot.nodes.find((nn) => nn.id === c.id);
-          if (n && (COMIC_TYPES.has(n.data.type) || n.data.type === "comic_combine")) {
-            comicRemoved = true;
-          }
-          if (n && n.data.type === "comic_page") {
-            // Cascade: a page's panels are crops of it — delete them too.
-            for (const e of snapshot.edges) {
-              if (e.source !== c.id) continue;
-              const t = snapshot.nodes.find((nn) => nn.id === e.target);
-              if (t && t.data.type === "comic_panel") cascade.add(e.target);
-            }
-          }
-          void deleteNodeByRfId(c.id);
+        if (c.type !== "remove") continue;
+        removedIds.push(c.id);
+        const n = snapshot.nodes.find((nn) => nn.id === c.id);
+        if (n && (COMIC_TYPES.has(n.data.type) || n.data.type === "comic_combine")) {
+          comicRemoved = true;
         }
+        if (n && n.data.type === "comic_page") {
+          // Cascade: a page's panels are crops of it — delete them too.
+          for (const e of snapshot.edges) {
+            if (e.source !== c.id) continue;
+            const t = snapshot.nodes.find((nn) => nn.id === e.target);
+            if (t && t.data.type === "comic_panel") cascade.add(e.target);
+          }
+        }
+      }
+      if (removedIds.length > 0) {
+        // Snapshot for Ctrl+Z BEFORE deleting (state still has the nodes), as a
+        // single undo entry covering the whole removal (incl. cascade).
+        snapshot.recordDeleteUndo([...removedIds, ...cascade]);
+        removedIds.forEach((id) => void deleteNodeByRfId(id));
       }
       let next = applyNodeChanges(changes, useBoardStore.getState().nodes) as FlowNode[];
       if (cascade.size > 0) {
@@ -375,6 +381,34 @@ export function Board() {
     };
     el.addEventListener("keydown", onKeyDown);
     return () => el.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  // Ctrl/Cmd + A → select all nodes (then Delete removes them); Ctrl/Cmd + Z →
+  // undo the last deletion. Skipped while typing in an input/textarea/select.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      const active = document.activeElement;
+      const tag = (active?.tagName ?? "").toLowerCase();
+      if (
+        tag === "input" || tag === "textarea" || tag === "select" ||
+        (active instanceof HTMLElement && active.isContentEditable)
+      ) {
+        return;
+      }
+      const key = e.key.toLowerCase();
+      if (key === "a") {
+        const s = useBoardStore.getState();
+        if (s.nodes.length === 0) return;
+        e.preventDefault();
+        s.setNodes(s.nodes.map((n) => ({ ...n, selected: true })));
+      } else if (key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        void useBoardStore.getState().undo();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   return (
