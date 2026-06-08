@@ -17,6 +17,8 @@ export const PANEL_COLS = 3;
 export const PANEL_CELL_W = 165;
 export const PANEL_CELL_H = 185;
 export const ROW_GAP = 60;
+const COMBINE_GAP_Y = 56;
+const DEFAULT_COMBINE_H = 420;
 
 export const COMIC_TYPES = new Set([
   "comic_import",
@@ -342,6 +344,56 @@ export function relayoutComicChains(): void {
   });
   store.setNodes(newNodes);
   for (const [rfId, p] of moves) {
+    const dbId = parseInt(rfId, 10);
+    if (!Number.isNaN(dbId)) patchNode(dbId, { x: p.x, y: p.y }).catch(() => {});
+  }
+}
+
+function combineNodeHeight(n: FlowNode): number {
+  const measured = n.data.__measuredHeight;
+  if (typeof measured === "number" && Number.isFinite(measured) && measured > 0) {
+    return Math.max(180, measured);
+  }
+  return DEFAULT_COMBINE_H;
+}
+
+/** Re-pack combine nodes in each upload chain using their measured card height.
+ * Combine cards grow after a 9:16 result/cell grid appears; without moving the
+ * later combine nodes, the enlarged card visually overlaps the next one. */
+export function relayoutComicCombineChains(): void {
+  const store = useBoardStore.getState();
+  const { nodes, edges } = store;
+  const moves = new Map<string, { x: number; y: number }>();
+
+  for (const up of nodes.filter((n) => n.data.type === "comic_import")) {
+    const combineNodes = edges
+      .filter((e) => e.source === up.id)
+      .map((e) => nodes.find((n) => n.id === e.target))
+      .filter((n): n is FlowNode => !!n && n.data.type === "comic_combine")
+      .sort((a, b) => a.position.y - b.position.y);
+
+    if (combineNodes.length === 0) continue;
+
+    let curY = combineNodes[0].position.y;
+    for (const node of combineNodes) {
+      moves.set(node.id, { x: node.position.x, y: curY });
+      curY += combineNodeHeight(node) + COMBINE_GAP_Y;
+    }
+  }
+
+  if (moves.size === 0) return;
+  const changed = new Map<string, { x: number; y: number }>();
+  const nextNodes = nodes.map((n) => {
+    const mv = moves.get(n.id);
+    if (!mv || (Math.abs(n.position.x - mv.x) < 1 && Math.abs(n.position.y - mv.y) < 1)) {
+      return n;
+    }
+    changed.set(n.id, mv);
+    return { ...n, position: { x: mv.x, y: mv.y } };
+  });
+  if (changed.size === 0) return;
+  store.setNodes(nextNodes);
+  for (const [rfId, p] of changed) {
     const dbId = parseInt(rfId, 10);
     if (!Number.isNaN(dbId)) patchNode(dbId, { x: p.x, y: p.y }).catch(() => {});
   }

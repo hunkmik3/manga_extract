@@ -1,6 +1,13 @@
+import { useEffect, useRef, type MouseEvent } from "react";
 import { ensureBoardProject, mediaUrl } from "../api/client";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
-import { createRequest, patchComicNode, runComicRequest } from "./comicShared";
+import {
+  createRequest,
+  findCharacterDb,
+  patchComicNode,
+  relayoutComicCombineChains,
+  runComicRequest,
+} from "./comicShared";
 
 interface PanelSpec {
   pageMediaId: string;
@@ -37,12 +44,17 @@ function CellCrop({ p }: { p: PanelSpec }) {
  * be re-generated (↻) without re-running all four.
  */
 export function ComicCombineBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const lastHeightRef = useRef(0);
+  const relayoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const panels = (Array.isArray(data.panels) ? data.panels : []) as PanelSpec[];
   const cells = (Array.isArray(data.cells) ? data.cells : []) as (string | null)[];
   const mediaId = typeof data.mediaId === "string" ? data.mediaId : "";
   const status = typeof data.status === "string" ? data.status : "idle";
   const isBusy = status === "queued" || status === "running";
   const errorMsg = typeof data.error === "string" ? data.error : undefined;
+  const characterRefs = findCharacterDb();
+  const useCharacterRefs = Boolean(data.useCharacterRefs);
 
   async function project(): Promise<string | null> {
     const boardId = useBoardStore.getState().boardId;
@@ -60,9 +72,11 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     const projectId = await project();
     if (!projectId) return;
     const specs = panels.map((p) => ({ page_media_id: p.pageMediaId, box: p.box }));
+    const params: Record<string, unknown> = { project_id: projectId, panels: specs };
+    if (useCharacterRefs && characterRefs?.length) params.characters = characterRefs;
     runComicRequest(
       rfId,
-      () => createRequest({ type: "combine_panels", node_id: parseInt(rfId, 10), params: { project_id: projectId, panels: specs } }),
+      () => createRequest({ type: "combine_panels", node_id: parseInt(rfId, 10), params }),
       (result) => ({ mediaId: (result.mediaId as string) ?? "", cells: (result.cells as (string | null)[]) ?? [], width: result.width, height: result.height }),
     );
   }
@@ -72,16 +86,81 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     const projectId = await project();
     if (!projectId) return;
     const panel = { page_media_id: panels[i].pageMediaId, box: panels[i].box };
+    const params: Record<string, unknown> = { project_id: projectId, panel, cells, index: i };
+    if (useCharacterRefs && characterRefs?.length) params.characters = characterRefs;
     runComicRequest(
       rfId,
-      () => createRequest({ type: "regen_cell", node_id: parseInt(rfId, 10), params: { project_id: projectId, panel, cells, index: i } }),
+      () => createRequest({ type: "regen_cell", node_id: parseInt(rfId, 10), params }),
       (result) => ({ mediaId: (result.mediaId as string) ?? mediaId, cells: (result.cells as (string | null)[]) ?? cells, width: result.width, height: result.height }),
     );
   }
 
+  function triggerDownload(url: string, name: string) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function downloadCombined(e: MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    if (!mediaId) return;
+    triggerDownload(mediaUrl(mediaId), `comic-combine-${data.shortId ?? rfId}.png`);
+  }
+
+  function downloadCells(e: MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    // Save each cleaned cell as its own file. Stagger the clicks so the browser
+    // doesn't drop the later ones as "concurrent download" spam.
+    let n = 0;
+    cells.forEach((cid, i) => {
+      if (typeof cid !== "string" || !cid) return;
+      const delay = n++ * 250;
+      const url = mediaUrl(cid);
+      setTimeout(() => triggerDownload(url, `comic-combine-${data.shortId ?? rfId}-cell-${i + 1}.png`), delay);
+    });
+  }
+
+  useEffect(() => {
+    const root = rootRef.current;
+    const card = root?.closest(".node-card") as HTMLElement | null;
+    if (!card) return;
+    const observer = new ResizeObserver((entries) => {
+      const next = Math.ceil(entries[0]?.contentRect.height ?? 0);
+      if (!Number.isFinite(next) || next <= 0) return;
+      if (Math.abs(next - lastHeightRef.current) < 4) return;
+      lastHeightRef.current = next;
+      useBoardStore.getState().updateNodeData(rfId, { __measuredHeight: next });
+      if (relayoutTimerRef.current) clearTimeout(relayoutTimerRef.current);
+      relayoutTimerRef.current = setTimeout(() => {
+        relayoutComicCombineChains();
+      }, 80);
+    });
+    observer.observe(card);
+    return () => {
+      observer.disconnect();
+      if (relayoutTimerRef.current) {
+        clearTimeout(relayoutTimerRef.current);
+        relayoutTimerRef.current = null;
+      }
+    };
+  }, [rfId]);
+
   return (
-    <div className="node-body node-body--comic-combine" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+    <div ref={rootRef} className="node-body node-body--comic-combine" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
       <label style={{ fontSize: 11, opacity: 0.75 }}>Combine 2×2 · {panels.length} panels</label>
+      {characterRefs?.length ? (
+        <label style={{ fontSize: 10, opacity: 0.72, margin: 0, display: "flex", alignItems: "center", gap: 5 }}>
+          <input
+            type="checkbox"
+            checked={useCharacterRefs}
+            onChange={(e) => patchComicNode(rfId, { useCharacterRefs: e.target.checked })}
+          />
+          Use Character DB refs · {characterRefs.length}
+        </label>
+      ) : null}
 
       {mediaId ? (
         <img src={mediaUrl(mediaId)} alt="2x2 storyboard" loading="lazy" style={{ width: "100%", borderRadius: 4, display: "block", background: "var(--border)" }} />
@@ -114,6 +193,21 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
             ))}
           </div>
         </>
+      )}
+
+      {(mediaId || cells.some((c) => typeof c === "string" && c)) && (
+        <div style={{ display: "flex", gap: 6 }}>
+          {mediaId && (
+            <button className="comic-btn" onClick={downloadCombined} style={{ flex: 1 }} title="Download the single combined 2×2 image">
+              ⬇ 2×2 image
+            </button>
+          )}
+          {cells.some((c) => typeof c === "string" && c) && (
+            <button className="comic-btn" onClick={downloadCells} style={{ flex: 1 }} title="Download the 4 cleaned cells as separate images">
+              ⬇ 4 cells
+            </button>
+          )}
+        </div>
       )}
 
       <button className="comic-btn" onClick={run} disabled={isBusy || panels.length === 0} title="Clean each panel then stitch a 2×2 9:16">

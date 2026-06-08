@@ -140,6 +140,7 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       for (const pn of pageNodes) {
         await syncPanelsForPage(String(pn.dbId));
       }
+      patchComicNode(rfId, { panelsMaterialized: true });
       setTimeout(() => { try { rf.fitView({ duration: 600 }); } catch { /* noop */ } }, 80);
     } catch (e) {
       setSpawnErr(String(e));
@@ -159,18 +160,57 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
     setSpawnErr(undefined);
     setBusy("combine");
     try {
+      const store = useBoardStore.getState();
       const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
       const flat: Array<Record<string, unknown>> = [];
-      for (const pn of sorted) {
-        const boxes = (pn.data.boxes as BoxItem[]) ?? [];
-        boxes.forEach((b, j) =>
-          flat.push({
-            pageMediaId: pn.data.pageMediaId, box: b, w: pn.data.w, h: pn.data.h,
-            pageName: pn.data.pageName, panelIndex: j,
-          }),
-        );
+      const pageIds = new Set(pageNodes.map((p) => String(p.dbId)));
+      const panelLayerExists =
+        Boolean(store.nodes.find((n) => n.id === rfId)?.data.panelsMaterialized)
+        || store.edges.some((e) => {
+          const tgt = store.nodes.find((n) => n.id === e.target);
+          return pageIds.has(e.source) && tgt?.data.type === "comic_panel";
+        });
+
+      if (panelLayerExists) {
+        for (const pn of sorted) {
+          const boxes = ((pn.data.boxes as BoxItem[]) ?? []).filter((b) => b?.id);
+          const panelByBoxId = new Map<string, string>();
+          for (const e of store.edges) {
+            if (e.source !== String(pn.dbId)) continue;
+            const panel = store.nodes.find((n) => n.id === e.target);
+            const boxId = panel?.data.boxId;
+            if (panel?.data.type === "comic_panel" && typeof boxId === "string") {
+              panelByBoxId.set(boxId, panel.id);
+            }
+          }
+          boxes.forEach((b, j) => {
+            if (!panelByBoxId.has(b.id)) return;
+            flat.push({
+              pageMediaId: pn.data.pageMediaId,
+              box: b,
+              w: pn.data.w,
+              h: pn.data.h,
+              pageName: pn.data.pageName,
+              panelIndex: j,
+              boxId: b.id,
+            });
+          });
+        }
+      } else {
+        for (const pn of sorted) {
+          const boxes = (pn.data.boxes as BoxItem[]) ?? [];
+          boxes.forEach((b, j) =>
+            flat.push({
+              pageMediaId: pn.data.pageMediaId, box: b, w: pn.data.w, h: pn.data.h,
+              pageName: pn.data.pageName, panelIndex: j,
+            }),
+          );
+        }
       }
-      if (flat.length === 0) { setSpawnErr("No panel boxes — detect/draw first"); return; }
+      if (flat.length === 0) {
+        setSpawnErr(panelLayerExists ? "No current panel nodes — create or keep at least one panel" : "No panel boxes — detect/draw first");
+        return;
+      }
       const pos = nodePosition(rfId);
       const bulk: BulkNodeInput[] = [];
       for (let i = 0; i < flat.length; i += 4) {
@@ -218,6 +258,7 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
               <select value={detector} onChange={(e) => patchComicNode(rfId, { detector: e.target.value })} style={{ fontSize: 11, padding: "2px 4px" }}>
                 <option value="heuristic">Heuristic</option>
                 <option value="ml">YOLO</option>
+                <option value="webtoon">Webtoon</option>
                 <option value="auto">Auto</option>
               </select>
             </label>

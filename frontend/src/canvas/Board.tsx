@@ -17,7 +17,7 @@ import {
 } from "@xyflow/react";
 
 import { useBoardStore, type FlowNode, type NodeType } from "../store/board";
-import { COMIC_TYPES, relayoutComicChains } from "./comicShared";
+import { COMIC_TYPES, relayoutComicChains, relayoutComicCombineChains } from "./comicShared";
 import { NodeCard } from "./NodeCard";
 import { VariantEdge } from "./VariantEdge";
 import { useGenerationStore } from "../store/generation";
@@ -192,7 +192,9 @@ export function Board() {
       for (const c of changes) {
         if (c.type === "remove") {
           const n = snapshot.nodes.find((nn) => nn.id === c.id);
-          if (n && COMIC_TYPES.has(n.data.type)) comicRemoved = true;
+          if (n && (COMIC_TYPES.has(n.data.type) || n.data.type === "comic_combine")) {
+            comicRemoved = true;
+          }
           if (n && n.data.type === "comic_page") {
             // Cascade: a page's panels are crops of it — delete them too.
             for (const e of snapshot.edges) {
@@ -212,7 +214,12 @@ export function Board() {
       setNodes(next);
       // Deleting a comic node leaves a gap — re-pack the chain so the nodes
       // below "run up" to fill it.
-      if (comicRemoved) setTimeout(() => relayoutComicChains(), 0);
+      if (comicRemoved) {
+        setTimeout(() => {
+          relayoutComicChains();
+          relayoutComicCombineChains();
+        }, 0);
+      }
     },
     [setNodes, deleteNodeByRfId],
   );

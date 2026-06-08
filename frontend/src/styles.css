@@ -1221,6 +1221,9 @@ button:disabled {
 .node-card:has(.node-body--comic-panel) {
   width: 160px;
 }
+.node-card:has(.node-body--comic-combine) {
+  width: 300px;
+}
 
 /* Full-width text buttons inside comic node bodies (NOT the 22x22 header icon
    button — reusing that class made the labels overlap). */
@@ -1250,6 +1253,71 @@ button:disabled {
   width: auto;
   padding: 3px 8px;
   font-size: 11px;
+}
+
+.comic-error-note {
+  margin: 2px 0 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(239, 68, 68, 0.32);
+  border-left: 2px solid #ef4444;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.08);
+  color: #fecaca;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1.35;
+  min-width: 0;
+}
+
+.comic-error-note strong {
+  color: #fca5a5;
+  font-size: 11px;
+}
+
+.comic-error-note code {
+  display: block;
+  padding: 4px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.24);
+  color: #e5e7eb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.comic-status-note {
+  margin: 2px 0 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  border-left: 2px solid #818cf8;
+  border-radius: 6px;
+  background: rgba(99, 102, 241, 0.08);
+  color: #c7d2fe;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.comic-status-note strong {
+  color: #e0e7ff;
+  font-size: 11px;
+}
+
+.comic-status-note--empty {
+  border-color: rgba(245, 158, 11, 0.32);
+  border-left-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.08);
+  color: #fde68a;
+}
+
+.comic-status-note--empty strong {
+  color: #fcd34d;
 }
 
 .node-card--selected {
@@ -5741,4 +5809,3 @@ button:disabled {
 .references-panel__toggle-tab:hover {
   animation: none;
 }
-

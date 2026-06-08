@@ -71,6 +71,7 @@ export function ComicPageBody({ rfId, data }: { rfId: string; data: FlowboardNod
         <select value={detector} onChange={(e) => patchComicNode(rfId, { detector: e.target.value })} style={{ fontSize: 11, padding: "2px 4px" }}>
           <option value="heuristic">Heuristic</option>
           <option value="ml">YOLO</option>
+          <option value="webtoon">Webtoon</option>
           <option value="auto">Auto</option>
         </select>
         <button className="comic-btn comic-btn--sm" onClick={redetect} disabled={busy} style={{ fontSize: 11, padding: "3px 8px" }}>

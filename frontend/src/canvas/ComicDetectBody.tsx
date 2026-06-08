@@ -66,6 +66,7 @@ export function ComicDetectBody({ rfId, data }: { rfId: string; data: FlowboardN
           <select value={detector} onChange={(e) => setDetector(e.target.value)} style={{ fontSize: 11, padding: "2px 4px" }}>
             <option value="heuristic">Heuristic</option>
             <option value="ml">YOLO (ML)</option>
+            <option value="webtoon">Webtoon</option>
             <option value="auto">Auto (best)</option>
           </select>
         </label>

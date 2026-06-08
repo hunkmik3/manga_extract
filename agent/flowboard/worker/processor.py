@@ -670,7 +670,7 @@ async def _handle_extract_panels(params: dict) -> tuple[dict, Optional[str]]:
     folder = folder.strip().strip("'\"").strip()
     debug = bool(params.get("debug"))
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "auto"):
         return {}, f"invalid_detector:{detector}"
 
     try:
@@ -815,7 +815,7 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     if not isinstance(pages_in, list) or not pages_in:
         return {}, "missing_pages"
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "auto"):
         return {}, f"invalid_detector:{detector}"
 
     def _run():
@@ -1099,6 +1099,21 @@ def _match_and_load_char_refs(panel_bytes: bytes, chars: list) -> list[bytes]:
     return refs
 
 
+def _panel_reference_bytes(
+    panel_bytes: bytes, panel_params: dict, chars: object, *, include_page: bool = True
+) -> list[bytes]:
+    """References for a comic panel edit: the full source page for environment
+    continuity plus matched Character DB crops for identity/costume continuity."""
+    refs: list[bytes] = []
+    if include_page:
+        page_ref = _page_ref_bytes(panel_params)
+        if page_ref:
+            refs.append(page_ref)
+    if isinstance(chars, list) and chars:
+        refs.extend(_match_and_load_char_refs(panel_bytes, chars))
+    return refs[:5]
+
+
 async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     from flowboard.services.comic import prompts
 
@@ -1108,15 +1123,8 @@ async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     raw = await asyncio.to_thread(_source_image_bytes, params)
     if raw is None:
         return {}, "no_source_image"
-    page_ref = await asyncio.to_thread(_page_ref_bytes, params)
-    refs: list[bytes] = []
-    if page_ref:
-        refs.append(page_ref)
     # Auto-match the panel's character → add its reference crops for consistency.
-    chars = params.get("characters")
-    if isinstance(chars, list) and chars:
-        refs.extend(await asyncio.to_thread(_match_and_load_char_refs, raw, chars))
-    refs = refs[:5]  # cap multi-image input
+    refs = await asyncio.to_thread(_panel_reference_bytes, raw, params, params.get("characters"))
 
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
@@ -1212,6 +1220,7 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "missing_panels"
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
+    chars = params.get("characters")
     pid = project_id.strip()
 
     raws = await asyncio.to_thread(
@@ -1220,24 +1229,34 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     if all(r is None for r in raws):
         return {}, "no_source_image"
 
-    # Clean + extend EVERY panel to the same 9:16 portrait so all four cells are
-    # uniformly filled (no white letterbox on the landscape panels).
-    cell_prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16
+    # Clean + extend every panel to the same 9:16 portrait so all four cells are
+    # filled before code stitches the exact 2×2 layout. Character refs remain
+    # opt-in and are used only for identity/costume consistency.
     cleaned: list = []
-    for raw in raws:
+    for spec, raw in zip(specs[:4], raws):
         if raw is None:
             cleaned.append(None)
             continue
+        refs = await asyncio.to_thread(
+            lambda: _panel_reference_bytes(
+                raw, spec if isinstance(spec, dict) else {}, chars, include_page=False
+            )
+        )
+        prompt = (
+            prompts.CLEAN_PROMPT
+            + prompts.EXTEND_9_16
+            + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
+        )
         try:
             out = await bridge.edit_image(
-                raw, cell_prompt, project_id=pid,
+                raw, prompt, reference_images=refs or None, project_id=pid,
                 aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
             )
         except bridge.BridgeEditError as exc:
             return {}, f"bridge_failed: {exc.reason}"[:200]
         try:
-            # guarantee exact 9:16 even if the model returned a slightly off size
-            cleaned.append(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
+            bgr = panel_svc.decode_bgr(out)
+            cleaned.append(panel_svc.pad_to_aspect(bgr, 9, 16))
         except Exception:  # noqa: BLE001
             cleaned.append(None)
 
@@ -1290,13 +1309,22 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "bad_index"
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
+    chars = params.get("characters")
 
     raw = await asyncio.to_thread(_source_image_bytes, panel)
     if raw is None:
         return {}, "no_source_image"
+    refs = await asyncio.to_thread(
+        lambda: _panel_reference_bytes(raw, panel, chars, include_page=False)
+    )
+    prompt = (
+        prompts.CLEAN_PROMPT
+        + prompts.EXTEND_9_16
+        + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
+    )
     try:
         out = await bridge.edit_image(
-            raw, prompts.CLEAN_PROMPT + prompts.EXTEND_9_16, project_id=project_id.strip(),
+            raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
             aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
         )
     except bridge.BridgeEditError as exc:
@@ -1304,7 +1332,9 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
 
     def _rebuild() -> tuple[list, bytes, int, int]:
         new_cells = list(cells)
-        new_cells[index] = _ingest_png(panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16)))
+        bgr = panel_svc.decode_bgr(out)
+        bgr = panel_svc.pad_to_aspect(bgr, 9, 16)
+        new_cells[index] = _ingest_png(panel_svc.encode_png(bgr))
         bgrs = []
         for cid in new_cells[:4]:
             path = media_service.cached_path(cid) if isinstance(cid, str) else None
