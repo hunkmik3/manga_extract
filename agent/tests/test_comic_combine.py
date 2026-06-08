@@ -116,6 +116,38 @@ async def test_regen_cell_recleans_one_and_restitches():
 
 
 @pytest.mark.asyncio
+async def test_regen_cell_uses_custom_prompt():
+    page = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(page, _png(900, 1200), kind="image", mime="image/png")
+    cells = [_ingest(_png(400, 711)) for _ in range(4)]
+    panel = {"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 200}}
+
+    edit = AsyncMock(return_value=_png(400, 711))
+    with patch("flowboard.services.comic.bridge.edit_image", edit):
+        _, err = await _handle_regen_cell(
+            {"project_id": "p", "panel": panel, "cells": cells, "index": 0, "prompt": "make the lighting warmer"}
+        )
+    assert err is None
+    assert edit.await_args.args[1] == "make the lighting warmer"  # custom prompt, no default
+
+
+@pytest.mark.asyncio
+async def test_regen_cell_blank_prompt_falls_back_to_default():
+    page = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(page, _png(900, 1200), kind="image", mime="image/png")
+    cells = [_ingest(_png(400, 711)) for _ in range(4)]
+    panel = {"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 200}}
+
+    edit = AsyncMock(return_value=_png(400, 711))
+    with patch("flowboard.services.comic.bridge.edit_image", edit):
+        await _handle_regen_cell(
+            {"project_id": "p", "panel": panel, "cells": cells, "index": 0, "prompt": "   "}
+        )
+    from flowboard.services.comic import prompts
+    assert edit.await_args.args[1] == prompts.CLEAN_PROMPT + prompts.EXTEND_9_16
+
+
+@pytest.mark.asyncio
 async def test_combine_uses_character_db_refs_when_available():
     page = _ingest(_png(900, 1200))
     ref = _ingest(_png(80, 120, 220))

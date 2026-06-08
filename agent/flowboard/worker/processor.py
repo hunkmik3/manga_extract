@@ -1317,11 +1317,12 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     refs = await asyncio.to_thread(
         lambda: _panel_reference_bytes(raw, panel, chars, include_page=False)
     )
-    prompt = (
-        prompts.CLEAN_PROMPT
-        + prompts.EXTEND_9_16
-        + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
-    )
+    # Optional custom prompt — lets the user steer a single re-gen (e.g. "make
+    # the lighting warmer") instead of the default clean+extend. Blank → default.
+    custom = params.get("prompt")
+    custom = custom.strip() if isinstance(custom, str) else ""
+    base = custom or (prompts.CLEAN_PROMPT + prompts.EXTEND_9_16)
+    prompt = base + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
     try:
         out = await bridge.edit_image(
             raw, prompt, reference_images=refs or None, project_id=project_id.strip(),

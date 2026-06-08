@@ -1,4 +1,4 @@
-import { useEffect, useRef, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { ensureBoardProject, mediaUrl } from "../api/client";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
 import {
@@ -47,6 +47,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   const rootRef = useRef<HTMLDivElement | null>(null);
   const lastHeightRef = useRef(0);
   const relayoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [regenPrompt, setRegenPrompt] = useState("");
   const panels = (Array.isArray(data.panels) ? data.panels : []) as PanelSpec[];
   const cells = (Array.isArray(data.cells) ? data.cells : []) as (string | null)[];
   const mediaId = typeof data.mediaId === "string" ? data.mediaId : "";
@@ -88,6 +89,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     const panel = { page_media_id: panels[i].pageMediaId, box: panels[i].box };
     const params: Record<string, unknown> = { project_id: projectId, panel, cells, index: i };
     if (useCharacterRefs && characterRefs?.length) params.characters = characterRefs;
+    if (regenPrompt.trim()) params.prompt = regenPrompt.trim();
     runComicRequest(
       rfId,
       () => createRequest({ type: "regen_cell", node_id: parseInt(rfId, 10), params }),
@@ -174,6 +176,14 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       {cells.length > 0 && (
         <>
           <p style={{ fontSize: 9, opacity: 0.55, margin: 0 }}>Re-gen a single cell if one came out wrong:</p>
+          <textarea
+            value={regenPrompt}
+            onChange={(e) => setRegenPrompt(e.target.value)}
+            placeholder="Custom re-gen prompt for ↻ (blank = default clean + extend to 9:16)"
+            rows={2}
+            spellCheck={false}
+            style={{ width: "100%", boxSizing: "border-box", fontSize: 10, padding: "4px 6px", resize: "vertical", fontFamily: "inherit" }}
+          />
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
             {[0, 1, 2, 3].map((i) => (
               <div key={i} style={{ position: "relative" }}>
@@ -186,7 +196,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                   className="comic-btn comic-btn--sm"
                   onClick={() => regenCell(i)}
                   disabled={isBusy || !panels[i]}
-                  title={`Re-generate cell ${i + 1}`}
+                  title={regenPrompt.trim() ? `Re-gen cell ${i + 1} with your custom prompt` : `Re-gen cell ${i + 1} (default clean + extend)`}
                   style={{ position: "absolute", top: 2, right: 2, padding: "1px 6px", fontSize: 11, background: "rgba(0,0,0,0.55)" }}
                 >↻</button>
               </div>
