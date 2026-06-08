@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 from typing import Optional, Sequence
 
@@ -48,6 +49,14 @@ DEFAULT_MAX_ATTEMPTS = 3
 RETRY_BACKOFF_S = 1.5
 # Comic panels default to portrait; callers (Node 2 9:16, Node 3) override.
 DEFAULT_ASPECT_RATIO = "IMAGE_ASPECT_RATIO_LANDSCAPE"
+
+# Upload de-dupe cache: (project_id, sha256(bytes)) → Flow media_id. The same
+# bytes (a shared character ref across 4 combine panels, or the same source on a
+# re-gen) upload only once per project. Flow media_ids are stable for the
+# project's lifetime; a rare stale id just makes the next generate retry/fail,
+# which the user can re-run. Bounded so a long session can't grow it unbounded.
+_UPLOAD_CACHE: dict[tuple[str, str], str] = {}
+_UPLOAD_CACHE_MAX = 2000
 
 
 class BridgeEditError(RuntimeError):
@@ -78,6 +87,11 @@ async def _upload(
     extension is reconnecting after an agent reload) with backoff. Raises
     ``BridgeEditError`` (attempts=0) only after exhausting retries.
     """
+    cache_key = (project_id, hashlib.sha256(bytes(image_bytes)).hexdigest())
+    cached = _UPLOAD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     b64 = base64.b64encode(image_bytes).decode("ascii")
     last = "unknown"
     for attempt in range(1, DEFAULT_MAX_ATTEMPTS + 1):
@@ -97,6 +111,9 @@ async def _upload(
             continue
         media_id = resp.get("media_id") if isinstance(resp, dict) else None
         if isinstance(media_id, str) and media_service.is_valid_media_id(media_id):
+            if len(_UPLOAD_CACHE) >= _UPLOAD_CACHE_MAX:
+                _UPLOAD_CACHE.clear()
+            _UPLOAD_CACHE[cache_key] = media_id
             return media_id
         last = "upload returned no valid media_id"
         await _backoff(attempt, DEFAULT_MAX_ATTEMPTS)
@@ -168,21 +185,18 @@ async def edit_image_variants(
 
     sdk = get_flow_sdk()
 
-    # Uploads are stable across generate retries → do them once.
-    source_media_id = await _upload(
-        sdk, bytes(image_bytes), project_id=project_id, mime=mime,
-        file_name="comic_source.png",
+    # Uploads are stable across generate retries → do them once, and in parallel
+    # (source + every ref at once). _upload de-dupes identical bytes via cache.
+    refs_to_upload = [(i, bytes(ref)) for i, ref in enumerate(reference_images or []) if ref]
+    uploaded = await asyncio.gather(
+        _upload(sdk, bytes(image_bytes), project_id=project_id, mime=mime, file_name="comic_source.png"),
+        *[
+            _upload(sdk, rb, project_id=project_id, mime=mime, file_name=f"comic_ref_{i}.png")
+            for i, rb in refs_to_upload
+        ],
     )
-    ref_media_ids: list[str] = []
-    for i, ref in enumerate(reference_images or []):
-        if not ref:
-            continue
-        ref_media_ids.append(
-            await _upload(
-                sdk, bytes(ref), project_id=project_id, mime=mime,
-                file_name=f"comic_ref_{i}.png",
-            )
-        )
+    source_media_id = uploaded[0]
+    ref_media_ids: list[str] = list(uploaded[1:])
 
     last_reason = "unknown"
     for attempt in range(1, max_attempts + 1):

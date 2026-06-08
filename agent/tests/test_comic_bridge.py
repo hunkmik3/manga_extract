@@ -184,3 +184,35 @@ async def test_upload_failure_raises_pre_flight():
 async def test_input_validation(kwargs):
     with pytest.raises(ValueError):
         await edit_image(**kwargs, paygate_tier="PAYGATE_TIER_ONE")
+
+
+@pytest.mark.asyncio
+async def test_upload_cache_dedupes_identical_bytes_across_calls():
+    """The same source bytes (same project) upload only once — later edits reuse
+    the cached Flow media_id (speeds up re-gens / shared refs)."""
+    sdk = _fake_sdk(edit_return=_ok_edit_response())
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk), \
+         patch.object(bridge.media_service, "ingest_urls", MagicMock(return_value=1)), \
+         patch.object(bridge.media_service, "fetch_and_cache",
+                      AsyncMock(return_value=(b"PNG", "image/png", "/tmp/x.png"))):
+        for _ in range(3):
+            await edit_image(b"same-source", "p", project_id=PROJECT_ID, paygate_tier="PAYGATE_TIER_ONE")
+    assert sdk.upload_image.await_count == 1  # uploaded once despite 3 edits
+    assert sdk.edit_image.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_edit_image_variants_returns_all_candidates():
+    """variant_count>1 → bridge returns every downloaded candidate's bytes."""
+    rids = [_media_id() for _ in range(4)]
+    resp = {"media_ids": rids, "media_entries": [{"media_id": r, "url": f"https://flow/{r}"} for r in rids]}
+    sdk = _fake_sdk(edit_return=resp)
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk), \
+         patch.object(bridge.media_service, "ingest_urls", MagicMock(return_value=4)), \
+         patch.object(bridge.media_service, "fetch_and_cache",
+                      AsyncMock(side_effect=lambda mid: (f"bytes-{mid}".encode(), "image/png", "/tmp/x.png"))):
+        outs = await bridge.edit_image_variants(
+            b"src", "p", project_id=PROJECT_ID, paygate_tier="PAYGATE_TIER_ONE", variant_count=4,
+        )
+    assert len(outs) == 4
+    assert sdk.edit_image.await_args.kwargs["variant_count"] == 4

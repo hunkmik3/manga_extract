@@ -1219,11 +1219,15 @@ async def _handle_build_character_db(params: dict) -> tuple[dict, Optional[str]]
 # that single "ground truth" image to the bridge with COMBINE_2X2_PROMPT → the
 # model removes text, keeps characters faithful, extends backgrounds to 9:16.
 
+COMBINE_CONCURRENCY = 4  # how many panel cleans run at once (overlap Flow gens)
+
+
 async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     """Clean each of the up-to-4 panels INDIVIDUALLY via the bridge (remove
     text/bubbles + reconstruct art), then code-stitch the cleaned panels into a
     clean 2×2 grid. The model never does the layout — code does — so the grid is
-    exact (no re-selecting/rearranging/invented panels)."""
+    exact (no re-selecting/rearranging/invented panels). The four cleans run in
+    parallel (capped) so the Flow generations overlap instead of serialising."""
     from flowboard.services.comic import bridge, panels as panel_svc, prompts
 
     project_id = params.get("project_id")
@@ -1244,13 +1248,14 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "no_source_image"
 
     # Clean + extend every panel to the same 9:16 portrait so all four cells are
-    # filled before code stitches the exact 2×2 layout. Character refs remain
+    # filled before code stitches the exact 2×2 layout. Run the cleans in
+    # parallel (capped) so the Flow generations overlap. Character refs remain
     # opt-in and are used only for identity/costume consistency.
-    cleaned: list = []
-    for spec, raw in zip(specs[:4], raws):
+    sem = asyncio.Semaphore(COMBINE_CONCURRENCY)
+
+    async def _clean_one(spec, raw) -> tuple[Optional["object"], Optional[str]]:
         if raw is None:
-            cleaned.append(None)
-            continue
+            return None, None
         refs = await asyncio.to_thread(
             lambda: _panel_reference_bytes(
                 raw, spec if isinstance(spec, dict) else {}, chars, include_page=False
@@ -1261,18 +1266,24 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
             + prompts.EXTEND_9_16
             + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
         )
+        async with sem:
+            try:
+                out = await bridge.edit_image(
+                    raw, prompt, reference_images=refs or None, project_id=pid,
+                    aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                )
+            except bridge.BridgeEditError as exc:
+                return None, f"bridge_failed: {exc.reason}"[:200]
         try:
-            out = await bridge.edit_image(
-                raw, prompt, reference_images=refs or None, project_id=pid,
-                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
-            )
-        except bridge.BridgeEditError as exc:
-            return {}, f"bridge_failed: {exc.reason}"[:200]
-        try:
-            bgr = panel_svc.decode_bgr(out)
-            cleaned.append(panel_svc.pad_to_aspect(bgr, 9, 16))
+            return panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16), None
         except Exception:  # noqa: BLE001
-            cleaned.append(None)
+            return None, None
+
+    results = await asyncio.gather(*[_clean_one(s, r) for s, r in zip(specs[:4], raws)])
+    err = next((e for _, e in results if e), None)
+    if err:
+        return {}, err
+    cleaned: list = [bgr for bgr, _ in results]
 
     if all(c is None for c in cleaned):
         return {}, "all_panels_failed"
