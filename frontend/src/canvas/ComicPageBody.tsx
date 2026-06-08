@@ -1,8 +1,9 @@
-import { useState } from "react";
-import { type FlowboardNodeData } from "../store/board";
+import { useEffect, useRef, useState } from "react";
+import { useBoardStore, type FlowboardNodeData } from "../store/board";
 import {
   createRequest,
   patchComicNode,
+  relayoutComicChains,
   runRequestToResult,
   syncPanelsForPage,
   type BoxItem,
@@ -30,6 +31,31 @@ export function ComicPageBody({ rfId, data }: { rfId: string; data: FlowboardNod
   };
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | undefined>();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const lastHeightRef = useRef(0);
+  const relayoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Tall webtoon pages make this node much taller than the default — report the
+  // measured height so relayoutComicChains spaces the pages by their real size
+  // (otherwise the next page node overlaps this one).
+  useEffect(() => {
+    const card = rootRef.current?.closest(".node-card") as HTMLElement | null;
+    if (!card) return;
+    const observer = new ResizeObserver((entries) => {
+      const next = Math.ceil(entries[0]?.contentRect.height ?? 0);
+      if (!Number.isFinite(next) || next <= 0) return;
+      if (Math.abs(next - lastHeightRef.current) < 4) return;
+      lastHeightRef.current = next;
+      useBoardStore.getState().updateNodeData(rfId, { __measuredHeight: next });
+      if (relayoutTimerRef.current) clearTimeout(relayoutTimerRef.current);
+      relayoutTimerRef.current = setTimeout(() => relayoutComicChains(), 80);
+    });
+    observer.observe(card);
+    return () => {
+      observer.disconnect();
+      if (relayoutTimerRef.current) clearTimeout(relayoutTimerRef.current);
+    };
+  }, [rfId]);
 
   function onBoxes(next: BoxItem[]) {
     patchComicNode(rfId, { boxes: next });
@@ -57,7 +83,7 @@ export function ComicPageBody({ rfId, data }: { rfId: string; data: FlowboardNod
   }
 
   return (
-    <div className="node-body node-body--comic-page" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+    <div ref={rootRef} className="node-body node-body--comic-page" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 11 }}>
         <span title={name} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span>
         <span style={{ opacity: 0.7 }}>{boxes.length} box</span>

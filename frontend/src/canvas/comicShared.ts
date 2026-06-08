@@ -327,7 +327,9 @@ export function relayoutComicChains(): void {
 
       const count = panelNodes.length || pageBoxes.length || 1;
       const rows = Math.max(1, Math.ceil(count / PANEL_COLS));
-      const rowH = Math.max(PAGE_H, rows * PANEL_CELL_H) + ROW_GAP;
+      // Use the page node's real (measured) height — tall webtoon pages are far
+      // taller than PAGE_H, so a fixed advance would overlap the next page.
+      const rowH = Math.max(pageNodeHeight(pn), rows * PANEL_CELL_H) + ROW_GAP;
 
       moves.set(pn.id, { x: pageX, y: curY });
       panelNodes.forEach((qn, j) => {
@@ -347,6 +349,14 @@ export function relayoutComicChains(): void {
     const dbId = parseInt(rfId, 10);
     if (!Number.isNaN(dbId)) patchNode(dbId, { x: p.x, y: p.y }).catch(() => {});
   }
+}
+
+function pageNodeHeight(n: FlowNode): number {
+  const measured = n.data.__measuredHeight;
+  if (typeof measured === "number" && Number.isFinite(measured) && measured > 0) {
+    return Math.max(PAGE_H, measured);
+  }
+  return PAGE_H;
 }
 
 function combineNodeHeight(n: FlowNode): number {
