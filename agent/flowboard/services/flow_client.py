@@ -14,6 +14,14 @@ Control flow:
 5. That HTTP handler resolves the pending future by id.
 6. WS-side inbound messages from the extension (``token_captured``,
    ``extension_ready``, ``pong``, ``status``) update our stats.
+
+Multiple extensions (one per Chrome profile / Google account) can be connected
+at once — each is a separate ``_Conn`` in the registry. Exactly one is the
+*active* connection; all proxied requests + the public properties reflect it.
+The active connection's state is mirrored onto the flat ``self._…`` fields so
+the rest of the agent (bridge, routes, tests) can keep reading them unchanged.
+The user picks which account is active via ``set_active`` (see the account
+picker UI) — handy for switching when one account hits its daily quota.
 """
 from __future__ import annotations
 
@@ -24,6 +32,7 @@ import os
 import secrets
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -49,45 +58,56 @@ _FLOW_CREDITS_URL = "https://aisandbox-pa.googleapis.com/v1/credits"
 _TIER_REFRESH_MIN_INTERVAL_S = 60.0
 
 
+@dataclass
+class _Conn:
+    """One connected extension (one Chrome profile / Google account)."""
+
+    id: str
+    ws: Any
+    flow_key: Optional[str] = None
+    flow_key_present: bool = False
+    user_info: Optional[dict] = None
+    paygate_tier: Optional[str] = None
+    sku: Optional[str] = None
+    credits: Optional[int] = None
+    token_captured_at: Optional[float] = None
+    last_tier_fetch_at: Optional[float] = None
+
+
 class FlowClient:
-    """Singleton bridge client."""
+    """Singleton bridge client (multi-connection, single active)."""
 
     DEFAULT_TIMEOUT = 180.0  # seconds
 
     def __init__(self) -> None:
-        self._ws: Optional[Any] = None
+        # Registry of all connected extensions + which one is active.
+        self._conns: dict[str, _Conn] = {}
+        self._active: Optional[str] = None
+        self._conn_seq = 0
+
         self._pending: dict[str, asyncio.Future] = {}
         self._callback_secret: str = secrets.token_urlsafe(32)
 
+        # ── flat "mirror" of the ACTIVE connection ──────────────────────────
+        # Kept so the bridge / routes / tests can read a single connection's
+        # state without knowing about the registry. _activate() syncs these.
+        self._ws: Optional[Any] = None
         self._token_captured_at: Optional[float] = None
         self._flow_key_present: bool = False
-        # Cached Bearer token for server-side fetches against
-        # aisandbox-pa (e.g. /v1/credits for paygate tier resolution).
-        # In-memory only; cleared on extension disconnect. NOT logged
-        # anywhere — see fetch_paygate_tier() for the only consumer.
-        self._flow_key: Optional[str] = None
-        # Last time we hit /v1/credits — guards against the extension
-        # emitting `token_captured` on every outbound aisandbox-pa
-        # request (polls fire dozens per minute during video gen). The
-        # extension was patched to only emit on rotation, but we keep
-        # this dedupe so older installs don't spam the credits endpoint.
+        self._flow_key: Optional[str] = None  # Bearer for server-side /v1/credits; never logged
         self._last_tier_fetch_at: Optional[float] = None
         self._last_logged_key: Optional[str] = None
-        # Profile pushed by the extension after it resolves the Bearer
-        # token via Google's userinfo endpoint. Stays in-memory only —
-        # if the agent restarts the extension will replay it on the
-        # next WS reconnect.
         self._user_info: Optional[dict] = None
-        # Paygate tier authoritative from /v1/credits + sku for display.
         self._paygate_tier: Optional[str] = None
         self._sku: Optional[str] = None  # e.g. "WS_ULTRA" / "WS_PRO"
         self._credits: Optional[int] = None
+
         self._request_count = 0
         self._success_count = 0
         self._failed_count = 0
         self._last_error: Optional[str] = None
 
-    # ── connection ─────────────────────────────────────────────────────────
+    # ── connection registry ─────────────────────────────────────────────────
     @property
     def connected(self) -> bool:
         return self._ws is not None
@@ -96,22 +116,97 @@ class FlowClient:
     def callback_secret(self) -> str:
         return self._callback_secret
 
-    def set_extension(self, ws: Any) -> None:
-        self._ws = ws
+    def add_connection(self, ws: Any) -> str:
+        """Register a newly-connected extension. The FIRST connection becomes
+        active; later ones are tracked but DON'T steal the active slot (so a
+        second profile reconnecting can't hijack the bridge mid-use)."""
+        self._conn_seq += 1
+        cid = f"conn-{self._conn_seq}"
+        self._conns[cid] = _Conn(id=cid, ws=ws)
+        if self._active is None:
+            self._activate(cid)
+        return cid
 
-    def clear_extension(self) -> None:
-        self._ws = None
-        self._flow_key_present = False
-        self._flow_key = None
-        # Drop the cached identity + tier — next reconnect will replay.
-        self._user_info = None
-        self._paygate_tier = None
-        self._sku = None
-        self._credits = None
+    def remove_connection(self, cid: str) -> None:
+        """Drop a connection. If it was the active one, fail its in-flight
+        requests and promote any remaining connection (else go disconnected).
+        A non-active connection closing leaves the active bridge untouched."""
+        if self._conns.pop(cid, None) is None:
+            return
+        if cid == self._active:
+            self._fail_pending()
+            self._activate(next(iter(self._conns), None))
+
+    def set_active(self, cid: str) -> bool:
+        """Make ``cid`` the connection all requests route through."""
+        if cid not in self._conns:
+            return False
+        self._activate(cid)
+        return True
+
+    def list_connections(self) -> list[dict]:
+        """Snapshot of every connected account for the picker UI."""
+        now = time.time()
+        out = []
+        for cid, c in self._conns.items():
+            info = c.user_info or {}
+            out.append({
+                "id": cid,
+                "email": info.get("email"),
+                "name": info.get("name"),
+                "picture": info.get("picture"),
+                "tier": c.paygate_tier,
+                "sku": c.sku,
+                "credits": c.credits,
+                "active": cid == self._active,
+                "token_age_s": int(now - c.token_captured_at) if c.token_captured_at else None,
+            })
+        return out
+
+    def _activate(self, cid: Optional[str]) -> None:
+        """Point the active slot at ``cid`` (or None) and mirror its state onto
+        the flat fields the rest of the agent reads."""
+        self._active = cid
+        conn = self._conns.get(cid) if cid else None
+        if conn is None:
+            self._ws = None
+            self._flow_key = None
+            self._flow_key_present = False
+            self._user_info = None
+            self._paygate_tier = None
+            self._sku = None
+            self._credits = None
+            self._token_captured_at = None
+            return
+        self._ws = conn.ws
+        self._flow_key = conn.flow_key
+        self._flow_key_present = conn.flow_key_present
+        self._user_info = conn.user_info
+        self._paygate_tier = conn.paygate_tier
+        self._sku = conn.sku
+        self._credits = conn.credits
+        self._token_captured_at = conn.token_captured_at
+
+    def _fail_pending(self) -> None:
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(ConnectionError("extension_disconnected"))
         self._pending.clear()
+
+    # ── legacy single-connection API (used by tests + as simple shims) ───────
+    def set_extension(self, ws: Any) -> None:
+        """Register ``ws`` and make it the active connection."""
+        cid = self.add_connection(ws)
+        self._activate(cid)
+
+    def clear_extension(self) -> None:
+        """Drop the active connection (+ fail its pending requests) and promote
+        any remaining one. Also resets the flat mirror when nothing is left."""
+        cid = self._active
+        if cid is not None:
+            self._conns.pop(cid, None)
+        self._fail_pending()
+        self._activate(next(iter(self._conns), None))
 
     @property
     def user_info(self) -> Optional[dict]:
@@ -130,26 +225,27 @@ class FlowClient:
         return self._credits
 
     async def fetch_paygate_tier(self) -> bool:
-        """Authoritative paygate tier resolution via the official Flow
-        /v1/credits endpoint. Replaces the passive request-body sniffer
-        as the primary path.
+        """Resolve the ACTIVE connection's paygate tier via /v1/credits.
 
-        Triggered automatically when `handle_message` receives a
-        `token_captured` message (extension just captured a fresh
-        Bearer token), and on demand via /api/auth/scan when the
-        cache is cold but the WS is open.
-
-        Returns True on success (tier cached), False otherwise. Failure
-        modes:
-          - No Bearer token cached (extension hasn't pushed one yet)
-          - HTTP 4xx (token expired / revoked)
-          - HTTP 5xx / network (transient — caller can retry)
-          - Response missing `userPaygateTier` (Flow API contract change)
-
-        IMPORTANT: never log the Bearer token. The error path captures
-        only the HTTP status / response shape, never headers.
+        Triggered on demand via /api/auth/scan when the active cache is cold but
+        the WS is open. Per-connection resolution on ``token_captured`` goes
+        through ``_fetch_tier_for``. Returns True on success (tier cached).
         """
-        if not self._flow_key:
+        conn = self._conns.get(self._active) if self._active else None
+        return await self._fetch_tier_for(conn)
+
+    async def _fetch_tier_for(self, conn: Optional[_Conn]) -> bool:
+        """Authoritative paygate-tier resolution via Flow's /v1/credits.
+
+        ``conn`` None → operate on the flat mirror (legacy / no-registry path,
+        e.g. unit tests that set ``_flow_key`` directly). Otherwise resolve for
+        that specific connection (so each account in the picker shows its own
+        tier/credits) and mirror onto the flat fields when it's the active one.
+
+        IMPORTANT: never log the Bearer token.
+        """
+        key = conn.flow_key if conn is not None else self._flow_key
+        if not key:
             return False
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -157,7 +253,7 @@ class FlowClient:
                     _FLOW_CREDITS_URL,
                     params={"key": _FLOW_API_KEY},
                     headers={
-                        "authorization": f"Bearer {self._flow_key}",
+                        "authorization": f"Bearer {key}",
                         "origin": "https://labs.google",
                         "referer": "https://labs.google/",
                     },
@@ -183,70 +279,99 @@ class FlowClient:
                 tier,
             )
             return False
-        self._paygate_tier = tier
-        sku = data.get("sku")
-        if isinstance(sku, str):
-            self._sku = sku
-        credits_val = data.get("credits")
-        if isinstance(credits_val, int):
-            self._credits = credits_val
+        sku = data.get("sku") if isinstance(data.get("sku"), str) else None
+        credits_val = data.get("credits") if isinstance(data.get("credits"), int) else None
+
+        if conn is not None:
+            conn.paygate_tier = tier
+            if sku is not None:
+                conn.sku = sku
+            if credits_val is not None:
+                conn.credits = credits_val
+            if conn.id == self._active:
+                self._paygate_tier = conn.paygate_tier
+                self._sku = conn.sku
+                self._credits = conn.credits
+        else:
+            self._paygate_tier = tier
+            if sku is not None:
+                self._sku = sku
+            if credits_val is not None:
+                self._credits = credits_val
         logger.info(
             "fetch_paygate_tier resolved tier=%s sku=%s credits=%s",
-            tier, self._sku, self._credits,
+            tier, sku, credits_val,
         )
         return True
 
     # ── inbound handling ───────────────────────────────────────────────────
-    async def handle_message(self, data: dict) -> None:
+    async def handle_message(self, data: dict, conn_id: Optional[str] = None) -> None:
+        """Process a frame from an extension. ``conn_id`` (from ws_server) names
+        the sending connection; None is the legacy/test path that updates the
+        flat mirror directly. State is written to the connection's record and
+        mirrored onto the flat fields when it's the active connection."""
         t = data.get("type")
+        conn = self._conns.get(conn_id) if conn_id is not None else None
+        # Mirror to the flat fields when this is the active connection, or when
+        # there's no specific connection (legacy/test path).
+        mirror = conn is None or conn_id == self._active
+
         if t == "extension_ready":
-            self._flow_key_present = bool(data.get("flowKeyPresent"))
-            logger.info("extension_ready flowKeyPresent=%s", self._flow_key_present)
+            present = bool(data.get("flowKeyPresent"))
+            if conn is not None:
+                conn.flow_key_present = present
+            if mirror:
+                self._flow_key_present = present
+            logger.info("extension_ready flowKeyPresent=%s (%s)", present, conn_id or "active")
             return
+
         if t == "token_captured":
-            self._flow_key_present = True
-            self._token_captured_at = time.time()
+            now = time.time()
+            if conn is not None:
+                conn.flow_key_present = True
+                conn.token_captured_at = now
+            if mirror:
+                self._flow_key_present = True
+                self._token_captured_at = now
             flow_key = data.get("flowKey")
             if isinstance(flow_key, str) and flow_key:
-                key_changed = flow_key != self._flow_key
-                self._flow_key = flow_key
-                # Defensive dedupe — see _last_tier_fetch_at field comment.
-                # Skip the log + credits refetch when the token hasn't
-                # rotated and we already fetched within the rate-limit
-                # window. Without this, an older extension re-sending the
-                # same token on every poll trips one /v1/credits per poll.
-                now = time.time()
-                last = self._last_tier_fetch_at or 0.0
+                prev_key = conn.flow_key if conn is not None else self._flow_key
+                key_changed = flow_key != prev_key
+                if conn is not None:
+                    conn.flow_key = flow_key
+                if mirror:
+                    self._flow_key = flow_key
+                last = (conn.last_tier_fetch_at if conn is not None else self._last_tier_fetch_at) or 0.0
                 if key_changed or (now - last) > _TIER_REFRESH_MIN_INTERVAL_S:
                     if flow_key != self._last_logged_key:
                         logger.info("token_captured (len=%d)", len(flow_key))
                         self._last_logged_key = flow_key
-                    self._last_tier_fetch_at = now
-                    # Authoritative tier resolution — fetch /v1/credits in
-                    # the background so the AccountPanel sees a real tier
-                    # within an HTTP RTT instead of waiting for the user's
-                    # Flow tab to emit a request the passive sniffer can
-                    # see. Don't await: WS handler must stay responsive.
-                    asyncio.create_task(self.fetch_paygate_tier())
+                    if conn is not None:
+                        conn.last_tier_fetch_at = now
+                    if mirror:
+                        self._last_tier_fetch_at = now
+                    # Resolve this connection's tier in the background so the
+                    # account picker shows a real tier within an HTTP RTT.
+                    asyncio.create_task(self._fetch_tier_for(conn))
             return
+
         if t == "user_info":
             info = data.get("userInfo")
             if isinstance(info, dict):
-                # Whitelist on intake — Google's userinfo response can
-                # carry id / locale / hd / given_name / family_name etc.
-                # The /api/auth/me route filters on output, but caching
-                # the full dict here means any future surface that
-                # returns flow_client.user_info directly leaks PII.
-                # Clamp at the door instead.
+                # Whitelist on intake — Google's userinfo can carry id / locale
+                # / hd / given_name etc. Clamp at the door so nothing leaks PII.
                 allowed = ("email", "name", "picture", "verified_email")
-                self._user_info = {k: info[k] for k in allowed if k in info}
-                logger.info(
-                    "user_info captured for %s",
-                    self._user_info.get("email") or "<no email>",
-                )
+                clean = {k: info[k] for k in allowed if k in info}
+                if conn is not None:
+                    conn.user_info = clean
+                if mirror:
+                    self._user_info = clean
+                logger.info("user_info captured for %s", clean.get("email") or "<no email>")
             return
+
         if t == "pong":
             return
+
         # Inbound response (legacy path; production flow uses HTTP callback)
         req_id = data.get("id")
         if req_id and req_id in self._pending:
@@ -283,14 +408,11 @@ class FlowClient:
 
     # ── outbound ──────────────────────────────────────────────────────────
     async def notify(self, message: dict) -> bool:
-        """Fire-and-forget WS push to the extension. Returns False when the
-        extension isn't connected so callers can surface a meaningful
-        diagnostic instead of silently losing the message.
+        """Fire-and-forget WS push to the active extension. Returns False when
+        no extension is connected so callers can surface a diagnostic.
 
-        Used by the logout flow (tell extension to clear its in-memory
-        token + cached userinfo) and the scan flow (ask extension to
-        re-fetch userinfo when the agent has a connection but the cache
-        is empty).
+        Used by the logout flow (tell extension to clear its in-memory token +
+        cached userinfo) and the scan flow (re-fetch userinfo).
         """
         if not self.connected or self._ws is None:
             return False
@@ -340,7 +462,7 @@ class FlowClient:
         timeout: Optional[float] = None,
     ) -> dict:
         """Proxy an HTTP call against aisandbox-pa.googleapis.com through the
-        extension's browser session. If ``captcha_action`` is set, the
+        active extension's browser session. If ``captcha_action`` is set, the
         extension solves reCAPTCHA on an active Flow tab before firing the
         fetch and injects the token into the body's recaptchaContext fields.
         """
@@ -362,7 +484,7 @@ class FlowClient:
         body: Any = None,
         timeout: Optional[float] = 30.0,
     ) -> dict:
-        """Proxy a TRPC call against labs.google through the extension.
+        """Proxy a TRPC call against labs.google through the active extension.
 
         No captcha; just Bearer auth passthrough on a `credentials: include`
         fetch. Used for metadata calls like ``project.createProject``.
@@ -390,11 +512,9 @@ class FlowClient:
             "success_count": self._success_count,
             "failed_count": self._failed_count,
             "last_error": self._last_error,
+            "connection_count": len(self._conns),
+            "active_connection": self._active,
         }
 
 
 flow_client = FlowClient()
-
-
-def get_flow_client() -> FlowClient:
-    return flow_client

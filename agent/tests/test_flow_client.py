@@ -151,3 +151,52 @@ async def test_api_request_4xx_counts_as_failed():
     assert stats["failed_count"] == 1
     assert stats["success_count"] == 0
     assert stats["last_error"] == "API_403"
+
+
+# ── multi-connection registry (account picker) ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_registry_first_active_then_switch_routes_to_new():
+    client = FlowClient()
+    a, b = FakeWs(), FakeWs()
+    client.add_connection(a)
+    cb = client.add_connection(b)
+    assert client.connected and client._ws is a          # first connection = active
+    assert client.ws_stats["connection_count"] == 2
+    assert client.set_active(cb) is True
+    assert client._ws is b                               # requests now route to b
+
+
+@pytest.mark.asyncio
+async def test_registry_nonactive_disconnect_keeps_active():
+    client = FlowClient()
+    a, b = FakeWs(), FakeWs()
+    client.add_connection(a)                             # active
+    cb = client.add_connection(b)
+    client.remove_connection(cb)                         # a stale/other profile drops
+    assert client.connected and client._ws is a          # active bridge untouched
+
+
+@pytest.mark.asyncio
+async def test_registry_active_disconnect_promotes_remaining():
+    client = FlowClient()
+    a, b = FakeWs(), FakeWs()
+    ca = client.add_connection(a)                        # active
+    cb = client.add_connection(b)
+    client.remove_connection(ca)                         # the active one drops
+    assert client._active == cb and client._ws is b      # b promoted
+
+
+@pytest.mark.asyncio
+async def test_handle_message_updates_target_connection_only():
+    client = FlowClient()
+    a, b = FakeWs(), FakeWs()
+    ca = client.add_connection(a)                        # active
+    cb = client.add_connection(b)
+    await client.handle_message(
+        {"type": "user_info", "userInfo": {"email": "b@x.com", "name": "B"}}, conn_id=cb
+    )
+    assert client.user_info is None                      # active (a) flat mirror untouched
+    conns = {c["id"]: c for c in client.list_connections()}
+    assert conns[cb]["email"] == "b@x.com"
+    assert conns[ca]["active"] is True

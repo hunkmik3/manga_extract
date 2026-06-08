@@ -8,10 +8,15 @@ exposes the cached object for the frontend's AccountPanel.
 from __future__ import annotations
 
 from fastapi import APIRouter
+from pydantic import BaseModel
 
 from flowboard.services.flow_client import flow_client
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+class _ActiveBody(BaseModel):
+    id: str
 
 
 # Test hook kept for backward compatibility with existing test imports.
@@ -57,6 +62,24 @@ def get_me() -> dict:
         "sku": flow_client.sku,
         "credits": flow_client.credits,
     }
+
+
+@router.get("/connections")
+def get_connections() -> dict:
+    """Every connected extension (one per Chrome profile / Google account) for
+    the account picker — which is active, plus each one's tier/credits."""
+    return {"connections": flow_client.list_connections()}
+
+
+@router.post("/active")
+async def set_active_connection(body: _ActiveBody) -> dict:
+    """Switch which connected account the bridge routes through (e.g. to move to
+    a fresh account when one hits its daily quota)."""
+    ok = flow_client.set_active(body.id)
+    # Resolve the newly-active account's tier if we don't have it yet.
+    if ok and flow_client.paygate_tier is None:
+        await flow_client.fetch_paygate_tier()
+    return {"ok": ok, "connections": flow_client.list_connections()}
 
 
 @router.post("/logout")

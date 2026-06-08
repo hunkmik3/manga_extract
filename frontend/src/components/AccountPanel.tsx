@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import {
   getAuthMe,
+  getFlowConnections,
   logoutExtension,
   scanExtension,
+  setActiveFlowConnection,
   type AuthMe,
+  type FlowConnection,
 } from "../api/client";
 import { useGenerationStore } from "../store/generation";
 import { getLatestRelease, isNewerVersion, type LatestRelease } from "../api/github";
@@ -40,6 +43,10 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
   // Bumped by handleScan / handleLogout to kick the poll effect into
   // re-running immediately instead of waiting for the next 5s tick.
   const [pollNonce, setPollNonce] = useState(0);
+  // All connected extensions (one per Chrome profile / account). When >1, an
+  // account switcher appears so the user can pick which one the bridge uses
+  // (e.g. move to a fresh account when one hits its daily quota).
+  const [connections, setConnections] = useState<FlowConnection[]>([]);
 
   // Poll /api/auth/me until BOTH email and paygate_tier are populated.
   // Email comes from Google's userinfo (fetched once per token rotation
@@ -75,6 +82,34 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
       if (timer) clearTimeout(timer);
     };
   }, [setStorePaygateTier, pollNonce]);
+
+  // Poll the connected-accounts list (independent of the /me stop condition so
+  // a second profile connecting later still shows up in the switcher).
+  useEffect(() => {
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      const conns = await getFlowConnections();
+      if (!alive) return;
+      setConnections(conns);
+      timer = setTimeout(poll, 5000);
+    };
+    poll();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [pollNonce]);
+
+  async function switchAccount(id: string) {
+    try {
+      const res = await setActiveFlowConnection(id);
+      setConnections(res.connections);
+    } catch {
+      // non-fatal
+    }
+    setPollNonce((n) => n + 1); // refresh /me (tier/credits) for the new active
+  }
 
   // Logout: clears agent-side cache + tells extension to drop in-memory
   // identity. Resets local state immediately so the chip flips to the
@@ -238,6 +273,23 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
                   </span>
                 )}
               </div>
+            )}
+            {connections.length > 1 && (
+              <select
+                value={connections.find((c) => c.active)?.id ?? ""}
+                onChange={(e) => switchAccount(e.target.value)}
+                title="Switch the active Flow account — the bridge routes generation through it"
+                style={{ marginTop: 4, width: "100%", fontSize: 11, padding: "2px 4px", boxSizing: "border-box" }}
+              >
+                {connections.map((c) => {
+                  const t = c.tier === "PAYGATE_TIER_TWO" ? "Ultra" : c.tier === "PAYGATE_TIER_ONE" ? "Pro" : "—";
+                  return (
+                    <option key={c.id} value={c.id}>
+                      {(c.email ?? "connecting…")} · {t}
+                    </option>
+                  );
+                })}
+              </select>
             )}
           </div>
         )}

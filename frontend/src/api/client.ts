@@ -429,6 +429,33 @@ export function scanExtension() {
   return api<AuthScanResult>("/api/auth/scan", { method: "POST" });
 }
 
+// One connected extension (Chrome profile / Google account). Several can be
+// connected at once; exactly one is `active` and routes all generation.
+export interface FlowConnection {
+  id: string;
+  email: string | null;
+  name: string | null;
+  picture: string | null;
+  tier: "PAYGATE_TIER_ONE" | "PAYGATE_TIER_TWO" | null;
+  sku: string | null;
+  credits: number | null;
+  active: boolean;
+  token_age_s: number | null;
+}
+
+export function getFlowConnections() {
+  return api<{ connections: FlowConnection[] }>("/api/auth/connections")
+    .then((r) => r.connections)
+    .catch(() => [] as FlowConnection[]);
+}
+
+export function setActiveFlowConnection(id: string) {
+  return api<{ ok: boolean; connections: FlowConnection[] }>("/api/auth/active", {
+    method: "POST",
+    body: JSON.stringify({ id }),
+  });
+}
+
 export function createRequest(body: {
   type: string;
   node_id?: number;
