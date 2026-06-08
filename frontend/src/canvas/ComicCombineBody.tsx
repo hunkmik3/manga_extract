@@ -125,6 +125,39 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     });
   }
 
+  function loadImage(src: string): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+
+  // Download the raw (un-cleaned) source panels — crop each box from its page
+  // client-side, available even before a combine has run.
+  async function downloadRaw(e: MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    const cache = new Map<string, Promise<HTMLImageElement>>();
+    for (let i = 0; i < Math.min(panels.length, 4); i++) {
+      const p = panels[i];
+      if (!p?.pageMediaId || !p.box?.w || !p.box?.h) continue;
+      try {
+        if (!cache.has(p.pageMediaId)) cache.set(p.pageMediaId, loadImage(mediaUrl(p.pageMediaId)));
+        const img = await cache.get(p.pageMediaId)!;
+        const canvas = document.createElement("canvas");
+        canvas.width = p.box.w;
+        canvas.height = p.box.h;
+        canvas.getContext("2d")?.drawImage(img, p.box.x, p.box.y, p.box.w, p.box.h, 0, 0, p.box.w, p.box.h);
+        triggerDownload(canvas.toDataURL("image/png"), `comic-raw-${data.shortId ?? rfId}-panel-${i + 1}.png`);
+        await new Promise((r) => setTimeout(r, 250)); // stagger so downloads aren't dropped
+      } catch {
+        /* skip a panel whose page image can't be read */
+      }
+    }
+  }
+
   useEffect(() => {
     const root = rootRef.current;
     const card = root?.closest(".node-card") as HTMLElement | null;
@@ -205,15 +238,18 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
         </>
       )}
 
-      {(mediaId || cells.some((c) => typeof c === "string" && c)) && (
-        <div style={{ display: "flex", gap: 6 }}>
+      {panels.length > 0 && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <button className="comic-btn" onClick={downloadRaw} style={{ flex: "1 1 30%" }} title="Download the raw (un-cleaned) source panels">
+            ⬇ Raw panels
+          </button>
           {mediaId && (
-            <button className="comic-btn" onClick={downloadCombined} style={{ flex: 1 }} title="Download the single combined 2×2 image">
+            <button className="comic-btn" onClick={downloadCombined} style={{ flex: "1 1 30%" }} title="Download the single combined 2×2 image">
               ⬇ 2×2 image
             </button>
           )}
           {cells.some((c) => typeof c === "string" && c) && (
-            <button className="comic-btn" onClick={downloadCells} style={{ flex: 1 }} title="Download the 4 cleaned cells as separate images">
+            <button className="comic-btn" onClick={downloadCells} style={{ flex: "1 1 30%" }} title="Download the 4 cleaned cells as separate images">
               ⬇ 4 cells
             </button>
           )}
