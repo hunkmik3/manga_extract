@@ -33,6 +33,7 @@ VIDEO_I2V_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoStartImage"
 VIDEO_OMNI_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoReferenceImages"
 VIDEO_POLL_URL = f"{FLOW_API_BASE}/v1/video:batchCheckAsyncVideoGenerationStatus"
 UPLOAD_IMAGE_URL = f"{FLOW_API_BASE}/v1/flow/uploadImage"
+UPSAMPLE_IMAGE_URL = f"{FLOW_API_BASE}/v1/flow/upsampleImage"
 
 
 # Omni Flash — variable-duration r2v video model. Each duration maps to a
@@ -957,6 +958,46 @@ class FlowSDK:
         entries = extract_media_entries(resp)
         media_ids = [e["media_id"] for e in entries]
         return {"raw": resp, "media_ids": media_ids, "media_entries": entries}
+
+    # ── image upscale / upsample (1K → 2K / 4K) ─────────────────────────────
+    async def upsample_image(
+        self,
+        media_id: str,
+        project_id: str,
+        paygate_tier: Optional[str] = None,
+        target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K",
+    ) -> dict[str, Any]:
+        """Upscale a Flow image to 2K/4K (Flow's Download → "2K/4K Upscaled").
+
+        ``media_id`` is a Flow media id in this project (upload the image first
+        if you only have bytes). Returns ``{raw, encoded_image}`` — a base64
+        JPEG of the upscaled result — or ``{raw, error}``.
+        """
+        if paygate_tier is None:
+            raise ValueError("paygate_tier is required — caller must resolve before dispatch")
+        ctx = _client_context(project_id, paygate_tier)
+        body = {
+            "mediaId": media_id,
+            "targetResolution": target_resolution,
+            "clientContext": ctx,
+        }
+        resp = await self._client.api_request(
+            url=UPSAMPLE_IMAGE_URL,
+            method="POST",
+            headers=dict(_API_HEADERS),
+            body=body,
+            captcha_action=CAPTCHA_IMAGE,
+        )
+        if isinstance(resp, dict) and resp.get("error"):
+            return {"raw": resp, "error": resp["error"]}
+        inner_err = _extract_inner_api_error(resp)
+        if inner_err:
+            return {"raw": resp, "error": inner_err}
+        data = resp.get("data") if isinstance(resp, dict) else None
+        encoded = data.get("encodedImage") if isinstance(data, dict) else None
+        if not isinstance(encoded, str) or not encoded:
+            return {"raw": resp, "error": "no_encoded_image"}
+        return {"raw": resp, "encoded_image": encoded}
 
     # ── image upload (api_request, no captcha) ─────────────────────────────
     async def upload_image(

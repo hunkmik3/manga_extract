@@ -1419,6 +1419,45 @@ async def _handle_restitch_cells(params: dict) -> tuple[dict, Optional[str]]:
     return {"mediaId": mid, "cells": cells[:4], "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
+async def _handle_upsample_image(params: dict) -> tuple[dict, Optional[str]]:
+    """Upscale a cached image to 2K/4K via Flow (its Download → "Upscaled").
+    ``media_id`` is the local cache id of the image to upscale (any combine
+    cell, the 2×2, a panel, …)."""
+    from flowboard.services.comic import bridge, panels as panel_svc
+    import uuid
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    media_id = params.get("media_id")
+    if not isinstance(media_id, str) or not media_id:
+        return {}, "missing_media_id"
+    target = params.get("resolution") or params.get("target") or "4K"
+
+    path = media_service.cached_path(media_id)
+    if path is None:
+        return {}, "no_source_image"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return {}, "no_source_image"
+
+    try:
+        out = await bridge.upsample_image(raw, project_id=project_id.strip(), target=str(target))
+    except bridge.BridgeEditError as exc:
+        return {}, f"bridge_failed: {exc.reason}"[:200]
+
+    new_id = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(new_id, out, kind="image", mime="image/jpeg")
+    w = h = 0
+    try:
+        img = panel_svc.decode_bgr(out)
+        h, w = int(img.shape[0]), int(img.shape[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"mediaId": new_id, "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
     "create_project": _handle_create_project,
@@ -1436,6 +1475,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "combine_panels": _handle_combine_panels,
     "regen_cell": _handle_regen_cell,
     "restitch_cells": _handle_restitch_cells,
+    "upsample_image": _handle_upsample_image,
 }
 
 

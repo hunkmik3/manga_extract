@@ -216,3 +216,27 @@ async def test_edit_image_variants_returns_all_candidates():
         )
     assert len(outs) == 4
     assert sdk.edit_image.await_args.kwargs["variant_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_upsample_image_uploads_then_decodes_4k():
+    """Upscale path: upload source → upsampleImage → base64 decode the result."""
+    import base64
+    sdk = _fake_sdk()  # upload_image returns a fresh media_id
+    sdk.upsample_image = AsyncMock(return_value={"encoded_image": base64.b64encode(b"UPSCALED-4K").decode()})
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk):
+        out = await bridge.upsample_image(
+            b"source-bytes", project_id=PROJECT_ID, target="4K", paygate_tier="PAYGATE_TIER_ONE",
+        )
+    assert out == b"UPSCALED-4K"
+    assert sdk.upload_image.await_count == 1  # uploaded once
+    assert sdk.upsample_image.await_args.kwargs["target_resolution"] == "UPSAMPLE_IMAGE_RESOLUTION_4K"
+
+
+@pytest.mark.asyncio
+async def test_upsample_image_raises_on_flow_error():
+    sdk = _fake_sdk()
+    sdk.upsample_image = AsyncMock(return_value={"error": "PUBLIC_ERROR_UNUSUAL_ACTIVITY"})
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk):
+        with pytest.raises(BridgeEditError):
+            await bridge.upsample_image(b"x", project_id=PROJECT_ID, target="2K", paygate_tier="PAYGATE_TIER_ONE")

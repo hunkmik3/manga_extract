@@ -53,6 +53,8 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   const [regenning, setRegenning] = useState<number[]>([]); // cells queued/in-flight
   const [cellCandidates, setCellCandidates] = useState<Record<number, (string | null)[]>>({}); // cell → variants awaiting a pick
   const [showHistory, setShowHistory] = useState(false);
+  const [dlRes, setDlRes] = useState<"1K" | "2K" | "4K">("1K"); // download resolution (2K/4K = Flow upscale)
+  const [upscaling, setUpscaling] = useState(false);
   // Every image ever produced for each cell (combine + all re-gen candidates),
   // keyed by cell index as a string. Persisted on the node so the user can
   // re-pick an earlier result from the history panel.
@@ -216,23 +218,62 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     a.remove();
   }
 
-  function downloadCombined(e: MouseEvent<HTMLButtonElement>) {
-    e.stopPropagation();
-    if (!mediaId) return;
-    triggerDownload(mediaUrl(mediaId), `comic-combine-${data.shortId ?? rfId}.png`);
+  // Upscale a cached image to 2K/4K via Flow; returns the new media id or null.
+  async function upscaleMedia(localMediaId: string, res: "2K" | "4K"): Promise<string | null> {
+    const projectId = await project();
+    if (!projectId) return null;
+    try {
+      const result = await runRequestToResult(
+        createRequest({ type: "upsample_image", node_id: parseInt(rfId, 10), params: { project_id: projectId, media_id: localMediaId, resolution: res } }),
+      );
+      return (result.mediaId as string) ?? null;
+    } catch (err) {
+      patchComicNode(rfId, { status: "error", error: `upscale ${res}: ${String(err)}` });
+      return null;
+    }
   }
 
-  function downloadCells(e: MouseEvent<HTMLButtonElement>) {
+  async function downloadCombined(e: MouseEvent<HTMLButtonElement>) {
     e.stopPropagation();
-    // Save each cleaned cell as its own file. Stagger the clicks so the browser
-    // doesn't drop the later ones as "concurrent download" spam.
-    let n = 0;
-    cells.forEach((cid, i) => {
-      if (typeof cid !== "string" || !cid) return;
-      const delay = n++ * 250;
-      const url = mediaUrl(cid);
-      setTimeout(() => triggerDownload(url, `comic-combine-${data.shortId ?? rfId}-cell-${i + 1}.png`), delay);
-    });
+    if (!mediaId || upscaling) return;
+    const base = `comic-combine-${data.shortId ?? rfId}`;
+    if (dlRes === "1K") {
+      triggerDownload(mediaUrl(mediaId), `${base}.png`);
+      return;
+    }
+    setUpscaling(true);
+    const up = await upscaleMedia(mediaId, dlRes);
+    setUpscaling(false);
+    if (up) triggerDownload(mediaUrl(up), `${base}-${dlRes}.jpg`);
+  }
+
+  async function downloadCells(e: MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    if (upscaling) return;
+    const base = `comic-combine-${data.shortId ?? rfId}`;
+    if (dlRes === "1K") {
+      // Save each cleaned cell as-is. Stagger so the browser doesn't drop them.
+      let n = 0;
+      cells.forEach((cid, i) => {
+        if (typeof cid !== "string" || !cid) return;
+        const delay = n++ * 250;
+        const url = mediaUrl(cid);
+        setTimeout(() => triggerDownload(url, `${base}-cell-${i + 1}.png`), delay);
+      });
+      return;
+    }
+    // Upscale each cell, then download (sequential — Flow is the bottleneck).
+    setUpscaling(true);
+    for (let i = 0; i < cells.length; i++) {
+      const cid = cells[i];
+      if (typeof cid !== "string" || !cid) continue;
+      const up = await upscaleMedia(cid, dlRes);
+      if (up) {
+        triggerDownload(mediaUrl(up), `${base}-cell-${i + 1}-${dlRes}.jpg`);
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+    setUpscaling(false);
   }
 
   function loadImage(src: string): Promise<HTMLImageElement> {
@@ -388,19 +429,35 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
         </>
       )}
 
+      {(mediaId || cells.some((c) => typeof c === "string" && c)) && (
+        <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10 }} title="Download resolution — 2K/4K upscale via Flow (Ultra/paid)">
+          <span style={{ opacity: 0.7 }}>Quality</span>
+          {(["1K", "2K", "4K"] as const).map((r) => (
+            <button
+              key={r}
+              className="comic-btn comic-btn--sm"
+              onClick={() => setDlRes(r)}
+              disabled={upscaling}
+              style={{ flex: 1, opacity: dlRes === r ? 1 : 0.5, fontWeight: dlRes === r ? 700 : 400 }}
+              title={r === "1K" ? "Original size" : `Upscaled to ${r} via Flow`}
+            >{r}</button>
+          ))}
+        </div>
+      )}
+
       {panels.length > 0 && (
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <button className="comic-btn" onClick={downloadRaw} style={{ flex: "1 1 30%" }} title="Download the raw (un-cleaned) source panels">
+          <button className="comic-btn" onClick={downloadRaw} disabled={upscaling} style={{ flex: "1 1 30%" }} title="Download the raw (un-cleaned) source panels (1K)">
             ⬇ Raw panels
           </button>
           {mediaId && (
-            <button className="comic-btn" onClick={downloadCombined} style={{ flex: "1 1 30%" }} title="Download the single combined 2×2 image">
-              ⬇ 2×2 image
+            <button className="comic-btn" onClick={downloadCombined} disabled={upscaling} style={{ flex: "1 1 30%" }} title="Download the combined 2×2 image at the chosen quality">
+              {upscaling ? "Upscaling…" : `⬇ 2×2 ${dlRes}`}
             </button>
           )}
           {cells.some((c) => typeof c === "string" && c) && (
-            <button className="comic-btn" onClick={downloadCells} style={{ flex: "1 1 30%" }} title="Download the 4 cleaned cells as separate images">
-              ⬇ 4 cells
+            <button className="comic-btn" onClick={downloadCells} disabled={upscaling} style={{ flex: "1 1 30%" }} title="Download the 4 cleaned cells at the chosen quality">
+              {upscaling ? "Upscaling…" : `⬇ 4 cells ${dlRes}`}
             </button>
           )}
         </div>

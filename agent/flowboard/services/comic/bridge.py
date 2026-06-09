@@ -259,6 +259,70 @@ async def edit_image_variants(
     raise BridgeEditError(last_reason, attempts=max_attempts)
 
 
+_UPSAMPLE_RESOLUTIONS = {
+    "2K": "UPSAMPLE_IMAGE_RESOLUTION_2K",
+    "4K": "UPSAMPLE_IMAGE_RESOLUTION_4K",
+}
+
+
+async def upsample_image(
+    image_bytes: bytes,
+    *,
+    project_id: str,
+    target: str = "4K",
+    paygate_tier: Optional[str] = None,
+    mime: str = "image/png",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> bytes:
+    """Upscale an image to 2K/4K via Flow's upsampleImage (the Download →
+    "2K/4K Upscaled" option). Uploads the bytes into the project, asks Flow to
+    upsample, and returns the upscaled JPEG bytes. Raises ``BridgeEditError``."""
+    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) == 0:
+        raise ValueError("image_bytes must be non-empty bytes")
+    if not is_valid_project_id(project_id):
+        raise ValueError(f"invalid project_id: {project_id!r}")
+    tier = paygate_tier or flow_client.paygate_tier
+    if tier is None:
+        raise BridgeEditError("paygate_tier_unknown", attempts=0)
+    target_resolution = _UPSAMPLE_RESOLUTIONS.get(str(target).upper(), str(target))
+
+    sdk = get_flow_sdk()
+    media_id = await _upload(
+        sdk, bytes(image_bytes), project_id=project_id, mime=mime, file_name="comic_upsample.png",
+    )
+
+    last_reason = "unknown"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = await sdk.upsample_image(
+                media_id=media_id, project_id=project_id,
+                paygate_tier=tier, target_resolution=target_resolution,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_reason = f"sdk_raised: {exc}"
+            logger.warning("upsample attempt %d/%d raised: %s", attempt, max_attempts, exc)
+            await _backoff(attempt, max_attempts)
+            continue
+        if not isinstance(resp, dict) or resp.get("error"):
+            last_reason = str(resp.get("error") if isinstance(resp, dict) else resp)[:200]
+            logger.warning("upsample attempt %d/%d error: %s", attempt, max_attempts, last_reason)
+            await _backoff(attempt, max_attempts)
+            continue
+        encoded = resp.get("encoded_image")
+        try:
+            out = base64.b64decode(encoded) if isinstance(encoded, str) else b""
+        except Exception:  # noqa: BLE001
+            out = b""
+        if not out:
+            last_reason = "decode_failed"
+            await _backoff(attempt, max_attempts)
+            continue
+        logger.info("upsample ok on attempt %d/%d: %d bytes (%s)", attempt, max_attempts, len(out), target_resolution)
+        return out
+
+    raise BridgeEditError(last_reason, attempts=max_attempts)
+
+
 async def _backoff(attempt: int, max_attempts: int) -> None:
     """Linear backoff between generate retries; no sleep after the last try."""
     if attempt < max_attempts:
