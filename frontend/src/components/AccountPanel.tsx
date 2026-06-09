@@ -198,11 +198,16 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
 
   // Google Flow plan tiers — both are paid (Flowboard's hard
   // requirement). TIER_TWO = Ultra (higher tier), TIER_ONE = Pro.
+  // Google keeps adding tiers (PAYGATE_TIER_TIER1P5, …). Map the two we know to
+  // their names; for any other known tier, show the SKU (or a generic "Plan")
+  // rather than a blank so the chip still reflects a connected paid account.
   const tierLabel = tier === "PAYGATE_TIER_TWO"
     ? "Ultra"
     : tier === "PAYGATE_TIER_ONE"
       ? "Pro"
-      : "—";
+      : tier
+        ? (profile?.sku || "Plan")
+        : "—";
 
   return (
     <>

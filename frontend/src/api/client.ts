@@ -383,7 +383,7 @@ export interface AuthMe {
   // triggered when the extension pushes a Bearer token. Falls back to
   // the legacy passive sniff (extension reading userPaygateTier out of
   // outgoing Flow request bodies) if the agent fetch fails.
-  paygate_tier: "PAYGATE_TIER_ONE" | "PAYGATE_TIER_TWO" | null;
+  paygate_tier: string | null; // PAYGATE_TIER_ONE / _TWO / _TIER1P5 / … or null
   // Subscription SKU from /v1/credits — e.g. "WS_ULTRA" / "WS_PRO".
   // Available alongside paygate_tier; null until the credits fetch lands.
   sku: string | null;
@@ -436,7 +436,7 @@ export interface FlowConnection {
   email: string | null;
   name: string | null;
   picture: string | null;
-  tier: "PAYGATE_TIER_ONE" | "PAYGATE_TIER_TWO" | null;
+  tier: string | null; // PAYGATE_TIER_ONE / _TWO / _TIER1P5 / … or null
   sku: string | null;
   credits: number | null;
   active: boolean;

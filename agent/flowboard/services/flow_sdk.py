@@ -282,13 +282,14 @@ def _client_context(project_id: str, paygate_tier: str) -> dict:
 
     `paygate_tier` is REQUIRED (no default). Pre-v1.1.5 the default was
     `"PAYGATE_TIER_ONE"` which silently downgraded Ultra users when any
-    upstream code path forgot to pass tier. Now we raise loudly on
-    invalid / unknown values so a code regression can't quietly serve
-    Pro to an Ultra account.
+    upstream code path forgot to pass tier. We still reject a missing/garbage
+    value, but accept ANY ``PAYGATE_TIER_*`` string — Google keeps adding tiers
+    (e.g. ``PAYGATE_TIER_TIER1P5``) and the value is the account's authoritative
+    tier from /v1/credits, passed straight back to Flow, not something we guess.
     """
-    if paygate_tier not in _VALID_TIERS:
+    if not (isinstance(paygate_tier, str) and paygate_tier.startswith("PAYGATE_TIER_")):
         raise ValueError(
-            f"invalid paygate_tier {paygate_tier!r} — must be one of {sorted(_VALID_TIERS)}"
+            f"invalid paygate_tier {paygate_tier!r} — expected a PAYGATE_TIER_* value"
         )
     return {
         "projectId": str(project_id),

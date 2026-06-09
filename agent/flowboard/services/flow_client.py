@@ -273,7 +273,9 @@ class FlowClient:
             logger.warning("fetch_paygate_tier: response was not JSON")
             return False
         tier = data.get("userPaygateTier")
-        if tier not in ("PAYGATE_TIER_ONE", "PAYGATE_TIER_TWO"):
+        # Accept ANY PAYGATE_TIER_* — Google adds new tiers (PAYGATE_TIER_TIER1P5
+        # etc.); this is the account's authoritative tier, passed back to Flow.
+        if not (isinstance(tier, str) and tier.startswith("PAYGATE_TIER_")):
             logger.warning(
                 "fetch_paygate_tier: response missing userPaygateTier (got %r)",
                 tier,
