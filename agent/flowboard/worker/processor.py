@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -1219,7 +1220,11 @@ async def _handle_build_character_db(params: dict) -> tuple[dict, Optional[str]]
 # that single "ground truth" image to the bridge with COMBINE_2X2_PROMPT → the
 # model removes text, keeps characters faithful, extends backgrounds to 9:16.
 
-COMBINE_CONCURRENCY = 4  # how many panel cleans run at once (overlap Flow gens)
+# How many panel cleans run at once during a combine. Parallel Flow generations
+# are faster but a big burst can trip Google's anti-abuse
+# (PUBLIC_ERROR_UNUSUAL_ACTIVITY / reCAPTCHA), so default to a modest 2 and let
+# it be tuned (1 = fully sequential / safest).
+COMBINE_CONCURRENCY = max(1, int(os.getenv("FLOWBOARD_COMBINE_CONCURRENCY", "2")))
 
 
 async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
