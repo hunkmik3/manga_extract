@@ -7,6 +7,8 @@ import {
   downstreamPageNodes,
   nodePosition,
   patchComicNode,
+  relayoutComicChains,
+  relayoutComicCombineChains,
   runComicRequest,
   runRequestToResult,
   syncPanelsForPage,
@@ -227,6 +229,12 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       const res = await createNodesBulk(boardId, bulk);
       useBoardStore.getState().appendNodesBulk(res.nodes, res.edges);
       focusNew(res.nodes);
+      // Pull each combine's source panels beside it + drop them from the page
+      // column (the combine now "owns" their layout).
+      setTimeout(() => {
+        relayoutComicCombineChains();
+        relayoutComicChains();
+      }, 0);
     } catch (e) {
       setSpawnErr(String(e));
     } finally {
