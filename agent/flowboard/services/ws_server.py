@@ -18,8 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 async def _handler(websocket) -> None:
-    flow_client.set_extension(websocket)
-    logger.info("extension connected from %s", getattr(websocket, "remote_address", "?"))
+    # Each connection (one per Chrome profile / account) is tracked separately;
+    # the first becomes active, later ones are picked via the account UI.
+    conn_id = flow_client.add_connection(websocket)
+    logger.info("extension connected (%s) from %s", conn_id, getattr(websocket, "remote_address", "?"))
 
     # Hand the extension the secret it needs to authenticate HTTP callbacks.
     try:
@@ -37,14 +39,14 @@ async def _handler(websocket) -> None:
                 logger.warning("invalid JSON from extension")
                 continue
             try:
-                await flow_client.handle_message(data)
+                await flow_client.handle_message(data, conn_id=conn_id)
             except Exception:  # noqa: BLE001
                 logger.exception("error handling extension message")
     except websockets.ConnectionClosed:
         pass
     finally:
-        flow_client.clear_extension()
-        logger.info("extension disconnected")
+        flow_client.remove_connection(conn_id)
+        logger.info("extension disconnected (%s)", conn_id)
 
 
 async def run_ws_server() -> None:

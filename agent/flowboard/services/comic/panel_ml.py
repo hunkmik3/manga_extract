@@ -9,7 +9,7 @@ detector" note in the brief.
 
 Heavy deps (torch + ultralytics) are an **optional** install:
 
-    pip install -e ".[ml]"      # or: pip install ultralytics huggingface_hub
+    uv pip install --python .venv/bin/python -e ".[ml]"
 
 so the base agent stays light. Everything here is lazy: nothing is imported or
 downloaded until the first ML detection. If the deps/weights are missing,
@@ -58,7 +58,7 @@ def _load_model():
     try:
         from ultralytics import YOLO  # optional dep (pulls torch)
     except Exception as exc:  # noqa: BLE001
-        _load_failed = f"ultralytics/torch not installed ({exc}); run: pip install -e '.[ml]'"
+        _load_failed = f'ultralytics/torch not installed ({exc}); run: uv pip install --python .venv/bin/python -e ".[ml]"'
         raise MLUnavailable(_load_failed) from exc
 
     weights = os.getenv("FLOWBOARD_PANEL_MODEL")

@@ -7,6 +7,8 @@ import {
   downstreamPageNodes,
   nodePosition,
   patchComicNode,
+  relayoutComicChains,
+  relayoutComicCombineChains,
   runComicRequest,
   runRequestToResult,
   syncPanelsForPage,
@@ -39,7 +41,7 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
   const isImporting = status === "queued" || status === "running";
 
   const [draftFolder, setDraftFolder] = useState(folder);
-  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine">(null);
+  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download">(null);
   const [spawnErr, setSpawnErr] = useState<string | undefined>();
   const dirInputRef = useRef<HTMLInputElement | null>(null);
   const rf = useReactFlow();
@@ -140,7 +142,46 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       for (const pn of pageNodes) {
         await syncPanelsForPage(String(pn.dbId));
       }
+      patchComicNode(rfId, { panelsMaterialized: true });
       setTimeout(() => { try { rf.fitView({ duration: 600 }); } catch { /* noop */ } }, 80);
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Download EVERY panel (detected + hand-adjusted boxes) across all pages as
+  // individual image files, bundled into ONE .zip in reading order.
+  async function downloadAllPanels() {
+    if (busy) return;
+    const pageNodes = downstreamPageNodes(rfId);
+    if (pageNodes.length === 0) { setSpawnErr("Create page nodes first"); return; }
+    setSpawnErr(undefined);
+    setBusy("download");
+    try {
+      const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
+      const panels: Array<{ page_media_id: string; box: { x: number; y: number; w: number; h: number } }> = [];
+      for (const pn of sorted) {
+        const mediaId = pn.data.pageMediaId;
+        if (typeof mediaId !== "string" || !mediaId) continue;
+        const boxes = ((pn.data.boxes as BoxItem[]) ?? [])
+          .slice()
+          .sort((a, b) => (a.y - b.y) || (a.x - b.x)); // reading order: top→bottom, left→right
+        for (const b of boxes) panels.push({ page_media_id: mediaId, box: { x: b.x, y: b.y, w: b.w, h: b.h } });
+      }
+      if (panels.length === 0) { setSpawnErr("No panels — detect/adjust boxes first"); setBusy(null); return; }
+      const result = await runRequestToResult(
+        createRequest({ type: "export_all_panels", node_id: parseInt(rfId, 10), params: { panels } }),
+      );
+      const mid = result.mediaId as string | undefined;
+      if (!mid) { setSpawnErr("Export failed"); return; }
+      const a = document.createElement("a");
+      a.href = mediaUrl(mid);
+      a.download = `comic-all-panels-${data.shortId ?? rfId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     } catch (e) {
       setSpawnErr(String(e));
     } finally {
@@ -159,18 +200,57 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
     setSpawnErr(undefined);
     setBusy("combine");
     try {
+      const store = useBoardStore.getState();
       const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
       const flat: Array<Record<string, unknown>> = [];
-      for (const pn of sorted) {
-        const boxes = (pn.data.boxes as BoxItem[]) ?? [];
-        boxes.forEach((b, j) =>
-          flat.push({
-            pageMediaId: pn.data.pageMediaId, box: b, w: pn.data.w, h: pn.data.h,
-            pageName: pn.data.pageName, panelIndex: j,
-          }),
-        );
+      const pageIds = new Set(pageNodes.map((p) => String(p.dbId)));
+      const panelLayerExists =
+        Boolean(store.nodes.find((n) => n.id === rfId)?.data.panelsMaterialized)
+        || store.edges.some((e) => {
+          const tgt = store.nodes.find((n) => n.id === e.target);
+          return pageIds.has(e.source) && tgt?.data.type === "comic_panel";
+        });
+
+      if (panelLayerExists) {
+        for (const pn of sorted) {
+          const boxes = ((pn.data.boxes as BoxItem[]) ?? []).filter((b) => b?.id);
+          const panelByBoxId = new Map<string, string>();
+          for (const e of store.edges) {
+            if (e.source !== String(pn.dbId)) continue;
+            const panel = store.nodes.find((n) => n.id === e.target);
+            const boxId = panel?.data.boxId;
+            if (panel?.data.type === "comic_panel" && typeof boxId === "string") {
+              panelByBoxId.set(boxId, panel.id);
+            }
+          }
+          boxes.forEach((b, j) => {
+            if (!panelByBoxId.has(b.id)) return;
+            flat.push({
+              pageMediaId: pn.data.pageMediaId,
+              box: b,
+              w: pn.data.w,
+              h: pn.data.h,
+              pageName: pn.data.pageName,
+              panelIndex: j,
+              boxId: b.id,
+            });
+          });
+        }
+      } else {
+        for (const pn of sorted) {
+          const boxes = (pn.data.boxes as BoxItem[]) ?? [];
+          boxes.forEach((b, j) =>
+            flat.push({
+              pageMediaId: pn.data.pageMediaId, box: b, w: pn.data.w, h: pn.data.h,
+              pageName: pn.data.pageName, panelIndex: j,
+            }),
+          );
+        }
       }
-      if (flat.length === 0) { setSpawnErr("No panel boxes — detect/draw first"); return; }
+      if (flat.length === 0) {
+        setSpawnErr(panelLayerExists ? "No current panel nodes — create or keep at least one panel" : "No panel boxes — detect/draw first");
+        return;
+      }
       const pos = nodePosition(rfId);
       const bulk: BulkNodeInput[] = [];
       for (let i = 0; i < flat.length; i += 4) {
@@ -187,6 +267,12 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       const res = await createNodesBulk(boardId, bulk);
       useBoardStore.getState().appendNodesBulk(res.nodes, res.edges);
       focusNew(res.nodes);
+      // Pull each combine's source panels beside it + drop them from the page
+      // column (the combine now "owns" their layout).
+      setTimeout(() => {
+        relayoutComicCombineChains();
+        relayoutComicChains();
+      }, 0);
     } catch (e) {
       setSpawnErr(String(e));
     } finally {
@@ -218,6 +304,8 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
               <select value={detector} onChange={(e) => patchComicNode(rfId, { detector: e.target.value })} style={{ fontSize: 11, padding: "2px 4px" }}>
                 <option value="heuristic">Heuristic</option>
                 <option value="ml">YOLO</option>
+                <option value="webtoon">Webtoon</option>
+                <option value="hybrid">Hybrid (ML+webtoon)</option>
                 <option value="auto">Auto</option>
               </select>
             </label>
@@ -230,6 +318,9 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
           </button>
           <button className="comic-btn" onClick={spawnCombine} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Group panels in reading order into 2×2 storyboard images (4 per group)">
             {busy === "combine" ? "Creating combine…" : "③ Combine 2×2 (groups of 4)"}
+          </button>
+          <button className="comic-btn" onClick={downloadAllPanels} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Crop every panel (detected + hand-adjusted) into separate files, bundled into ONE .zip">
+            {busy === "download" ? "Exporting…" : "⬇ Download all panels (.zip)"}
           </button>
         </>
       )}

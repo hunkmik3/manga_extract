@@ -383,7 +383,7 @@ export interface AuthMe {
   // triggered when the extension pushes a Bearer token. Falls back to
   // the legacy passive sniff (extension reading userPaygateTier out of
   // outgoing Flow request bodies) if the agent fetch fails.
-  paygate_tier: "PAYGATE_TIER_ONE" | "PAYGATE_TIER_TWO" | null;
+  paygate_tier: string | null; // PAYGATE_TIER_ONE / _TWO / _TIER1P5 / … or null
   // Subscription SKU from /v1/credits — e.g. "WS_ULTRA" / "WS_PRO".
   // Available alongside paygate_tier; null until the credits fetch lands.
   sku: string | null;
@@ -427,6 +427,33 @@ export interface AuthScanResult {
 
 export function scanExtension() {
   return api<AuthScanResult>("/api/auth/scan", { method: "POST" });
+}
+
+// One connected extension (Chrome profile / Google account). Several can be
+// connected at once; exactly one is `active` and routes all generation.
+export interface FlowConnection {
+  id: string;
+  email: string | null;
+  name: string | null;
+  picture: string | null;
+  tier: string | null; // PAYGATE_TIER_ONE / _TWO / _TIER1P5 / … or null
+  sku: string | null;
+  credits: number | null;
+  active: boolean;
+  token_age_s: number | null;
+}
+
+export function getFlowConnections() {
+  return api<{ connections: FlowConnection[] }>("/api/auth/connections")
+    .then((r) => r.connections)
+    .catch(() => [] as FlowConnection[]);
+}
+
+export function setActiveFlowConnection(id: string) {
+  return api<{ ok: boolean; connections: FlowConnection[] }>("/api/auth/active", {
+    method: "POST",
+    body: JSON.stringify({ id }),
+  });
 }
 
 export function createRequest(body: {

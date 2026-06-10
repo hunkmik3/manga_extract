@@ -224,11 +224,10 @@ async def test_fetch_paygate_tier_handles_expired_token(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_paygate_tier_rejects_unknown_tier_value(monkeypatch):
-    """Defensive — Flow API contract change that returns an unknown
-    tier value (e.g. PAYGATE_TIER_THREE in the future) must NOT
-    silently set the cache to that string. Returns False, leaves
-    cache untouched."""
+async def test_fetch_paygate_tier_rejects_missing_tier_value(monkeypatch):
+    """A /v1/credits response with no (or non-PAYGATE_TIER) tier MUST NOT poison
+    the cache — returns False, cache untouched. (A new PAYGATE_TIER_* value, by
+    contrast, IS accepted — see test_fetch_paygate_tier_accepts_new_tier.)"""
     import httpx
     flow_client._flow_key = "ya29.fake"
     flow_client._paygate_tier = None
@@ -236,7 +235,7 @@ async def test_fetch_paygate_tier_rejects_unknown_tier_value(monkeypatch):
     class _MockResponse:
         status_code = 200
         def json(self):
-            return {"userPaygateTier": "PAYGATE_TIER_FUTURE", "credits": 100}
+            return {"credits": 100}  # no userPaygateTier field
 
     class _MockClient:
         def __init__(self, *args, **kwargs): pass
@@ -249,6 +248,33 @@ async def test_fetch_paygate_tier_rejects_unknown_tier_value(monkeypatch):
     ok = await flow_client.fetch_paygate_tier()
     assert ok is False
     assert flow_client.paygate_tier is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_paygate_tier_accepts_new_tier(monkeypatch):
+    """Google adds tiers over time (e.g. PAYGATE_TIER_TIER1P5). Any PAYGATE_TIER_*
+    value resolves successfully — it's the account's real tier, passed to Flow."""
+    import httpx
+    flow_client._flow_key = "ya29.fake"
+    flow_client._paygate_tier = None
+
+    class _MockResponse:
+        status_code = 200
+        def json(self):
+            return {"userPaygateTier": "PAYGATE_TIER_TIER1P5", "sku": "WS_PRO_PLUS", "credits": 9626}
+
+    class _MockClient:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def get(self, *args, **kwargs):
+            return _MockResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _MockClient)
+    ok = await flow_client.fetch_paygate_tier()
+    assert ok is True
+    assert flow_client.paygate_tier == "PAYGATE_TIER_TIER1P5"
+    assert flow_client.credits == 9626
 
 
 def test_logout_clears_cached_identity_and_tier(client):

@@ -7,6 +7,7 @@ import {
   patchBoard as apiPatchBoard,
   deleteBoard as apiDeleteBoard,
   createNode,
+  createNodesBulk,
   patchNode,
   deleteNode,
   createEdge,
@@ -97,6 +98,15 @@ export interface FlowboardNodeData extends Record<string, unknown> {
 }
 
 export type FlowNode = Node<FlowboardNodeData>;
+
+/** A recorded deletion that {@link BoardState.undo} can replay. Nodes are
+ * captured by value (type/pos/data) — they're recreated with NEW ids, and the
+ * edges are remapped (a surviving endpoint keeps its id). */
+interface DeleteUndoEntry {
+  nodes: Array<{ rfId: string; type: NodeType; x: number; y: number; data: Record<string, unknown> }>;
+  edges: Array<{ source: string; target: string; sourceVariantIdx: number | null }>;
+}
+const MAX_UNDO = 25;
 
 // Per-edge data we attach to ReactFlow's `Edge.data` so dispatch and
 // edge-rendering paths can read it without a round-trip through the
@@ -210,6 +220,9 @@ interface BoardState {
   edges: Edge[];
   loading: boolean;
   error: string | null;
+  // Undo stack for destructive actions (currently node/edge deletions). Each
+  // entry can recreate what was removed. Not persisted — session-only.
+  undoStack: DeleteUndoEntry[];
 
   loadInitialBoard(): Promise<void>;
   refreshBoardState(): Promise<void>;
@@ -267,6 +280,12 @@ interface BoardState {
     nodes: Array<{ id: number; type: NodeType; x: number; y: number; short_id: string; data: Record<string, unknown>; status: NodeStatus }>,
     edges: Array<{ id: number; source_id: number; target_id: number; source_variant_idx?: number | null }>,
   ): void;
+  /** Snapshot the given nodes (+ their touching edges) onto the undo stack
+   * BEFORE they're deleted, so {@link undo} can recreate them. */
+  recordDeleteUndo(removedRfIds: string[]): void;
+  /** Undo the last recorded deletion: recreate the nodes (new ids) + edges,
+   * remapping endpoints. No-op when the stack is empty. */
+  undo(): Promise<void>;
   clearError(): void;
 }
 
@@ -278,6 +297,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   edges: [],
   loading: false,
   error: null,
+  undoStack: [],
 
   async loadInitialBoard() {
     set({ loading: true, error: null });
@@ -307,6 +327,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         nodes,
         edges,
         loading: false,
+        undoStack: [], // undo history is per-board
       });
       persistBoardId(detail.board.id);
     } catch (err) {
@@ -336,6 +357,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         nodes,
         edges,
         loading: false,
+        undoStack: [], // undo history is per-board
       });
       persistBoardId(detail.board.id);
     } catch (err) {
@@ -674,5 +696,69 @@ export const useBoardStore = create<BoardState>((set, get) => ({
       nodes: [...s.nodes, ...nodeDtos.map(nodeFromDto)],
       edges: [...s.edges, ...edgeDtos.map(edgeFromDto)],
     })),
+
+  recordDeleteUndo: (removedRfIds) => {
+    const ids = new Set(removedRfIds);
+    const s = get();
+    const nodes = s.nodes
+      .filter((n) => ids.has(n.id))
+      .map((n) => ({
+        rfId: n.id,
+        type: n.data.type as NodeType,
+        x: Math.round(n.position.x),
+        y: Math.round(n.position.y),
+        data: { ...n.data },
+      }));
+    if (nodes.length === 0) return;
+    // Every edge touching a removed node is dropped server-side too → capture it.
+    const edges = s.edges
+      .filter((e) => ids.has(e.source) || ids.has(e.target))
+      .map((e) => ({
+        source: e.source,
+        target: e.target,
+        sourceVariantIdx: ((e.data as FlowboardEdgeData | undefined)?.sourceVariantIdx) ?? null,
+      }));
+    set((st) => ({ undoStack: [...st.undoStack.slice(-(MAX_UNDO - 1)), { nodes, edges }] }));
+  },
+
+  async undo() {
+    const { boardId, undoStack } = get();
+    if (boardId === null || undoStack.length === 0) return;
+    const entry = undoStack[undoStack.length - 1];
+    set((s) => ({ undoStack: s.undoStack.slice(0, -1) }));
+    try {
+      // Recreate the nodes (new ids), preserving order so we can remap edges.
+      const res = await createNodesBulk(
+        boardId,
+        entry.nodes.map((n) => ({ type: n.type, x: n.x, y: n.y, data: n.data })),
+      );
+      const idMap = new Map<string, string>();
+      entry.nodes.forEach((n, i) => {
+        if (res.nodes[i]) idMap.set(n.rfId, String(res.nodes[i].id));
+      });
+      get().appendNodesBulk(res.nodes, []);
+      // Recreate edges, remapping each endpoint (a surviving endpoint keeps its
+      // id). Skip an edge whose endpoint no longer exists anywhere.
+      const alive = new Set(get().nodes.map((n) => n.id));
+      for (const e of entry.edges) {
+        const src = idMap.get(e.source) ?? e.source;
+        const tgt = idMap.get(e.target) ?? e.target;
+        if (!alive.has(src) || !alive.has(tgt)) continue;
+        try {
+          const dto = await createEdge({
+            board_id: boardId,
+            source_id: parseInt(src, 10),
+            target_id: parseInt(tgt, 10),
+            source_variant_idx: e.sourceVariantIdx ?? undefined,
+          });
+          set((s) => ({ edges: [...s.edges, edgeFromDto(dto)] }));
+        } catch {
+          // ignore an individual edge that can't be recreated
+        }
+      }
+    } catch (err) {
+      console.error("undo failed", err);
+    }
+  },
   clearError: () => set({ error: null }),
 }));

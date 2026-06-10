@@ -193,8 +193,13 @@ def test_client_context_rejects_invalid_paygate_tier():
     two = _client_context("p", "PAYGATE_TIER_TWO")
     assert two["userPaygateTier"] == "PAYGATE_TIER_TWO"
 
-    # Unknown / malformed values raise loudly (not silent coerce).
-    for bad in ("PAYGATE_TIER_THREE", "", "<script>", "PAYGATE_TIER_FREE"):
+    # Any PAYGATE_TIER_* value Google reports (incl. new tiers like TIER1P5)
+    # passes through — it's the account's authoritative tier, sent back to Flow.
+    new = _client_context("p", "PAYGATE_TIER_TIER1P5")
+    assert new["userPaygateTier"] == "PAYGATE_TIER_TIER1P5"
+
+    # Missing / non-PAYGATE_TIER garbage still raises loudly (no silent coerce).
+    for bad in ("", "<script>", "GARBAGE", "TIER_ONE"):
         with _pytest.raises(ValueError, match="invalid paygate_tier"):
             _client_context("p", bad)
 

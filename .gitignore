@@ -50,3 +50,6 @@ flowboard-*.zip
 # comments as source-of-truth, but contains raw OAuth bearer tokens.
 # Keep on disk; never commit.
 /video_model*.md
+
+# Claude Code local settings (per-machine, not shared)
+.claude/

@@ -17,6 +17,8 @@ export const PANEL_COLS = 3;
 export const PANEL_CELL_W = 165;
 export const PANEL_CELL_H = 185;
 export const ROW_GAP = 60;
+const COMBINE_GAP_Y = 56;
+const DEFAULT_COMBINE_H = 420;
 
 export const COMIC_TYPES = new Set([
   "comic_import",
@@ -297,10 +299,25 @@ export async function syncPanelsForPage(pageRfId: string): Promise<void> {
   }
 }
 
+/** boxIds of every panel that belongs to a combine group. Those panels are laid
+ * out next to their combine (see relayoutComicCombineChains) instead of in the
+ * page→panel grid, so this set tells relayoutComicChains to skip them. */
+function combineOwnedBoxIds(nodes: FlowNode[]): Set<string> {
+  const owned = new Set<string>();
+  for (const c of nodes.filter((n) => n.data.type === "comic_combine")) {
+    const panels = Array.isArray(c.data.panels) ? (c.data.panels as Array<Record<string, unknown>>) : [];
+    for (const p of panels) {
+      if (p && typeof p.boxId === "string") owned.add(p.boxId);
+    }
+  }
+  return owned;
+}
+
 export function relayoutComicChains(): void {
   const store = useBoardStore.getState();
   const { nodes, edges } = store;
   const moves = new Map<string, { x: number; y: number }>();
+  const owned = combineOwnedBoxIds(nodes); // panels claimed by a combine sit beside it
 
   for (const up of nodes.filter((n) => n.data.type === "comic_import")) {
     const pageX = up.position.x + PAGE_GAP_X;
@@ -321,11 +338,14 @@ export function relayoutComicChains(): void {
         .filter((e) => e.source === pn.id)
         .map((e) => nodes.find((n) => n.id === e.target))
         .filter((n): n is FlowNode => !!n && n.data.type === "comic_panel")
+        .filter((n) => !owned.has(n.data.boxId as string)) // combine-owned panels move beside it
         .sort((a, b) => boxOrder(a) - boxOrder(b));
 
-      const count = panelNodes.length || pageBoxes.length || 1;
+      const count = panelNodes.length || 1;
       const rows = Math.max(1, Math.ceil(count / PANEL_COLS));
-      const rowH = Math.max(PAGE_H, rows * PANEL_CELL_H) + ROW_GAP;
+      // Use the page node's real (measured) height — tall webtoon pages are far
+      // taller than PAGE_H, so a fixed advance would overlap the next page.
+      const rowH = Math.max(pageNodeHeight(pn), rows * PANEL_CELL_H) + ROW_GAP;
 
       moves.set(pn.id, { x: pageX, y: curY });
       panelNodes.forEach((qn, j) => {
@@ -342,6 +362,86 @@ export function relayoutComicChains(): void {
   });
   store.setNodes(newNodes);
   for (const [rfId, p] of moves) {
+    const dbId = parseInt(rfId, 10);
+    if (!Number.isNaN(dbId)) patchNode(dbId, { x: p.x, y: p.y }).catch(() => {});
+  }
+}
+
+function pageNodeHeight(n: FlowNode): number {
+  const measured = n.data.__measuredHeight;
+  if (typeof measured === "number" && Number.isFinite(measured) && measured > 0) {
+    return Math.max(PAGE_H, measured);
+  }
+  return PAGE_H;
+}
+
+function combineNodeHeight(n: FlowNode): number {
+  const measured = n.data.__measuredHeight;
+  if (typeof measured === "number" && Number.isFinite(measured) && measured > 0) {
+    return Math.max(180, measured);
+  }
+  return DEFAULT_COMBINE_H;
+}
+
+/** Re-pack combine nodes in each upload chain using their measured card height.
+ * Combine cards grow after a 9:16 result/cell grid appears; without moving the
+ * later combine nodes, the enlarged card visually overlaps the next one. */
+export function relayoutComicCombineChains(): void {
+  const store = useBoardStore.getState();
+  const { nodes, edges } = store;
+  const moves = new Map<string, { x: number; y: number }>();
+
+  for (const up of nodes.filter((n) => n.data.type === "comic_import")) {
+    const combineNodes = edges
+      .filter((e) => e.source === up.id)
+      .map((e) => nodes.find((n) => n.id === e.target))
+      .filter((n): n is FlowNode => !!n && n.data.type === "comic_combine")
+      .sort((a, b) => a.position.y - b.position.y);
+
+    if (combineNodes.length === 0) continue;
+
+    let curY = combineNodes[0].position.y;
+    const SRC_COLS = 2;
+    const SRC_GAP_X = 40; // gap between a combine's source-panel grid and the card
+    const gridW = SRC_COLS * PANEL_CELL_W;
+    for (const node of combineNodes) {
+      moves.set(node.id, { x: node.position.x, y: curY });
+      // Pin this combine's 4 source panel nodes (matched by boxId) in a 2×2 to
+      // its left, mirroring the 2×2 output for easy input→output comparison.
+      const panels = Array.isArray(node.data.panels)
+        ? (node.data.panels as Array<Record<string, unknown>>)
+        : [];
+      panels.slice(0, 4).forEach((spec, j) => {
+        const boxId = spec?.boxId;
+        if (typeof boxId !== "string") return;
+        const pnode = nodes.find(
+          (n) => n.data.type === "comic_panel" && n.data.boxId === boxId,
+        );
+        if (!pnode) return;
+        const col = j % SRC_COLS;
+        const row = Math.floor(j / SRC_COLS);
+        moves.set(pnode.id, {
+          x: node.position.x - SRC_GAP_X - gridW + col * PANEL_CELL_W,
+          y: curY + row * PANEL_CELL_H,
+        });
+      });
+      curY += combineNodeHeight(node) + COMBINE_GAP_Y;
+    }
+  }
+
+  if (moves.size === 0) return;
+  const changed = new Map<string, { x: number; y: number }>();
+  const nextNodes = nodes.map((n) => {
+    const mv = moves.get(n.id);
+    if (!mv || (Math.abs(n.position.x - mv.x) < 1 && Math.abs(n.position.y - mv.y) < 1)) {
+      return n;
+    }
+    changed.set(n.id, mv);
+    return { ...n, position: { x: mv.x, y: mv.y } };
+  });
+  if (changed.size === 0) return;
+  store.setNodes(nextNodes);
+  for (const [rfId, p] of changed) {
     const dbId = parseInt(rfId, 10);
     if (!Number.isNaN(dbId)) patchNode(dbId, { x: p.x, y: p.y }).catch(() => {});
   }

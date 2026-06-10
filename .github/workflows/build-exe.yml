@@ -61,6 +61,14 @@ jobs:
           FLOWBOARD_BUNDLE_ML: "1"
         run: pyinstaller packaging/flowboard.spec --noconfirm
 
+      # Ship the matching Chrome bridge extension + a quickstart inside the zip
+      # (the extension can't be bundled into the .exe — it loads into Chrome).
+      - name: Bundle extension + quickstart
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse -Path extension -Destination dist/flowboard/extension
+          Copy-Item -Path packaging/READ-ME-FIRST.txt -Destination dist/flowboard/READ-ME-FIRST.txt
+
       - name: Zip bundle
         run: Compress-Archive -Path dist/flowboard -DestinationPath flowboard-full-windows.zip
 

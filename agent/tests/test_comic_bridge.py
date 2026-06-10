@@ -184,3 +184,59 @@ async def test_upload_failure_raises_pre_flight():
 async def test_input_validation(kwargs):
     with pytest.raises(ValueError):
         await edit_image(**kwargs, paygate_tier="PAYGATE_TIER_ONE")
+
+
+@pytest.mark.asyncio
+async def test_upload_cache_dedupes_identical_bytes_across_calls():
+    """The same source bytes (same project) upload only once — later edits reuse
+    the cached Flow media_id (speeds up re-gens / shared refs)."""
+    sdk = _fake_sdk(edit_return=_ok_edit_response())
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk), \
+         patch.object(bridge.media_service, "ingest_urls", MagicMock(return_value=1)), \
+         patch.object(bridge.media_service, "fetch_and_cache",
+                      AsyncMock(return_value=(b"PNG", "image/png", "/tmp/x.png"))):
+        for _ in range(3):
+            await edit_image(b"same-source", "p", project_id=PROJECT_ID, paygate_tier="PAYGATE_TIER_ONE")
+    assert sdk.upload_image.await_count == 1  # uploaded once despite 3 edits
+    assert sdk.edit_image.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_edit_image_variants_returns_all_candidates():
+    """variant_count>1 → bridge returns every downloaded candidate's bytes."""
+    rids = [_media_id() for _ in range(4)]
+    resp = {"media_ids": rids, "media_entries": [{"media_id": r, "url": f"https://flow/{r}"} for r in rids]}
+    sdk = _fake_sdk(edit_return=resp)
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk), \
+         patch.object(bridge.media_service, "ingest_urls", MagicMock(return_value=4)), \
+         patch.object(bridge.media_service, "fetch_and_cache",
+                      AsyncMock(side_effect=lambda mid: (f"bytes-{mid}".encode(), "image/png", "/tmp/x.png"))):
+        outs = await bridge.edit_image_variants(
+            b"src", "p", project_id=PROJECT_ID, paygate_tier="PAYGATE_TIER_ONE", variant_count=4,
+        )
+    assert len(outs) == 4
+    assert sdk.edit_image.await_args.kwargs["variant_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_upsample_image_uploads_then_decodes_4k():
+    """Upscale path: upload source → upsampleImage → base64 decode the result."""
+    import base64
+    sdk = _fake_sdk()  # upload_image returns a fresh media_id
+    sdk.upsample_image = AsyncMock(return_value={"encoded_image": base64.b64encode(b"UPSCALED-4K").decode()})
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk):
+        out = await bridge.upsample_image(
+            b"source-bytes", project_id=PROJECT_ID, target="4K", paygate_tier="PAYGATE_TIER_ONE",
+        )
+    assert out == b"UPSCALED-4K"
+    assert sdk.upload_image.await_count == 1  # uploaded once
+    assert sdk.upsample_image.await_args.kwargs["target_resolution"] == "UPSAMPLE_IMAGE_RESOLUTION_4K"
+
+
+@pytest.mark.asyncio
+async def test_upsample_image_raises_on_flow_error():
+    sdk = _fake_sdk()
+    sdk.upsample_image = AsyncMock(return_value={"error": "PUBLIC_ERROR_UNUSUAL_ACTIVITY"})
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk):
+        with pytest.raises(BridgeEditError):
+            await bridge.upsample_image(b"x", project_id=PROJECT_ID, target="2K", paygate_tier="PAYGATE_TIER_ONE")

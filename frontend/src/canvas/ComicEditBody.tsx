@@ -23,6 +23,8 @@ export function ComicEditBody({
   const errorMsg = typeof data.error === "string" ? data.error : undefined;
   const mediaId = typeof data.mediaId === "string" ? data.mediaId : "";
   const extend916 = Boolean(data.extend916);
+  const variantCount = typeof data.variantCount === "number" && data.variantCount >= 1 ? Math.min(data.variantCount, 4) : 1;
+  const mediaIds = (Array.isArray(data.mediaIds) ? data.mediaIds : []) as (string | null)[];
 
   const up = resolveUpstreamImage(rfId);
   const ready = up !== null;
@@ -55,12 +57,19 @@ export function ComicEditBody({
       const chars = findCharacterDb();
       if (chars) params.characters = chars;
     }
+    params.variant_count = variantCount; // "x4" on Flow — generate N candidates
     const pageMediaId = up!.pageMediaId; // persist so a downstream enhance can reference it
 
     runComicRequest(
       rfId,
       () => createRequest({ type: taskType, node_id: dbId, params }),
-      (result) => ({ mediaId: (result.mediaId as string) ?? "", width: result.width, height: result.height, pageMediaId }),
+      (result) => ({
+        mediaId: (result.mediaId as string) ?? "",
+        mediaIds: (result.mediaIds as (string | null)[]) ?? undefined,
+        width: result.width,
+        height: result.height,
+        pageMediaId,
+      }),
     );
   }
 
@@ -81,6 +90,19 @@ export function ComicEditBody({
         </label>
       )}
 
+      <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11 }} title="How many candidates to generate at once (Flow x1–x4)">
+        <span style={{ opacity: 0.7 }}>Variants</span>
+        {[1, 2, 3, 4].map((k) => (
+          <button
+            key={k}
+            className="comic-btn comic-btn--sm"
+            onClick={() => patchComicNode(rfId, { variantCount: k })}
+            disabled={isBusy}
+            style={{ flex: 1, opacity: variantCount === k ? 1 : 0.5, fontWeight: variantCount === k ? 700 : 400 }}
+          >x{k}</button>
+        ))}
+      </div>
+
       <button className="comic-btn" onClick={run} disabled={isBusy || !ready} title="Run through the Flow bridge (Nano Banana Pro)">
         {isBusy ? "Running…" : kind === "clean" ? "Clean panel" : "Enhance to anime"}
       </button>
@@ -89,7 +111,34 @@ export function ComicEditBody({
         <p className="brief-hint" style={{ color: "#ef4444", fontSize: 11 }}>⚠ {errorMsg}</p>
       )}
 
-      {mediaId ? (
+      {mediaIds.length > 1 ? (
+        <>
+          <p style={{ fontSize: 9, opacity: 0.55, margin: 0 }}>Pick the variant to keep (feeds downstream):</p>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+            {mediaIds.map((mid, i) =>
+              mid ? (
+                <img
+                  key={i}
+                  src={mediaUrl(mid)}
+                  alt={`variant ${i + 1}`}
+                  loading="lazy"
+                  onClick={() => patchComicNode(rfId, { mediaId: mid })}
+                  title={mid === mediaId ? "Selected" : `Use variant ${i + 1}`}
+                  style={{
+                    width: "100%", borderRadius: 4, display: "block", cursor: "pointer",
+                    background: "var(--border)",
+                    outline: mid === mediaId ? "2px solid #6aa3ff" : "1px solid transparent",
+                    outlineOffset: -2,
+                    opacity: mid === mediaId ? 1 : 0.8,
+                  }}
+                />
+              ) : (
+                <div key={i} style={{ aspectRatio: "9 / 16", background: "var(--border)", borderRadius: 4, opacity: 0.4 }} />
+              )
+            )}
+          </div>
+        </>
+      ) : mediaId ? (
         <img src={mediaUrl(mediaId)} alt={titleLabel} loading="lazy" style={{ width: "100%", borderRadius: 4, display: "block", background: "var(--border)" }} />
       ) : (
         ready && !isBusy && <p style={{ fontSize: 10, opacity: 0.55, margin: 0 }}>Run to generate · costs 1 Flow generation</p>

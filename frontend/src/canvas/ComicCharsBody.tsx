@@ -8,6 +8,24 @@ import {
   type PageItem,
 } from "./comicShared";
 
+function characterErrorView(errorMsg: string | undefined) {
+  if (!errorMsg) return null;
+  if (errorMsg.startsWith("ml_unavailable")) {
+    return {
+      title: "ML extras missing",
+      message: "Character DB needs torch, ultralytics, dghs-imgutils, and onnxruntime.",
+      command: 'cd agent && uv pip install --python .venv/bin/python -e ".[ml]"',
+      detail: errorMsg.replace(/^ml_unavailable:\s*/, ""),
+    };
+  }
+  return {
+    title: "Character DB failed",
+    message: errorMsg,
+    command: undefined,
+    detail: errorMsg,
+  };
+}
+
 /**
  * Character DB node — detects + clusters characters across the whole comic
  * (manga109 + CCIP) and shows one entry per character. Connect it to a Comic
@@ -19,6 +37,8 @@ export function ComicCharsBody({ rfId, data }: { rfId: string; data: FlowboardNo
   const status = typeof data.status === "string" ? data.status : "idle";
   const isBusy = status === "queued" || status === "running";
   const errorMsg = typeof data.error === "string" ? data.error : undefined;
+  const displayError = status === "error" ? characterErrorView(errorMsg) : null;
+  const emptyDone = status === "done" && characters.length === 0;
 
   const upstream = getUpstreamComicData(rfId);
   const pages = (Array.isArray(upstream?.pages) ? upstream?.pages : []) as PageItem[];
@@ -44,8 +64,24 @@ export function ComicCharsBody({ rfId, data }: { rfId: string; data: FlowboardNo
         {isBusy ? "Building… (detect + cluster)" : characters.length ? "Rebuild" : `Build from ${pages.length} pages`}
       </button>
 
-      {errorMsg && status === "error" && (
-        <p className="brief-hint" style={{ color: "#ef4444", fontSize: 11 }}>⚠ {errorMsg}</p>
+      {isBusy && (
+        <div className="comic-status-note">
+          <strong>Working</strong>
+          <span>Detecting character bodies and clustering refs. First run can take a minute while models warm up.</span>
+        </div>
+      )}
+      {emptyDone && (
+        <div className="comic-status-note comic-status-note--empty">
+          <strong>No character refs found</strong>
+          <span>The run finished, but no reusable character clusters were produced.</span>
+        </div>
+      )}
+      {displayError && (
+        <div className="comic-error-note" title={displayError.detail}>
+          <strong>{displayError.title}</strong>
+          <span>{displayError.message}</span>
+          {displayError.command && <code>{displayError.command}</code>}
+        </div>
       )}
       {characters.length > 0 && (
         <p style={{ fontSize: 11, opacity: 0.8, margin: 0 }}>{characters.length} character{characters.length === 1 ? "" : "s"} → auto-used by Enhance</p>

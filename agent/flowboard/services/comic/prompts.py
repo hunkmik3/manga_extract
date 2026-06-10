@@ -54,6 +54,12 @@ REFERENCE_CLAUSE = (
     "setting consistent."
 )
 
+COMBINE_CHARACTER_REFERENCE_CLAUSE = (
+    " Use the additional reference images only as character identity and costume references. "
+    "Do not copy their backgrounds, camera angles, poses, layouts, or scene content into this "
+    "panel. The source panel remains the ground truth."
+)
+
 # Combine 4 panels (pre-stitched into a rough 2×2) into one clean vertical 9:16
 # storyboard image: remove text, keep characters 100% faithful, extend only
 # backgrounds. Sent with the stitched composite as the single source image.

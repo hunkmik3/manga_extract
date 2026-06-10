@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 from typing import Optional, Sequence
 
@@ -48,6 +49,14 @@ DEFAULT_MAX_ATTEMPTS = 3
 RETRY_BACKOFF_S = 1.5
 # Comic panels default to portrait; callers (Node 2 9:16, Node 3) override.
 DEFAULT_ASPECT_RATIO = "IMAGE_ASPECT_RATIO_LANDSCAPE"
+
+# Upload de-dupe cache: (project_id, sha256(bytes)) → Flow media_id. The same
+# bytes (a shared character ref across 4 combine panels, or the same source on a
+# re-gen) upload only once per project. Flow media_ids are stable for the
+# project's lifetime; a rare stale id just makes the next generate retry/fail,
+# which the user can re-run. Bounded so a long session can't grow it unbounded.
+_UPLOAD_CACHE: dict[tuple[str, str], str] = {}
+_UPLOAD_CACHE_MAX = 2000
 
 
 class BridgeEditError(RuntimeError):
@@ -78,6 +87,11 @@ async def _upload(
     extension is reconnecting after an agent reload) with backoff. Raises
     ``BridgeEditError`` (attempts=0) only after exhausting retries.
     """
+    cache_key = (project_id, hashlib.sha256(bytes(image_bytes)).hexdigest())
+    cached = _UPLOAD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     b64 = base64.b64encode(image_bytes).decode("ascii")
     last = "unknown"
     for attempt in range(1, DEFAULT_MAX_ATTEMPTS + 1):
@@ -97,6 +111,9 @@ async def _upload(
             continue
         media_id = resp.get("media_id") if isinstance(resp, dict) else None
         if isinstance(media_id, str) and media_service.is_valid_media_id(media_id):
+            if len(_UPLOAD_CACHE) >= _UPLOAD_CACHE_MAX:
+                _UPLOAD_CACHE.clear()
+            _UPLOAD_CACHE[cache_key] = media_id
             return media_id
         last = "upload returned no valid media_id"
         await _backoff(attempt, DEFAULT_MAX_ATTEMPTS)
@@ -117,14 +134,39 @@ async def edit_image(
 ) -> bytes:
     """Edit one image through the Flow bridge and return the result bytes.
 
-    Uploads ``image_bytes`` (and each of ``reference_images``) into the board's
-    Flow project, runs ``edit_image`` with ``prompt`` (Nano Banana Pro by
-    default), ingests the result URL and downloads the bytes back. The generate
-    step is retried up to ``max_attempts`` times; uploads are done once and
-    reused. Raises ``BridgeEditError`` if no usable image comes back.
+    Thin wrapper over :func:`edit_image_variants` for the common single-output
+    case — returns the first (only) variant's bytes.
+    """
+    outs = await edit_image_variants(
+        image_bytes, prompt, reference_images,
+        project_id=project_id, aspect_ratio=aspect_ratio, image_model=image_model,
+        paygate_tier=paygate_tier, mime=mime, max_attempts=max_attempts, variant_count=1,
+    )
+    return outs[0]
 
-    The order of inputs to Flow is BASE_IMAGE (``image_bytes``) first, then the
-    references — handled inside ``flow_sdk.edit_image``.
+
+async def edit_image_variants(
+    image_bytes: bytes,
+    prompt: str,
+    reference_images: Optional[Sequence[bytes]] = None,
+    *,
+    project_id: str,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    image_model: Optional[str] = None,
+    paygate_tier: Optional[str] = None,
+    mime: str = "image/png",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    variant_count: int = 1,
+) -> list[bytes]:
+    """Edit one image and return up to ``variant_count`` result candidates.
+
+    Uploads ``image_bytes`` (and each of ``reference_images``) into the board's
+    Flow project once, then runs Nano Banana Pro with ``variant_count`` (1-4)
+    replicated seeds — the "x4" on the Flow UI — and downloads every candidate
+    back. The generate step is retried up to ``max_attempts`` times (uploads are
+    reused). Returns the candidates that downloaded (≥1); raises
+    ``BridgeEditError`` if none come back. The order of inputs to Flow is
+    BASE_IMAGE (``image_bytes``) first, then the references.
     """
     if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) == 0:
         raise ValueError("image_bytes must be non-empty bytes")
@@ -143,21 +185,18 @@ async def edit_image(
 
     sdk = get_flow_sdk()
 
-    # Uploads are stable across generate retries → do them once.
-    source_media_id = await _upload(
-        sdk, bytes(image_bytes), project_id=project_id, mime=mime,
-        file_name="comic_source.png",
+    # Uploads are stable across generate retries → do them once, and in parallel
+    # (source + every ref at once). _upload de-dupes identical bytes via cache.
+    refs_to_upload = [(i, bytes(ref)) for i, ref in enumerate(reference_images or []) if ref]
+    uploaded = await asyncio.gather(
+        _upload(sdk, bytes(image_bytes), project_id=project_id, mime=mime, file_name="comic_source.png"),
+        *[
+            _upload(sdk, rb, project_id=project_id, mime=mime, file_name=f"comic_ref_{i}.png")
+            for i, rb in refs_to_upload
+        ],
     )
-    ref_media_ids: list[str] = []
-    for i, ref in enumerate(reference_images or []):
-        if not ref:
-            continue
-        ref_media_ids.append(
-            await _upload(
-                sdk, bytes(ref), project_id=project_id, mime=mime,
-                file_name=f"comic_ref_{i}.png",
-            )
-        )
+    source_media_id = uploaded[0]
+    ref_media_ids: list[str] = list(uploaded[1:])
 
     last_reason = "unknown"
     for attempt in range(1, max_attempts + 1):
@@ -170,6 +209,7 @@ async def edit_image(
                 aspect_ratio=aspect_ratio,
                 paygate_tier=tier,
                 image_model=image_model,
+                variant_count=variant_count,
             )
         except Exception as exc:  # noqa: BLE001 — transport/bridge errors are retryable
             last_reason = f"sdk_raised: {exc}"
@@ -199,20 +239,86 @@ async def edit_image(
         except Exception:  # noqa: BLE001 — caching bookkeeping must not abort the edit
             logger.exception("ingest_urls failed (continuing to fetch result)")
 
-        result_id = entries[0]["media_id"]
-        fetched = await media_service.fetch_and_cache(result_id)
-        if fetched is None:
-            last_reason = f"fetch_failed: {result_id}"
+        outs: list[bytes] = []
+        for e in entries:
+            fetched = await media_service.fetch_and_cache(e["media_id"])
+            if fetched is not None:
+                outs.append(fetched[0])
+        if not outs:
+            last_reason = f"fetch_failed: {entries[0]['media_id']}"
             logger.warning("edit_image attempt %d/%d: %s", attempt, max_attempts, last_reason)
             await _backoff(attempt, max_attempts)
             continue
 
-        out_bytes = fetched[0]
         logger.info(
-            "edit_image ok on attempt %d/%d: %d bytes (media_id=%s)",
-            attempt, max_attempts, len(out_bytes), result_id,
+            "edit_image ok on attempt %d/%d: %d/%d variant(s) (%d bytes first)",
+            attempt, max_attempts, len(outs), len(entries), len(outs[0]),
         )
-        return out_bytes
+        return outs
+
+    raise BridgeEditError(last_reason, attempts=max_attempts)
+
+
+_UPSAMPLE_RESOLUTIONS = {
+    "2K": "UPSAMPLE_IMAGE_RESOLUTION_2K",
+    "4K": "UPSAMPLE_IMAGE_RESOLUTION_4K",
+}
+
+
+async def upsample_image(
+    image_bytes: bytes,
+    *,
+    project_id: str,
+    target: str = "4K",
+    paygate_tier: Optional[str] = None,
+    mime: str = "image/png",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> bytes:
+    """Upscale an image to 2K/4K via Flow's upsampleImage (the Download →
+    "2K/4K Upscaled" option). Uploads the bytes into the project, asks Flow to
+    upsample, and returns the upscaled JPEG bytes. Raises ``BridgeEditError``."""
+    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) == 0:
+        raise ValueError("image_bytes must be non-empty bytes")
+    if not is_valid_project_id(project_id):
+        raise ValueError(f"invalid project_id: {project_id!r}")
+    tier = paygate_tier or flow_client.paygate_tier
+    if tier is None:
+        raise BridgeEditError("paygate_tier_unknown", attempts=0)
+    target_resolution = _UPSAMPLE_RESOLUTIONS.get(str(target).upper(), str(target))
+
+    sdk = get_flow_sdk()
+    media_id = await _upload(
+        sdk, bytes(image_bytes), project_id=project_id, mime=mime, file_name="comic_upsample.png",
+    )
+
+    last_reason = "unknown"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = await sdk.upsample_image(
+                media_id=media_id, project_id=project_id,
+                paygate_tier=tier, target_resolution=target_resolution,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_reason = f"sdk_raised: {exc}"
+            logger.warning("upsample attempt %d/%d raised: %s", attempt, max_attempts, exc)
+            await _backoff(attempt, max_attempts)
+            continue
+        if not isinstance(resp, dict) or resp.get("error"):
+            last_reason = str(resp.get("error") if isinstance(resp, dict) else resp)[:200]
+            logger.warning("upsample attempt %d/%d error: %s", attempt, max_attempts, last_reason)
+            await _backoff(attempt, max_attempts)
+            continue
+        encoded = resp.get("encoded_image")
+        try:
+            out = base64.b64decode(encoded) if isinstance(encoded, str) else b""
+        except Exception:  # noqa: BLE001
+            out = b""
+        if not out:
+            last_reason = "decode_failed"
+            await _backoff(attempt, max_attempts)
+            continue
+        logger.info("upsample ok on attempt %d/%d: %d bytes (%s)", attempt, max_attempts, len(out), target_resolution)
+        return out
 
     raise BridgeEditError(last_reason, attempts=max_attempts)
 

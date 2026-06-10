@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -670,7 +671,7 @@ async def _handle_extract_panels(params: dict) -> tuple[dict, Optional[str]]:
     folder = folder.strip().strip("'\"").strip()
     debug = bool(params.get("debug"))
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto"):
         return {}, f"invalid_detector:{detector}"
 
     try:
@@ -815,7 +816,7 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     if not isinstance(pages_in, list) or not pages_in:
         return {}, "missing_pages"
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto"):
         return {}, f"invalid_detector:{detector}"
 
     def _run():
@@ -982,36 +983,48 @@ def _page_ref_bytes(params: dict) -> Optional[bytes]:
 
 async def _bridge_edit(
     raw: bytes, prompt: str, *, project_id: str, aspect: str, image_model: Optional[str],
-    references: Optional[list[bytes]], pad_916: bool, node_id,
+    references: Optional[list[bytes]], pad_916: bool, node_id, variant_count: int = 1,
 ) -> tuple[dict, Optional[str]]:
     """Run bridge.edit_image(raw + refs, prompt) → (optional 9:16 letterbox) →
-    cache → return media_id + dims."""
+    cache → return media_id + dims. With ``variant_count`` > 1, return every
+    candidate in ``mediaIds`` (the "x4" on Flow) — ``mediaId`` is the first."""
     from flowboard.services.comic import bridge, panels as panel_svc
     import uuid
 
+    n = max(1, min(int(variant_count or 1), 4))
     try:
-        out = await bridge.edit_image(
-            raw, prompt, reference_images=references,
-            project_id=project_id, aspect_ratio=aspect, image_model=image_model,
-        )
+        if n == 1:
+            outs = [await bridge.edit_image(
+                raw, prompt, reference_images=references,
+                project_id=project_id, aspect_ratio=aspect, image_model=image_model,
+            )]
+        else:
+            outs = await bridge.edit_image_variants(
+                raw, prompt, reference_images=references,
+                project_id=project_id, aspect_ratio=aspect, image_model=image_model,
+                variant_count=n,
+            )
     except bridge.BridgeEditError as exc:
         return {}, f"bridge_failed: {exc.reason}"[:200]
 
-    if pad_916:
-        try:
-            out = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
-        except Exception:  # noqa: BLE001
-            pass
-
-    media_id = str(uuid.uuid4())
-    media_service.ingest_inline_bytes(media_id, out, kind="image", mime="image/png")
+    media_ids: list[str] = []
     w = h = 0
-    try:
-        img = panel_svc.decode_bgr(out)
-        h, w = int(img.shape[0]), int(img.shape[1])
-    except Exception:  # noqa: BLE001
-        pass
-    return {"mediaId": media_id, "width": w, "height": h, "node_id": node_id}, None
+    for out in outs:
+        if pad_916:
+            try:
+                out = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
+            except Exception:  # noqa: BLE001
+                pass
+        mid = str(uuid.uuid4())
+        media_service.ingest_inline_bytes(mid, out, kind="image", mime="image/png")
+        media_ids.append(mid)
+        if w == 0:
+            try:
+                img = panel_svc.decode_bgr(out)
+                h, w = int(img.shape[0]), int(img.shape[1])
+            except Exception:  # noqa: BLE001
+                pass
+    return {"mediaId": media_ids[0], "mediaIds": media_ids, "width": w, "height": h, "node_id": node_id}, None
 
 
 async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
@@ -1050,6 +1063,7 @@ async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
     return await _bridge_edit(
         raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
         references=refs, pad_916=extend, node_id=params.get("__node_id"),
+        variant_count=params.get("variant_count") or 1,
     )
 
 
@@ -1099,6 +1113,21 @@ def _match_and_load_char_refs(panel_bytes: bytes, chars: list) -> list[bytes]:
     return refs
 
 
+def _panel_reference_bytes(
+    panel_bytes: bytes, panel_params: dict, chars: object, *, include_page: bool = True
+) -> list[bytes]:
+    """References for a comic panel edit: the full source page for environment
+    continuity plus matched Character DB crops for identity/costume continuity."""
+    refs: list[bytes] = []
+    if include_page:
+        page_ref = _page_ref_bytes(panel_params)
+        if page_ref:
+            refs.append(page_ref)
+    if isinstance(chars, list) and chars:
+        refs.extend(_match_and_load_char_refs(panel_bytes, chars))
+    return refs[:5]
+
+
 async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     from flowboard.services.comic import prompts
 
@@ -1108,15 +1137,8 @@ async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     raw = await asyncio.to_thread(_source_image_bytes, params)
     if raw is None:
         return {}, "no_source_image"
-    page_ref = await asyncio.to_thread(_page_ref_bytes, params)
-    refs: list[bytes] = []
-    if page_ref:
-        refs.append(page_ref)
     # Auto-match the panel's character → add its reference crops for consistency.
-    chars = params.get("characters")
-    if isinstance(chars, list) and chars:
-        refs.extend(await asyncio.to_thread(_match_and_load_char_refs, raw, chars))
-    refs = refs[:5]  # cap multi-image input
+    refs = await asyncio.to_thread(_panel_reference_bytes, raw, params, params.get("characters"))
 
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
@@ -1125,6 +1147,7 @@ async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     return await _bridge_edit(
         raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
         references=refs or None, pad_916=False, node_id=params.get("__node_id"),
+        variant_count=params.get("variant_count") or 1,
     )
 
 
@@ -1197,11 +1220,19 @@ async def _handle_build_character_db(params: dict) -> tuple[dict, Optional[str]]
 # that single "ground truth" image to the bridge with COMBINE_2X2_PROMPT → the
 # model removes text, keeps characters faithful, extends backgrounds to 9:16.
 
+# How many panel cleans run at once during a combine. Parallel Flow generations
+# are faster but a big burst can trip Google's anti-abuse
+# (PUBLIC_ERROR_UNUSUAL_ACTIVITY / reCAPTCHA), so default to a modest 2 and let
+# it be tuned (1 = fully sequential / safest).
+COMBINE_CONCURRENCY = max(1, int(os.getenv("FLOWBOARD_COMBINE_CONCURRENCY", "2")))
+
+
 async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     """Clean each of the up-to-4 panels INDIVIDUALLY via the bridge (remove
     text/bubbles + reconstruct art), then code-stitch the cleaned panels into a
     clean 2×2 grid. The model never does the layout — code does — so the grid is
-    exact (no re-selecting/rearranging/invented panels)."""
+    exact (no re-selecting/rearranging/invented panels). The four cleans run in
+    parallel (capped) so the Flow generations overlap instead of serialising."""
     from flowboard.services.comic import bridge, panels as panel_svc, prompts
 
     project_id = params.get("project_id")
@@ -1212,6 +1243,7 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "missing_panels"
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
+    chars = params.get("characters")
     pid = project_id.strip()
 
     raws = await asyncio.to_thread(
@@ -1220,26 +1252,43 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     if all(r is None for r in raws):
         return {}, "no_source_image"
 
-    # Clean + extend EVERY panel to the same 9:16 portrait so all four cells are
-    # uniformly filled (no white letterbox on the landscape panels).
-    cell_prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16
-    cleaned: list = []
-    for raw in raws:
+    # Clean + extend every panel to the same 9:16 portrait so all four cells are
+    # filled before code stitches the exact 2×2 layout. Run the cleans in
+    # parallel (capped) so the Flow generations overlap. Character refs remain
+    # opt-in and are used only for identity/costume consistency.
+    sem = asyncio.Semaphore(COMBINE_CONCURRENCY)
+
+    async def _clean_one(spec, raw) -> tuple[Optional["object"], Optional[str]]:
         if raw is None:
-            cleaned.append(None)
-            continue
-        try:
-            out = await bridge.edit_image(
-                raw, cell_prompt, project_id=pid,
-                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+            return None, None
+        refs = await asyncio.to_thread(
+            lambda: _panel_reference_bytes(
+                raw, spec if isinstance(spec, dict) else {}, chars, include_page=False
             )
-        except bridge.BridgeEditError as exc:
-            return {}, f"bridge_failed: {exc.reason}"[:200]
+        )
+        prompt = (
+            prompts.CLEAN_PROMPT
+            + prompts.EXTEND_9_16
+            + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
+        )
+        async with sem:
+            try:
+                out = await bridge.edit_image(
+                    raw, prompt, reference_images=refs or None, project_id=pid,
+                    aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                )
+            except bridge.BridgeEditError as exc:
+                return None, f"bridge_failed: {exc.reason}"[:200]
         try:
-            # guarantee exact 9:16 even if the model returned a slightly off size
-            cleaned.append(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
+            return panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16), None
         except Exception:  # noqa: BLE001
-            cleaned.append(None)
+            return None, None
+
+    results = await asyncio.gather(*[_clean_one(s, r) for s, r in zip(specs[:4], raws)])
+    err = next((e for _, e in results if e), None)
+    if err:
+        return {}, err
+    cleaned: list = [bgr for bgr, _ in results]
 
     if all(c is None for c in cleaned):
         return {}, "all_panels_failed"
@@ -1270,10 +1319,26 @@ def _ingest_pngs(pngs: list) -> list:
     return [None if p is None else _ingest_png(p) for p in pngs]
 
 
+def _stitch_cells(cells: list) -> tuple[bytes, int, int]:
+    """Code-stitch the 2×2 composite from up to 4 cell media ids (each already a
+    cleaned 9:16 cell). Missing/unreadable cells become blank slots."""
+    from flowboard.services.comic import panels as panel_svc
+    bgrs = []
+    for cid in cells[:4]:
+        path = media_service.cached_path(cid) if isinstance(cid, str) else None
+        try:
+            bgrs.append(panel_svc.decode_bgr(path.read_bytes()) if path else None)
+        except Exception:  # noqa: BLE001
+            bgrs.append(None)
+    comp = panel_svc.stitch_2x2(bgrs)
+    return panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+
+
 async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     """Re-clean ONE panel of a combine group and re-stitch the 2×2, reusing the
     other (already-cleaned) cells. Lets the user fix the one cell that came out
-    wrong without re-running all four."""
+    wrong without re-running all four. With ``variant_count`` > 1, returns
+    ``candidates`` for the cell instead of committing — the user picks one."""
     from flowboard.services.comic import bridge, panels as panel_svc, prompts
 
     project_id = params.get("project_id")
@@ -1290,33 +1355,145 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "bad_index"
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
+    chars = params.get("characters")
 
     raw = await asyncio.to_thread(_source_image_bytes, panel)
     if raw is None:
         return {}, "no_source_image"
+    refs = await asyncio.to_thread(
+        lambda: _panel_reference_bytes(raw, panel, chars, include_page=False)
+    )
+    # Optional custom prompt — lets the user steer a single re-gen (e.g. "make
+    # the lighting warmer") instead of the default clean+extend. Blank → default.
+    custom = params.get("prompt")
+    custom = custom.strip() if isinstance(custom, str) else ""
+    base = custom or (prompts.CLEAN_PROMPT + prompts.EXTEND_9_16)
+    prompt = base + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
+    n = max(1, min(int(params.get("variant_count") or 1), 4))
     try:
-        out = await bridge.edit_image(
-            raw, prompts.CLEAN_PROMPT + prompts.EXTEND_9_16, project_id=project_id.strip(),
-            aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
-        )
+        if n == 1:
+            outs = [await bridge.edit_image(
+                raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
+                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+            )]
+        else:
+            outs = await bridge.edit_image_variants(
+                raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
+                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                variant_count=n,
+            )
     except bridge.BridgeEditError as exc:
         return {}, f"bridge_failed: {exc.reason}"[:200]
 
+    def _pad_ingest(b: bytes) -> str:
+        return _ingest_png(panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(b), 9, 16)))
+
+    if n > 1:
+        # x4: return the candidates for this cell — the user picks one, then the
+        # frontend commits it via restitch_cells. Don't change the grid yet.
+        candidates = await asyncio.to_thread(lambda: [_pad_ingest(o) for o in outs])
+        return {"candidates": candidates, "index": index, "node_id": params.get("__node_id")}, None
+
     def _rebuild() -> tuple[list, bytes, int, int]:
         new_cells = list(cells)
-        new_cells[index] = _ingest_png(panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16)))
-        bgrs = []
-        for cid in new_cells[:4]:
-            path = media_service.cached_path(cid) if isinstance(cid, str) else None
-            try:
-                bgrs.append(panel_svc.decode_bgr(path.read_bytes()) if path else None)
-            except Exception:  # noqa: BLE001
-                bgrs.append(None)
-        comp = panel_svc.stitch_2x2(bgrs)
-        return new_cells, panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+        new_cells[index] = _pad_ingest(outs[0])
+        composite, w, h = _stitch_cells(new_cells)
+        return new_cells, composite, w, h
 
     new_cells, composite, w, h = await asyncio.to_thread(_rebuild)
     return {"mediaId": _ingest_png(composite), "cells": new_cells, "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_export_all_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Crop every detected/hand-adjusted panel box (already in reading order) and
+    bundle them as INDIVIDUAL PNG files into ONE downloadable ZIP — all panels
+    gathered in one archive, not stitched into a single image. Pure local (no
+    bridge call)."""
+    import io
+    import uuid
+    import zipfile
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+
+    def _run() -> Optional[tuple[bytes, int]]:
+        pngs: list[bytes] = []
+        for s in specs:
+            if not isinstance(s, dict):
+                continue
+            b = _source_image_bytes(s)  # already a PNG crop of the box region
+            if b:
+                pngs.append(b)
+        if not pngs:
+            return None
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, png in enumerate(pngs, 1):
+                zf.writestr(f"panel-{i:04d}.png", png)  # reading order = caller order
+        return buf.getvalue(), len(pngs)
+
+    res = await asyncio.to_thread(_run)
+    if res is None:
+        return {}, "no_panels"
+    zip_bytes, count = res
+    mid = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(mid, zip_bytes, kind="file", mime="application/zip")
+    return {"mediaId": mid, "count": count, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_restitch_cells(params: dict) -> tuple[dict, Optional[str]]:
+    """Re-stitch the 2×2 from given cell media ids — used after the user picks a
+    re-gen candidate for one cell. Pure local (no bridge call)."""
+    cells = params.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return {}, "missing_cells"
+
+    def _do() -> tuple[str, int, int]:
+        composite, w, h = _stitch_cells(cells)
+        return _ingest_png(composite), w, h
+
+    mid, w, h = await asyncio.to_thread(_do)
+    return {"mediaId": mid, "cells": cells[:4], "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_upsample_image(params: dict) -> tuple[dict, Optional[str]]:
+    """Upscale a cached image to 2K/4K via Flow (its Download → "Upscaled").
+    ``media_id`` is the local cache id of the image to upscale (any combine
+    cell, the 2×2, a panel, …)."""
+    from flowboard.services.comic import bridge, panels as panel_svc
+    import uuid
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    media_id = params.get("media_id")
+    if not isinstance(media_id, str) or not media_id:
+        return {}, "missing_media_id"
+    target = params.get("resolution") or params.get("target") or "4K"
+
+    path = media_service.cached_path(media_id)
+    if path is None:
+        return {}, "no_source_image"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return {}, "no_source_image"
+
+    try:
+        out = await bridge.upsample_image(raw, project_id=project_id.strip(), target=str(target))
+    except bridge.BridgeEditError as exc:
+        return {}, f"bridge_failed: {exc.reason}"[:200]
+
+    new_id = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(new_id, out, kind="image", mime="image/jpeg")
+    w = h = 0
+    try:
+        img = panel_svc.decode_bgr(out)
+        h, w = int(img.shape[0]), int(img.shape[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"mediaId": new_id, "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
 _DEFAULT_HANDLERS: dict[str, Handler] = {
@@ -1335,6 +1512,9 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "build_character_db": _handle_build_character_db,
     "combine_panels": _handle_combine_panels,
     "regen_cell": _handle_regen_cell,
+    "restitch_cells": _handle_restitch_cells,
+    "export_all_panels": _handle_export_all_panels,
+    "upsample_image": _handle_upsample_image,
 }
 
 

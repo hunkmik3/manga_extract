@@ -166,6 +166,151 @@ def detect_panels(
     return out
 
 
+# ── Webtoon panel detection (band split + colour-aware crop) ─────────────────
+# Tall vertical webtoons (Korean manhwa scrolls) don't have the gutter-grid
+# structure XY-cut needs: panels are full-bleed/borderless, separated by large
+# vertical whitespace, with B/W speech bubbles floating on that whitespace.
+# XY-cut over-segments them (fragments a panel on its internal white, and emits
+# each floating bubble as its own "panel"). Instead:
+#   1. split into horizontal reading BANDS on full-width background rows, then
+#   2. crop each band to its COLOURED art — so a bubble floating *beside* the
+#      panel (in its own white space) is excluded, while a bubble drawn *over*
+#      the art stays inside the art's bbox.
+# Bands with no art (pure narration) are dropped; a dense grayscale band (B/W
+# art) falls back to its full content extent so black-&-white pages still work.
+WEBTOON_ASPECT = 2.0          # H/W ≥ this ⇒ treat as a webtoon (else XY-cut)
+WEBTOON_BG_FRAC = 0.99        # a row/col is "background" if this fraction is flat
+WEBTOON_MIN_BAND_FRAC = 0.02  # drop bands shorter than this fraction of height
+WEBTOON_MERGE_GAP_FRAC = 0.02 # bridge gaps smaller than this (keep a panel whole)
+WEBTOON_SAT_THR = 35          # HSV saturation above which a pixel counts as "art"
+WEBTOON_MIN_COLOR_FRAC = 0.003  # colour ≥ this fraction of page ⇒ use the colour crop
+WEBTOON_MIN_INK_FRAC = 0.04   # B/W fallback: keep band only if this dense (else text)
+WEBTOON_PAD = 6               # px margin kept around the cropped art
+
+
+def detect_panels_webtoon(
+    bgr: np.ndarray,
+    sat_thr: int = WEBTOON_SAT_THR,
+    white_thr: int = GUTTER_WHITE,
+    black_thr: int = GUTTER_BLACK,
+    bg_frac: float = WEBTOON_BG_FRAC,
+    min_band_frac: float = WEBTOON_MIN_BAND_FRAC,
+    merge_gap_frac: float = WEBTOON_MERGE_GAP_FRAC,
+    min_color_frac: float = WEBTOON_MIN_COLOR_FRAC,
+    min_ink_frac: float = WEBTOON_MIN_INK_FRAC,
+    pad: int = WEBTOON_PAD,
+    crop: str = "color",
+) -> list[Box]:
+    """Return [(x, y, w, h)] art-panel boxes for a tall webtoon page (BGR in).
+
+    One box per horizontal reading band. Two crop modes:
+
+      * ``crop="color"`` (default) — crop to the band's COLOURED art, so a B/W
+        bubble floating beside a panel is excluded (a bubble over the art stays
+        in its bbox). Grayscale-art bands fall back to full content extent;
+        pure-text bands dropped.
+      * ``crop="content"`` — crop to ALL non-background content (incl. pale/B-W:
+        bright sky, clouds, on-panel bubbles, low-saturation subjects). Captures
+        a whole scene without the colour crop pulling the box in off a light
+        region. Used for hybrid BACKFILL, where side-by-side panels are already
+        separated by the ML detector so over-capturing a bubble doesn't matter.
+
+    Accepts a gray array too."""
+    if bgr.ndim == 2:  # tolerate a gray array
+        bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+    H, W = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    row_bg = ((gray >= white_thr).mean(axis=1) >= bg_frac) | (
+        (gray <= black_thr).mean(axis=1) >= bg_frac
+    )
+    bands = merge_close(
+        content_runs(row_bg, int(min_band_frac * H)), max(1, int(merge_gap_frac * H))
+    )
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    colored = (((hsv[:, :, 1] > sat_thr) & (hsv[:, :, 2] > 30)).astype(np.uint8)) * 255
+    # de-speckle so a few stray colour pixels can't inflate the crop
+    colored = cv2.morphologyEx(
+        colored, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    )
+    not_bg = (gray < white_thr) & (gray > black_thr)
+    out: list[Box] = []
+    for y0, y1 in bands:
+        cb = colored[y0:y1 + 1, :] > 0
+        ink = not_bg[y0:y1 + 1, :]
+        if crop == "content":
+            # full content extent — keep the WHOLE scene (incl. light sky / B-W /
+            # on-panel bubbles); drop only genuinely sparse (pure-text) bands.
+            if ink.sum() < min_ink_frac * (y1 - y0 + 1) * W and cb.sum() < min_color_frac * H * W:
+                continue
+            rows = np.where(ink.any(axis=1))[0]
+            cols = np.where(ink.any(axis=0))[0]
+            if len(rows) == 0 or len(cols) == 0:
+                continue
+            x0, x1 = int(cols[0]), int(cols[-1])
+            yy0, yy1 = y0 + int(rows[0]), y0 + int(rows[-1])
+        elif cb.sum() >= min_color_frac * H * W:
+            ys, xs = np.where(cb)                       # colour crop (drops side bubbles)
+            x0, x1 = int(xs.min()), int(xs.max())
+            yy0, yy1 = y0 + int(ys.min()), y0 + int(ys.max())
+        else:                                           # no colour → B/W band
+            if ink.sum() < min_ink_frac * (y1 - y0 + 1) * W:
+                continue                                # sparse ⇒ pure text, drop
+            cols = np.where(ink.any(axis=0))[0]         # dense B/W art ⇒ content extent
+            if len(cols) == 0:
+                continue
+            x0, x1, yy0, yy1 = int(cols[0]), int(cols[-1]), y0, y1
+        bx, by = max(0, x0 - pad), max(0, yy0 - pad)
+        out.append((bx, by, min(W, x1 + pad) - bx, min(H, yy1 + pad) - by))
+    out.sort(key=lambda b: (round(b[1] / (0.08 * H)), b[0]))
+    return out
+
+
+def _box_overlap_frac(box: Box, others: list[Box]) -> float:
+    """Fraction of ``box``'s area covered by ``others`` (approx — sums pairwise
+    intersections, fine because panel boxes barely overlap each other)."""
+    bx, by, bw, bh = box
+    area = max(1, bw * bh)
+    inter = 0
+    for ox, oy, ow, oh in others:
+        ix = max(0, min(bx + bw, ox + ow) - max(bx, ox))
+        iy = max(0, min(by + bh, oy + oh) - max(by, oy))
+        inter += ix * iy
+    return inter / area
+
+
+def detect_panels_hybrid(bgr: np.ndarray, cover_thr: float = 0.5) -> list[Box]:
+    """Best-of-both webtoon detection (ML primary + heuristic backfill).
+
+    The ML 'frame' detector captures each panel's TRUE extent — full art
+    including on-panel bubbles and low-saturation subjects (pale figures, B/W,
+    checkered clothing), and correctly tight side-by-side close-ups — but it
+    MISSES some borderless colour panels. The band heuristic never misses a band
+    but crops to coloured pixels (losing bubbles / pale subjects).
+
+    So: take the ML boxes as the primary set, then BACKFILL any heuristic band
+    that ML left uncovered (< ``cover_thr`` of its area overlapped). Falls back to
+    the pure heuristic when the ML backend is unavailable.
+    """
+    from flowboard.services.comic import panel_ml
+
+    try:
+        ml = panel_ml.detect_panels_ml(bgr)
+    except panel_ml.MLUnavailable:
+        return detect_panels_webtoon(bgr, crop="content")
+    # crop="content": a panel ML misses is backfilled at its FULL scene extent
+    # (incl. light sky / on-panel bubbles), not the colour-cropped subregion.
+    wt = detect_panels_webtoon(bgr, crop="content")
+    if not ml:
+        return wt
+    result = list(ml)
+    for hb in wt:
+        if _box_overlap_frac(hb, ml) < cover_thr:  # a panel ML didn't cover → keep it
+            result.append(hb)
+    H = bgr.shape[0]
+    result.sort(key=lambda b: (round(b[1] / (0.08 * H)), b[0]))
+    return result
+
+
 # ── Folder / page helpers ────────────────────────────────────────────────────
 
 def iter_page_paths(folder: str | Path) -> list[Path]:
@@ -289,23 +434,40 @@ class PageResult:
 def detect_boxes(bgr: np.ndarray, detector: str = "heuristic") -> list[Box]:
     """Detect panel boxes on a BGR page with the chosen backend:
 
-      * ``"heuristic"`` — pure-OpenCV XY-cut (default; no heavy deps).
+      * ``"heuristic"`` — pure-OpenCV XY-cut (default; no heavy deps). Best for
+                          gutter-separated grid manga.
+      * ``"webtoon"``   — full-width band segmentation for tall vertical scrolls
+                          (manhwa/webtoon): borderless panels on whitespace.
+      * ``"hybrid"``    — webtoon ML frame detector + band-heuristic backfill
+                          (best panel extents, nothing missed). Falls back to the
+                          heuristic if the ML backend is unavailable.
       * ``"ml"``        — YOLO frame detector (raises if the optional ML deps
                           aren't installed).
-      * ``"auto"``      — run both and keep whichever finds more panels; falls
-                          back to heuristic if the ML backend is unavailable.
-                          Best aggregate quality (rescues dense/borderless pages
-                          the heuristic collapses to one panel).
+      * ``"auto"``      — pick by page shape: a tall page (H/W ≥ WEBTOON_ASPECT)
+                          uses the hybrid detector; otherwise run heuristic
+                          + YOLO and keep whichever finds more (falling back to
+                          heuristic if the ML backend is unavailable).
     """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    H, W = gray.shape
     if detector == "heuristic":
         return detect_panels(gray)
+    if detector == "webtoon":
+        return detect_panels_webtoon(bgr)
+    if detector == "hybrid":
+        return detect_panels_hybrid(bgr)
 
     from flowboard.services.comic import panel_ml
 
     if detector == "ml":
         return panel_ml.detect_panels_ml(bgr)
     if detector == "auto":
+        # Tall vertical webtoons: XY-cut/YOLO over-segment them. The hybrid
+        # detector keeps each panel whole (ML extents + heuristic backfill).
+        if H / max(1, W) >= WEBTOON_ASPECT:
+            hy = detect_panels_hybrid(bgr)
+            if hy:
+                return hy
         heur = detect_panels(gray)
         try:
             ml = panel_ml.detect_panels_ml(bgr)
