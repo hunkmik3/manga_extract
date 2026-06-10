@@ -67,6 +67,7 @@ export function ComicDetectBody({ rfId, data }: { rfId: string; data: FlowboardN
             <option value="heuristic">Heuristic</option>
             <option value="ml">YOLO (ML)</option>
             <option value="webtoon">Webtoon</option>
+            <option value="hybrid">Hybrid (ML+webtoon)</option>
             <option value="auto">Auto (best)</option>
           </select>
         </label>

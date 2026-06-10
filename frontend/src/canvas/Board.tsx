@@ -443,6 +443,16 @@ export function Board() {
         // pixel-perfect on the handle to complete an edge.
         connectionRadius={32}
         fitView
+        // Figma/Miro scroll model: the mouse wheel SCROLLS (pans) the canvas
+        // up/down; hold Ctrl (Win) / Cmd (Mac) — or pinch on a trackpad — to
+        // zoom toward the cursor. Wide range (5%–800%) for an "infinite" feel;
+        // panning is already unbounded (no translateExtent).
+        minZoom={0.05}
+        maxZoom={8}
+        panOnScroll
+        zoomOnScroll={false}
+        zoomOnPinch
+        zoomActivationKeyCode={["Meta", "Control"]}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={24} size={1} color="#2a2e38" />

@@ -226,3 +226,17 @@ async def test_handle_extract_panels_missing_folder():
 async def test_handle_extract_panels_bad_dir():
     result, err = await _handle_extract_panels({"folder": "/no/such/dir/zzz"})
     assert err and "not a directory" in err.lower()
+
+
+def test_detect_panels_webtoon_content_crop_keeps_light_region():
+    """crop='content' reaches a light/low-saturation region (e.g. bright sky) that
+    the colour crop pulls the box top past — so a whole scene stays in one box."""
+    import numpy as np
+    page = np.full((2400, 1000, 3), 255, np.uint8)     # white page
+    page[400:900] = (200, 200, 205)                    # pale "sky": not_bg but unsaturated
+    page[900:1600, 200:800] = (40, 90, 200)            # saturated colour block below
+    color = panel_svc.detect_panels_webtoon(page, crop="color")
+    content = panel_svc.detect_panels_webtoon(page, crop="content")
+    assert color and content
+    assert content[0][1] < color[0][1]                 # content box top reaches the sky
+

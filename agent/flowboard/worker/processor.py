@@ -671,7 +671,7 @@ async def _handle_extract_panels(params: dict) -> tuple[dict, Optional[str]]:
     folder = folder.strip().strip("'\"").strip()
     debug = bool(params.get("debug"))
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "webtoon", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto"):
         return {}, f"invalid_detector:{detector}"
 
     try:
@@ -816,7 +816,7 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     if not isinstance(pages_in, list) or not pages_in:
         return {}, "missing_pages"
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "webtoon", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto"):
         return {}, f"invalid_detector:{detector}"
 
     def _run():
@@ -1404,6 +1404,44 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     return {"mediaId": _ingest_png(composite), "cells": new_cells, "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
+async def _handle_export_all_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Crop every detected/hand-adjusted panel box (already in reading order) and
+    bundle them as INDIVIDUAL PNG files into ONE downloadable ZIP — all panels
+    gathered in one archive, not stitched into a single image. Pure local (no
+    bridge call)."""
+    import io
+    import uuid
+    import zipfile
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+
+    def _run() -> Optional[tuple[bytes, int]]:
+        pngs: list[bytes] = []
+        for s in specs:
+            if not isinstance(s, dict):
+                continue
+            b = _source_image_bytes(s)  # already a PNG crop of the box region
+            if b:
+                pngs.append(b)
+        if not pngs:
+            return None
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, png in enumerate(pngs, 1):
+                zf.writestr(f"panel-{i:04d}.png", png)  # reading order = caller order
+        return buf.getvalue(), len(pngs)
+
+    res = await asyncio.to_thread(_run)
+    if res is None:
+        return {}, "no_panels"
+    zip_bytes, count = res
+    mid = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(mid, zip_bytes, kind="file", mime="application/zip")
+    return {"mediaId": mid, "count": count, "node_id": params.get("__node_id")}, None
+
+
 async def _handle_restitch_cells(params: dict) -> tuple[dict, Optional[str]]:
     """Re-stitch the 2×2 from given cell media ids — used after the user picks a
     re-gen candidate for one cell. Pure local (no bridge call)."""
@@ -1475,6 +1513,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "combine_panels": _handle_combine_panels,
     "regen_cell": _handle_regen_cell,
     "restitch_cells": _handle_restitch_cells,
+    "export_all_panels": _handle_export_all_panels,
     "upsample_image": _handle_upsample_image,
 }
 

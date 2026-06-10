@@ -98,6 +98,7 @@ export function ComicPageBody({ rfId, data }: { rfId: string; data: FlowboardNod
           <option value="heuristic">Heuristic</option>
           <option value="ml">YOLO</option>
           <option value="webtoon">Webtoon</option>
+          <option value="hybrid">Hybrid (ML+webtoon)</option>
           <option value="auto">Auto</option>
         </select>
         <button className="comic-btn comic-btn--sm" onClick={redetect} disabled={busy} style={{ fontSize: 11, padding: "3px 8px" }}>

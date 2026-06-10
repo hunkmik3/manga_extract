@@ -13,6 +13,7 @@ from flowboard.worker.processor import (
     _handle_combine_panels,
     _handle_regen_cell,
     _handle_restitch_cells,
+    _handle_export_all_panels,
 )
 
 
@@ -222,3 +223,30 @@ async def test_combine_panels_errors():
     assert (await _handle_combine_panels({"panels": [{}]}))[1] == "missing_project_id"
     assert (await _handle_combine_panels({"project_id": "p"}))[1] == "missing_panels"
     assert (await _handle_combine_panels({"project_id": "p", "panels": [{"page_media_id": "ghost", "box": {"x": 0, "y": 0, "w": 9, "h": 9}}]}))[1] == "no_source_image"
+
+
+@pytest.mark.asyncio
+async def test_export_all_panels_bundles_individual_pngs_in_zip():
+    import zipfile
+    page = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(page, _png(800, 1200), kind="image", mime="image/png")
+    panels = [
+        {"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 300}},
+        {"page_media_id": page, "box": {"x": 0, "y": 300, "w": 600, "h": 200}},
+    ]
+    result, err = await _handle_export_all_panels({"panels": panels})
+    assert err is None
+    assert result["count"] == 2
+    path = media_service.cached_path(result["mediaId"])
+    assert path is not None and path.suffix == ".zip"
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        assert names == ["panel-0001.png", "panel-0002.png"]   # individual files, in order
+        assert zf.read(names[0])[:8] == b"\x89PNG\r\n\x1a\n"    # each entry is a real PNG
+
+
+@pytest.mark.asyncio
+async def test_export_all_panels_errors():
+    assert (await _handle_export_all_panels({}))[1] == "missing_panels"
+    bad = {"panels": [{"page_media_id": "ghost", "box": {"x": 0, "y": 0, "w": 9, "h": 9}}]}
+    assert (await _handle_export_all_panels(bad))[1] == "no_panels"

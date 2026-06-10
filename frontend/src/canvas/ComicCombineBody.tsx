@@ -398,12 +398,13 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                     </div>
                   )}
                   {cand && (
-                    <div className="comic-cell-regen" style={{ gap: 3, padding: 3, display: "grid", gridTemplateColumns: "1fr 1fr", alignContent: "center", overflow: "auto" }}>
+                    <div className="comic-cell-regen nodrag nopan" style={{ gap: 3, padding: 3, display: "grid", gridTemplateColumns: "1fr 1fr", alignContent: "center", overflow: "auto" }}>
                       <span style={{ gridColumn: "1 / -1", textAlign: "center" }}>pick one:</span>
                       {cand.map((cid, k) =>
                         cid ? (
                           <img
                             key={k}
+                            className="nodrag"
                             src={mediaUrl(cid)}
                             alt={`candidate ${k + 1}`}
                             loading="lazy"
@@ -488,6 +489,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                         return (
                           <img
                             key={k}
+                            className="nodrag"
                             src={mediaUrl(cid)}
                             alt={`cell ${i + 1} v${k + 1}`}
                             loading="lazy"
