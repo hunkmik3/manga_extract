@@ -5,6 +5,7 @@ import { createNodesBulk, mediaUrl, uploadComicPages, type BulkNodeInput } from 
 import {
   createRequest,
   downstreamPageNodes,
+  findCharacterDb,
   nodePosition,
   patchComicNode,
   relayoutComicChains,
@@ -41,8 +42,9 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
   const isImporting = status === "queued" || status === "running";
 
   const [draftFolder, setDraftFolder] = useState(folder);
-  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download">(null);
+  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download" | "assign">(null);
   const [spawnErr, setSpawnErr] = useState<string | undefined>();
+  const [assignInfo, setAssignInfo] = useState<string | undefined>();
   const dirInputRef = useRef<HTMLInputElement | null>(null);
   const rf = useReactFlow();
 
@@ -189,6 +191,64 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
     }
   }
 
+  // 🪄 Director (chapter-wide WHO): run magiv2 locally over every page with the
+  // Character DB as a named bank, then write the per-panel character
+  // assignments into every combine node's per-cell settings. No Flow calls.
+  async function magiAssignChapter() {
+    if (busy) return;
+    const characterRefs = findCharacterDb();
+    if (!characterRefs?.length) { setSpawnErr("Define characters first (Character DB node)"); return; }
+    const pageNodes = downstreamPageNodes(rfId);
+    if (pageNodes.length === 0) { setSpawnErr("Create page nodes first"); return; }
+    setSpawnErr(undefined);
+    setAssignInfo(undefined);
+    setBusy("assign");
+    try {
+      const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
+      const pagesParam = sorted
+        .map((pn) => ({
+          media_id: pn.data.pageMediaId as string,
+          boxes: ((pn.data.boxes as BoxItem[]) ?? []).map((b) => ({ id: b.id, x: b.x, y: b.y, w: b.w, h: b.h })),
+        }))
+        .filter((p) => typeof p.media_id === "string" && p.media_id && p.boxes.length > 0);
+      if (pagesParam.length === 0) { setSpawnErr("No detected panels — run detection first"); setBusy(null); return; }
+      const cast = characterRefs.map((c) => ({ id: c.id, name: c.name, refMediaIds: c.refMediaIds, sampleMediaId: c.sampleMediaId }));
+      const result = await runRequestToResult(
+        createRequest({ type: "magi_assign_panels", node_id: parseInt(rfId, 10), params: { pages: pagesParam, characters: cast } }),
+      );
+      const assignments = (result.assignments as Record<string, Record<string, string>>) ?? {};
+      // Route the assignments into every combine node's per-cell settings
+      // (matched by the cell's page + box identity). Existing manual choices
+      // for other fields (🔒/outfit) are preserved.
+      const store = useBoardStore.getState();
+      let applied = 0;
+      for (const n of store.nodes) {
+        if (n.data.type !== "comic_combine") continue;
+        const panels = Array.isArray(n.data.panels) ? (n.data.panels as Array<Record<string, unknown>>) : [];
+        const cur = ((n.data.cellAssign as Record<string, Record<string, unknown>>) ?? {});
+        const merged = { ...cur };
+        let changed = false;
+        panels.slice(0, 4).forEach((p, i) => {
+          const pageId = p.pageMediaId as string | undefined;
+          const boxId = p.boxId as string | undefined;
+          const cid = pageId && boxId ? assignments[pageId]?.[boxId] : undefined;
+          if (cid) {
+            merged[String(i)] = { ...(merged[String(i)] ?? {}), charId: cid };
+            changed = true;
+            applied++;
+          }
+        });
+        if (changed) patchComicNode(n.id, { cellAssign: merged });
+      }
+      const total = Number(result.panels_assigned ?? 0);
+      setAssignInfo(`Magi assigned ${total} panel(s) · routed into ${applied} combine cell(s)`);
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   // ③ flatten panels in reading order → groups of 4 → one Combine (2×2) node each
   async function spawnCombine() {
     if (busy) return;
@@ -322,9 +382,19 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
           <button className="comic-btn" onClick={downloadAllPanels} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Crop every panel (detected + hand-adjusted) into separate files, bundled into ONE .zip">
             {busy === "download" ? "Exporting…" : "⬇ Download all panels (.zip)"}
           </button>
+          <button
+            className="comic-btn"
+            onClick={magiAssignChapter}
+            disabled={busy !== null}
+            style={{ fontSize: 12, padding: "4px 10px" }}
+            title="Director (local Magi v2): read the whole chapter with the Character DB as a named bank and auto-assign each panel's character into every combine cell. No Flow calls. First run loads the model (~30s), then ~2-3s per page."
+          >
+            {busy === "assign" ? "Assigning… (local model)" : "🪄 Auto-assign characters (chapter)"}
+          </button>
         </>
       )}
 
+      {assignInfo && <p className="brief-hint" style={{ color: "#22c55e", fontSize: 11 }}>✓ {assignInfo}</p>}
       {spawnErr && <p className="brief-hint" style={{ color: "#ef4444", fontSize: 11 }}>⚠ {spawnErr}</p>}
       {status === "error" && typeof data.error === "string" && (
         <p className="brief-hint" style={{ color: "#ef4444", fontSize: 11 }}>⚠ {data.error}</p>

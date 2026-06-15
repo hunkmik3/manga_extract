@@ -129,13 +129,44 @@ class FlowClient:
 
     def remove_connection(self, cid: str) -> None:
         """Drop a connection. If it was the active one, fail its in-flight
-        requests and promote any remaining connection (else go disconnected).
-        A non-active connection closing leaves the active bridge untouched."""
+        requests and promote the best remaining connection (else go
+        disconnected). A non-active connection closing leaves the active
+        bridge untouched."""
         if self._conns.pop(cid, None) is None:
             return
         if cid == self._active:
             self._fail_pending()
-            self._activate(next(iter(self._conns), None))
+            self._activate(self._best_remaining())
+
+    def _best_remaining(self) -> Optional[str]:
+        """Prefer a connection that actually holds the Flow key — the extension
+        opens one WS per browser context (service worker, popup, tabs) and only
+        the context riding the signed-in Flow tab carries the session."""
+        keyed = next((cid for cid, c in self._conns.items() if c.flow_key_present), None)
+        return keyed or next(iter(self._conns), None)
+
+    def _maybe_promote(self, conn_id: Optional[str]) -> None:
+        """Auto-fail-over: if the ACTIVE connection has no Flow key but
+        ``conn_id`` just proved it has one, route through ``conn_id`` instead.
+
+        Without this, the first (often keyless — e.g. the extension's service
+        worker) connection gets pinned as active forever: the real session's
+        token then arrives on ANOTHER connection and is ignored, leaving the
+        bridge stuck on 401 with "token: none" until a manual restart. Never
+        steals from an active connection that already has a key, so a second
+        signed-in profile still can't hijack the bridge mid-use."""
+        if conn_id is None or conn_id == self._active:
+            return
+        cand = self._conns.get(conn_id)
+        if cand is None or not cand.flow_key_present:
+            return
+        cur = self._conns.get(self._active) if self._active else None
+        if cur is None or not cur.flow_key_present:
+            logger.info(
+                "promoting %s to active (previous active %s has no flow key)",
+                conn_id, self._active,
+            )
+            self._activate(conn_id)
 
     def set_active(self, cid: str) -> bool:
         """Make ``cid`` the connection all requests route through."""
@@ -325,6 +356,7 @@ class FlowClient:
             if mirror:
                 self._flow_key_present = present
             logger.info("extension_ready flowKeyPresent=%s (%s)", present, conn_id or "active")
+            self._maybe_promote(conn_id)
             return
 
         if t == "token_captured":
@@ -355,6 +387,7 @@ class FlowClient:
                     # Resolve this connection's tier in the background so the
                     # account picker shows a real tier within an HTTP RTT.
                     asyncio.create_task(self._fetch_tier_for(conn))
+            self._maybe_promote(conn_id)
             return
 
         if t == "user_info":

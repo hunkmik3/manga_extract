@@ -17,7 +17,7 @@ import {
 } from "@xyflow/react";
 
 import { useBoardStore, type FlowNode, type NodeType } from "../store/board";
-import { COMIC_TYPES, relayoutComicChains, relayoutComicCombineChains } from "./comicShared";
+import { COMIC_TYPES, patchComicNode, relayoutComicChains, relayoutComicCombineChains, type BoxItem } from "./comicShared";
 import { NodeCard } from "./NodeCard";
 import { VariantEdge } from "./VariantEdge";
 import { useGenerationStore } from "../store/generation";
@@ -206,6 +206,20 @@ export function Board() {
           }
         }
       }
+      // Deleting a panel node directly should also drop its detect box from the
+      // parent page (so the box disappears AND the panel isn't re-created on the
+      // next sync). Skip panels removed via a page cascade — that page is gone.
+      const boxRemovals = new Map<string, Set<string>>(); // pageRfId → boxIds
+      for (const id of removedIds) {
+        const n = snapshot.nodes.find((nn) => nn.id === id);
+        if (!n || n.data.type !== "comic_panel") continue;
+        const pageRfId = typeof n.data.pageNodeId === "string" ? n.data.pageNodeId : undefined;
+        const boxId = typeof n.data.boxId === "string" ? n.data.boxId : undefined;
+        if (!pageRfId || !boxId || removedIds.includes(pageRfId)) continue;
+        if (!boxRemovals.has(pageRfId)) boxRemovals.set(pageRfId, new Set());
+        boxRemovals.get(pageRfId)!.add(boxId);
+      }
+
       if (removedIds.length > 0) {
         // Snapshot for Ctrl+Z BEFORE deleting (state still has the nodes), as a
         // single undo entry covering the whole removal (incl. cascade).
@@ -218,6 +232,14 @@ export function Board() {
         cascade.forEach((id) => void deleteNodeByRfId(id));
       }
       setNodes(next);
+
+      // Drop the deleted panels' boxes from their page (store + backend).
+      for (const [pageRfId, boxIds] of boxRemovals) {
+        const page = useBoardStore.getState().nodes.find((nn) => nn.id === pageRfId);
+        const curBoxes = (Array.isArray(page?.data.boxes) ? page!.data.boxes : []) as BoxItem[];
+        const nextBoxes = curBoxes.filter((b) => !boxIds.has(b.id));
+        if (nextBoxes.length !== curBoxes.length) patchComicNode(pageRfId, { boxes: nextBoxes });
+      }
       // Deleting a comic node leaves a gap — re-pack the chain so the nodes
       // below "run up" to fill it.
       if (comicRemoved) {

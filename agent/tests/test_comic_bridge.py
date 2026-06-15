@@ -240,3 +240,118 @@ async def test_upsample_image_raises_on_flow_error():
     with patch.object(bridge, "get_flow_sdk", return_value=sdk):
         with pytest.raises(BridgeEditError):
             await bridge.upsample_image(b"x", project_id=PROJECT_ID, target="2K", paygate_tier="PAYGATE_TIER_ONE")
+
+
+@pytest.mark.asyncio
+async def test_quota_error_fails_fast_without_retries():
+    """Daily-quota / anti-abuse / content-filter errors can never succeed on
+    retry — the bridge must surface them after ONE attempt instead of burning
+    the remaining attempts (extra doomed calls make the account look MORE
+    bot-like)."""
+    for err in (
+        "PUBLIC_ERROR_PER_MODEL_DAILY_QUOTA_REACHED",
+        "PUBLIC_ERROR_UNUSUAL_ACTIVITY",
+        "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED",
+    ):
+        sdk = _fake_sdk(edit_return={"error": err})
+        with patch.object(bridge, "get_flow_sdk", return_value=sdk), \
+             patch.object(bridge.media_service, "ingest_urls", MagicMock()), \
+             patch.object(bridge.media_service, "fetch_and_cache", AsyncMock()):
+            with pytest.raises(BridgeEditError) as ei:
+                await edit_image(b"src" + err.encode(), "p", project_id=PROJECT_ID,
+                                 paygate_tier="PAYGATE_TIER_ONE", max_attempts=3)
+        assert err in ei.value.reason
+        assert ei.value.attempts == 1          # failed fast
+        assert sdk.edit_image.await_count == 1  # no doomed retries
+
+
+@pytest.mark.asyncio
+async def test_transient_error_still_retries():
+    """Sanity: the fail-fast classifier must NOT catch ordinary transient
+    errors — those keep the existing retry behaviour."""
+    responses = [{"error": "extension_disconnected"}, _ok_edit_response()]
+    sdk = _fake_sdk(edit_side_effect=responses)
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk), \
+         patch.object(bridge.media_service, "ingest_urls", MagicMock()), \
+         patch.object(bridge.media_service, "fetch_and_cache",
+                      AsyncMock(return_value=(b"OK", "image/png", "/tmp/x.png"))):
+        out = await edit_image(b"src-transient", "p", project_id=PROJECT_ID,
+                               paygate_tier="PAYGATE_TIER_ONE", max_attempts=3)
+    assert out == b"OK"
+    assert sdk.edit_image.await_count == 2
+
+
+def _gemini_ok_response(png=b"\x89PNG-fake"):
+    import base64
+    return {"candidates": [{"content": {"parts": [
+        {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(png).decode()}}
+    ]}}]}
+
+
+def _fake_httpx_client(post_side_effects):
+    """An AsyncClient stand-in whose .post returns the queued responses."""
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.post = AsyncMock(side_effect=post_side_effects)
+    return client
+
+
+def _resp(status, payload):
+    r = MagicMock()
+    r.status_code = status
+    r.json = MagicMock(return_value=payload)
+    return r
+
+
+@pytest.mark.asyncio
+async def test_gemini_model_routes_to_api_engine(monkeypatch):
+    """image_model='gemini-…' must bypass the Flow SDK entirely (no extension,
+    no tier check) and return the API result."""
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaTest")
+    client = _fake_httpx_client([_resp(200, _gemini_ok_response(b"APIIMG"))])
+    sdk = _fake_sdk(edit_return=_ok_edit_response())
+    with patch.object(bridge, "get_flow_sdk", return_value=sdk), \
+         patch("flowboard.services.comic.gemini_api.httpx.AsyncClient", return_value=client):
+        out = await edit_image(b"src-api", "make it anime", project_id=PROJECT_ID,
+                               image_model="gemini-3-pro-image")  # NOTE: no paygate_tier
+    assert out == b"APIIMG"
+    sdk.edit_image.assert_not_awaited()      # Flow never touched
+    sdk.upload_image.assert_not_awaited()
+    # request body carried source + prompt and the model in the URL
+    args, kwargs = client.post.await_args
+    assert "gemini-3-pro-image:generateContent" in args[0]
+    assert kwargs["json"]["contents"][0]["parts"][-1]["text"] == "make it anime"
+
+
+@pytest.mark.asyncio
+async def test_gemini_api_quota_fails_fast_and_503_retries(monkeypatch):
+    from flowboard.services.comic import gemini_api
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaTest")
+    # 429 → fatal, one call only
+    client = _fake_httpx_client([_resp(429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "quota"}})])
+    with patch("flowboard.services.comic.gemini_api.httpx.AsyncClient", return_value=client), \
+         patch("flowboard.services.comic.gemini_api.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(BridgeEditError) as ei:
+            await gemini_api.edit_image_variants(b"s", "p", image_model="gemini-3-pro-image")
+    assert "RESOURCE_EXHAUSTED" in ei.value.reason
+    assert client.post.await_count == 1
+    # 503 → retried, then succeeds
+    client2 = _fake_httpx_client([
+        _resp(503, {"error": {"status": "UNAVAILABLE", "message": "high demand"}}),
+        _resp(200, _gemini_ok_response(b"OK2")),
+    ])
+    with patch("flowboard.services.comic.gemini_api.httpx.AsyncClient", return_value=client2), \
+         patch("flowboard.services.comic.gemini_api.asyncio.sleep", new=AsyncMock()):
+        outs = await gemini_api.edit_image_variants(b"s", "p", image_model="gemini-3-pro-image")
+    assert outs == [b"OK2"]
+    assert client2.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_gemini_api_missing_key_errors(monkeypatch):
+    from flowboard.services.comic import gemini_api
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(BridgeEditError) as ei:
+        await gemini_api.edit_image_variants(b"s", "p", image_model="gemini-3-pro-image")
+    assert "GEMINI_API_KEY" in ei.value.reason

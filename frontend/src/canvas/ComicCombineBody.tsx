@@ -2,9 +2,11 @@ import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { ensureBoardProject, mediaUrl } from "../api/client";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
 import {
+  addCharacter,
   createRequest,
   findCharacterDb,
   patchComicNode,
+  promoteCellToCharacter,
   relayoutComicCombineChains,
   runComicRequest,
   runRequestToResult,
@@ -17,6 +19,30 @@ interface PanelSpec {
   h: number;
   pageName?: string;
   panelIndex?: number;
+}
+
+/** Per-cell character assignment: which canon character drives this cell's refs
+ * (char_id), an optional outfit label, which axes the canon ref should OVERRIDE
+ * the (off-model) source on, plus the Director's camera tags (shot scale +
+ * facing orientation — drive view selection and override safety). Keyed by cell
+ * index in node.data.cellAssign. */
+interface CellAssign {
+  charId?: string;
+  outfit?: string;
+  override?: string[];
+  shot?: string;        // closeup | medium | wide
+  orientation?: string; // front | profile | back
+}
+
+/** Build a combine/regen panel spec, merging the per-cell character assignment. */
+function buildCellSpec(p: PanelSpec, a: CellAssign | undefined): Record<string, unknown> {
+  const s: Record<string, unknown> = { page_media_id: p.pageMediaId, box: p.box };
+  if (a?.charId) s.char_id = a.charId;
+  if (a?.outfit && a.outfit.trim()) s.outfit = a.outfit.trim();
+  if (Array.isArray(a?.override) && a.override.length) s.override_axes = a.override;
+  if (a?.shot) s.shot = a.shot;
+  if (a?.orientation) s.orientation = a.orientation;
+  return s;
 }
 
 /** A 2×2-cell preview: CSS-crops one source panel from its page image. */
@@ -71,12 +97,109 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   const errorMsg = typeof data.error === "string" ? data.error : undefined;
   const characterRefs = findCharacterDb();
   const useCharacterRefs = Boolean(data.useCharacterRefs);
+  // Engine + model in one pick. `gemini-*` = direct Gemini API via the key in
+  // .env (default — no extension/Flow tab needed, runs on API credits);
+  // `NANO_BANANA_*` = the Flow bridge through the extension (subscription).
+  // Flow's quota is PER MODEL per day, so within Flow, NB2 keeps working after
+  // Pro's quota is exhausted.
+  const imageModel = typeof data.imageModel === "string" && data.imageModel ? data.imageModel : "gemini-3-pro-image";
+  const [promoted, setPromoted] = useState<number | null>(null); // cell just ⭐-promoted (transient)
+  // Per-cell character assignment (char_id + outfit + override axes), keyed by cell index.
+  const cellAssign = (data.cellAssign && typeof data.cellAssign === "object"
+    ? (data.cellAssign as Record<string, CellAssign>)
+    : {});
 
   // Keep the freshest values for the async re-gen queue (avoids stale closures).
-  const latestRef = useRef({ panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt, regenVariants });
-  latestRef.current = { panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt, regenVariants };
+  const latestRef = useRef({ panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt, regenVariants, cellAssign, imageModel });
+  latestRef.current = { panels, cells, mediaId, useCharacterRefs, characterRefs, regenPrompt, regenVariants, cellAssign, imageModel };
 
-  async function project(): Promise<string | null> {
+  // Persist a per-cell assignment patch (merging with the freshest stored map).
+  function setCellAssign(i: number, patch: CellAssign) {
+    const node = useBoardStore.getState().nodes.find((n) => n.id === rfId);
+    const cur = ((node?.data?.cellAssign as Record<string, CellAssign>) ?? {});
+    const key = String(i);
+    patchComicNode(rfId, { cellAssign: { ...cur, [key]: { ...(cur[key] ?? {}), ...patch } } });
+  }
+
+  // ⭐ — bless the current cell image as a frozen reference for its assigned
+  // character (newest first). Disabled until a character is chosen for the cell.
+  function promoteCell(i: number) {
+    const cid = cells[i];
+    const charId = cellAssign[String(i)]?.charId;
+    if (typeof cid !== "string" || !cid || !charId) return;
+    if (promoteCellToCharacter(charId, cid)) {
+      setPromoted(i);
+      setTimeout(() => setPromoted((v) => (v === i ? null : v)), 1500);
+    }
+  }
+
+  // 🔒 force — when on, the canon ref OVERRIDES the source's face/hair + outfit
+  // (for off-model panels). Off = gentle identity hint, source stays faithful.
+  function toggleForce(i: number) {
+    const on = (cellAssign[String(i)]?.override ?? []).length > 0;
+    setCellAssign(i, { override: on ? [] : ["identity", "outfit"] });
+  }
+
+  // ✨ Director — one vision call tags every cell (who / shot scale / facing),
+  // then applies the routing automatically: char_id assignment, camera tags for
+  // view selection, and SAFETY: the identity override (🔒) is force-cleared on
+  // back/profile cells (it would rotate the character to face the camera).
+  const [tagging, setTagging] = useState(false);
+  async function autoAssign() {
+    if (tagging || panels.length === 0 || !characterRefs?.length) return;
+    setTagging(true);
+    try {
+      const specs = panels.slice(0, 4).map((p) => ({ page_media_id: p.pageMediaId, box: p.box }));
+      const cast = characterRefs.map((c) => ({ id: c.id, name: c.name, sampleMediaId: c.sampleMediaId }));
+      const result = await runRequestToResult(
+        createRequest({ type: "tag_panels", node_id: parseInt(rfId, 10), params: { panels: specs, characters: cast } }),
+      );
+      const tags = (result.tags as Array<{ char_id?: string | null; shot?: string | null; orientation?: string | null }>) ?? [];
+      const node = useBoardStore.getState().nodes.find((n) => n.id === rfId);
+      const cur = ((node?.data?.cellAssign as Record<string, CellAssign>) ?? {});
+      const merged: Record<string, CellAssign> = { ...cur };
+      tags.forEach((t, i) => {
+        const key = String(i);
+        const prev = merged[key] ?? {};
+        const unsafe = t.orientation === "back" || t.orientation === "profile";
+        merged[key] = {
+          ...prev,
+          charId: t.char_id ?? prev.charId,
+          shot: t.shot ?? prev.shot,
+          orientation: t.orientation ?? prev.orientation,
+          // Never let 🔒 rotate a back/profile panel toward the camera.
+          override: unsafe ? [] : prev.override,
+        };
+      });
+      patchComicNode(rfId, { cellAssign: merged });
+    } catch (err) {
+      patchComicNode(rfId, { status: "error", error: `auto-assign: ${String(err)}` });
+    } finally {
+      setTagging(false);
+    }
+  }
+
+  // Cell character <select>: pick an existing character, clear, or define a new
+  // one inline (cold-start, no CCIP) — seeding it with this cell as its first
+  // frozen reference, then assigning it to the cell.
+  async function onSelectChar(i: number, value: string) {
+    if (value === "__new__") {
+      const name = window.prompt("New character name:", `Character ${(characterRefs?.length ?? 0) + 1}`);
+      if (name == null) return; // cancelled
+      const cid = cells[i];
+      const id = await addCharacter(name, typeof cid === "string" && cid ? cid : undefined);
+      if (id) setCellAssign(i, { charId: id });
+      return;
+    }
+    setCellAssign(i, { charId: value || undefined });
+  }
+
+  async function project(opts?: { needsFlow?: boolean }): Promise<string | null> {
+    // API engine doesn't touch Flow at all — skip the board→Flow-project
+    // handshake (which needs a live extension token) and use a placeholder id,
+    // so combine/regen run with no Flow session whatsoever. Flow-only features
+    // (2K/4K upscale) pass needsFlow to always get the real project.
+    if (!opts?.needsFlow && latestRef.current.imageModel.startsWith("gemini-")) return "api-local";
     const boardId = useBoardStore.getState().boardId;
     if (boardId == null) return null;
     try {
@@ -91,9 +214,14 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     if (isBusy || panels.length === 0) return;
     const projectId = await project();
     if (!projectId) return;
-    const specs = panels.map((p) => ({ page_media_id: p.pageMediaId, box: p.box }));
+    const specs = panels.map((p, i) => buildCellSpec(p, cellAssign[String(i)]));
     const params: Record<string, unknown> = { project_id: projectId, panels: specs };
-    if (useCharacterRefs && characterRefs?.length) params.characters = characterRefs;
+    // Pass the character DB whenever it exists so per-cell char_id can resolve to
+    // frozen refs; CCIP appearance-match runs only when "Use Character DB refs"
+    // is ticked (auto_match). An assigned char_id always wins regardless.
+    if (characterRefs?.length) params.characters = characterRefs;
+    params.auto_match = useCharacterRefs;
+    params.image_model = imageModel;
     runComicRequest(
       rfId,
       () => createRequest({ type: "combine_panels", node_id: parseInt(rfId, 10), params }),
@@ -150,9 +278,11 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
         setRegenning((prev) => prev.filter((x) => x !== i));
         continue;
       }
-      const panel = { page_media_id: p.pageMediaId, box: p.box };
+      const panel = buildCellSpec(p, L.cellAssign[String(i)]);
       const params: Record<string, unknown> = { project_id: projectId, panel, cells: working, index: i };
-      if (L.useCharacterRefs && L.characterRefs?.length) params.characters = L.characterRefs;
+      if (L.characterRefs?.length) params.characters = L.characterRefs;
+      params.auto_match = L.useCharacterRefs;
+      params.image_model = L.imageModel;
       if (L.regenPrompt.trim()) params.prompt = L.regenPrompt.trim();
       if (L.regenVariants > 1) params.variant_count = L.regenVariants;
       try {
@@ -220,7 +350,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
 
   // Upscale a cached image to 2K/4K via Flow; returns the new media id or null.
   async function upscaleMedia(localMediaId: string, res: "2K" | "4K"): Promise<string | null> {
-    const projectId = await project();
+    const projectId = await project({ needsFlow: true }); // upscale is Flow-only
     if (!projectId) return null;
     try {
       const result = await runRequestToResult(
@@ -337,22 +467,99 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   return (
     <div ref={rootRef} className="node-body node-body--comic-combine" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
       <label style={{ fontSize: 11, opacity: 0.75 }}>Combine 2×2 · {panels.length} panels</label>
+      <label
+        style={{ fontSize: 10, opacity: 0.75, display: "flex", alignItems: "center", gap: 5 }}
+        title="Engine + model. API = direct Gemini API via your key in .env (no extension/Flow tab, separate quota/billing). Flow = the extension bridge on your Flow subscription; Flow quota is PER MODEL per day, so NB2 still works after Pro's quota is exhausted."
+      >
+        Model
+        <select
+          className="nodrag"
+          value={imageModel}
+          onChange={(e) => patchComicNode(rfId, { imageModel: e.target.value })}
+          style={{ flex: 1, minWidth: 0, fontSize: 10, padding: "1px 4px" }}
+        >
+          <optgroup label="Gemini API (key — no extension)">
+            <option value="gemini-3-pro-image">API · Nano Banana Pro</option>
+            <option value="gemini-2.5-flash-image">API · Nano Banana (flash)</option>
+          </optgroup>
+          <optgroup label="Flow (extension bridge)">
+            <option value="NANO_BANANA_PRO">Flow · Nano Banana Pro</option>
+            <option value="NANO_BANANA_2">Flow · Nano Banana 2</option>
+          </optgroup>
+        </select>
+      </label>
       {characterRefs?.length ? (
-        <label style={{ fontSize: 10, opacity: 0.72, margin: 0, display: "flex", alignItems: "center", gap: 5 }}>
-          <input
-            type="checkbox"
-            checked={useCharacterRefs}
-            onChange={(e) => patchComicNode(rfId, { useCharacterRefs: e.target.checked })}
-          />
-          Use Character DB refs · {characterRefs.length}
-        </label>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <button
+            className="comic-btn comic-btn--sm"
+            onClick={() => void autoAssign()}
+            disabled={tagging || panels.length === 0}
+            title="Director: one vision pass tags every cell (which character / shot scale / facing direction), assigns characters, picks the matching sheet view, and disables 🔒 on back/profile cells."
+            style={{ flex: 1 }}
+          >
+            {tagging ? "Tagging…" : "✨ Auto-assign cells"}
+          </button>
+          <label
+            style={{ fontSize: 10, opacity: 0.72, margin: 0, display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}
+            title="CCIP appearance auto-match for cells with NO character picked. Per-cell assignment always takes priority."
+          >
+            <input
+              type="checkbox"
+              checked={useCharacterRefs}
+              onChange={(e) => patchComicNode(rfId, { useCharacterRefs: e.target.checked })}
+            />
+            CCIP fallback
+          </label>
+        </div>
       ) : null}
 
       {mediaId ? (
         <img src={mediaUrl(mediaId)} alt="2x2 storyboard" loading="lazy" style={{ width: "100%", borderRadius: 4, display: "block", background: "var(--border)" }} />
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 3 }}>
-          {[0, 1, 2, 3].map((i) => (panels[i] ? <CellCrop key={i} p={panels[i]} /> : <div key={i} style={{ aspectRatio: "1 / 1", background: "var(--border)", borderRadius: 3, opacity: 0.4 }} />))}
+          {[0, 1, 2, 3].map((i) => {
+            if (!panels[i]) {
+              return <div key={i} style={{ aspectRatio: "1 / 1", background: "var(--border)", borderRadius: 3, opacity: 0.4 }} />;
+            }
+            // Pre-combine: show each source crop WITH its routing strip so 🪄/✨
+            // assignments are visible (and editable) before the first combine —
+            // they steer that very first generation.
+            const assign = cellAssign[String(i)] ?? {};
+            const forced = (assign.override ?? []).length > 0;
+            const camTag = [assign.shot, assign.orientation].filter(Boolean).join(" · ");
+            return (
+              <div key={i} style={{ minWidth: 0 }}>
+                <CellCrop p={panels[i]} />
+                <div className="nodrag nopan" style={{ display: "flex", alignItems: "center", gap: 2, marginTop: 2, width: "100%", minWidth: 0, boxSizing: "border-box", overflow: "hidden" }}>
+                  <select
+                    value={assign.charId ?? ""}
+                    onChange={(e) => void onSelectChar(i, e.target.value)}
+                    title="Assign this cell's character → feeds its frozen refs on the first combine. Pick ＋ New to define one."
+                    style={{ flex: "1 1 0%", minWidth: 0, width: 0, fontSize: 9, padding: "1px 2px" }}
+                  >
+                    <option value="">— char</option>
+                    {(characterRefs ?? []).map((c) => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                    <option value="__new__">＋ New character…</option>
+                  </select>
+                  <button
+                    className="comic-btn comic-btn--sm"
+                    onClick={() => toggleForce(i)}
+                    disabled={!assign.charId}
+                    title="Force the canon ref to OVERRIDE the source's face/hair + outfit (only for FRONT-facing off-model panels)."
+                    style={{ flexShrink: 0, padding: "1px 4px", fontSize: 10, opacity: forced ? 1 : 0.45, fontWeight: forced ? 700 : 400 }}
+                  >🔒</button>
+                </div>
+                {camTag ? (
+                  <p
+                    title="Director camera tags (shot scale · facing) from ✨ — drive which sheet view is attached."
+                    style={{ fontSize: 8, opacity: 0.55, margin: "1px 0 0", textAlign: "center" }}
+                  >🎬 {camTag}</p>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -384,6 +591,9 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
               const busyCell = regenning.includes(i);
               const waiting = queueRef.current.includes(i); // still in queue = not the active one
               const cand = cellCandidates[i];
+              const assign = cellAssign[String(i)] ?? {};
+              const forced = (assign.override ?? []).length > 0;
+              const camTag = [assign.shot, assign.orientation].filter(Boolean).join(" · ");
               return (
                 <div key={i} style={{ position: "relative" }}>
                   {cells[i] ? (
@@ -423,6 +633,42 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                     title={regenVariants > 1 ? `Re-gen cell ${i + 1} → ${regenVariants} candidates to pick` : regenPrompt.trim() ? `Re-gen cell ${i + 1} with your custom prompt` : `Re-gen cell ${i + 1} (default clean + extend)`}
                     style={{ position: "absolute", top: 2, right: 2, padding: "1px 6px", fontSize: 11, background: "rgba(0,0,0,0.55)" }}
                   >↻</button>
+                  {cells[i] ? (
+                    <div className="nodrag nopan" style={{ display: "flex", alignItems: "center", gap: 2, marginTop: 2, width: "100%", minWidth: 0, boxSizing: "border-box", overflow: "hidden" }}>
+                      <select
+                        value={assign.charId ?? ""}
+                        onChange={(e) => void onSelectChar(i, e.target.value)}
+                        title="Assign this cell's character → feeds its frozen refs directly (bypasses CCIP). Pick ＋ New to define one."
+                        style={{ flex: "1 1 0%", minWidth: 0, width: 0, fontSize: 9, padding: "1px 2px" }}
+                      >
+                        <option value="">— char</option>
+                        {(characterRefs ?? []).map((c) => (
+                          <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                        <option value="__new__">＋ New character…</option>
+                      </select>
+                      <button
+                        className="comic-btn comic-btn--sm"
+                        onClick={() => toggleForce(i)}
+                        disabled={!assign.charId}
+                        title="Force the canon ref to OVERRIDE the source's face/hair + outfit (use when the panel is off-model). Off = gentle hint, source stays faithful."
+                        style={{ flexShrink: 0, padding: "1px 4px", fontSize: 10, opacity: forced ? 1 : 0.45, fontWeight: forced ? 700 : 400 }}
+                      >🔒</button>
+                      <button
+                        className="comic-btn comic-btn--sm"
+                        onClick={() => promoteCell(i)}
+                        disabled={!assign.charId || !cells[i]}
+                        title={assign.charId ? "⭐ Bless this cell as a frozen reference for the chosen character (newest first)" : "Pick a character first"}
+                        style={{ flexShrink: 0, padding: "1px 4px", fontSize: 10 }}
+                      >{promoted === i ? "✓" : "⭐"}</button>
+                    </div>
+                  ) : null}
+                  {cells[i] && camTag ? (
+                    <p
+                      title="Director camera tags (shot scale · facing). Drive which sheet view is attached; 🔒 is auto-disabled on back/profile."
+                      style={{ fontSize: 8, opacity: 0.55, margin: "1px 0 0", textAlign: "center" }}
+                    >🎬 {camTag}</p>
+                  ) : null}
                 </div>
               );
             })}

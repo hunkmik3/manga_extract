@@ -177,6 +177,15 @@ export function resolveUpstreamImage(rfId: string): UpstreamImage | null {
   return null;
 }
 
+/** A typed reference view of a character (cropped from a model sheet): the
+ * Director attaches the view matching the panel's camera — face for close-ups,
+ * body for wides, back for back-facing panels. kind "auto" = untyped (e.g. a
+ * ⭐-promoted cell), used as a generic fallback. */
+export interface CharacterRefView {
+  mediaId: string;
+  kind: "face" | "body" | "back" | "auto";
+}
+
 export interface CharacterItem {
   id: string;
   name: string;
@@ -184,6 +193,12 @@ export interface CharacterItem {
   refMediaIds: string[];
   sampleMediaId: string;
   pages?: number[];
+  /** Typed views (from sheet segmentation). When present, the backend picks
+   * views by the panel's shot/orientation instead of the flat refMediaIds. */
+  refViews?: CharacterRefView[];
+  /** Canonical appearance description — appended VERBATIM to every prompt the
+   * character appears in (prompt-token consistency across panels). */
+  descriptor?: string;
 }
 /** The character DB from the (single) comic_chars node on the board, if built.
  * Passed to enhance so it can auto-match each panel's character. */
@@ -195,6 +210,84 @@ export function findCharacterDb(): CharacterItem[] | null {
     }
   }
   return null;
+}
+
+/** The comic_chars node (rfId + its characters) on the board, if present —
+ * even when empty, so cells can promote the first ref into it. */
+export function findCharacterDbNode(): { rfId: string; characters: CharacterItem[] } | null {
+  const { nodes } = useBoardStore.getState();
+  for (const n of nodes) {
+    if (n.data.type === "comic_chars" && Array.isArray(n.data.characters)) {
+      return { rfId: n.id, characters: n.data.characters as CharacterItem[] };
+    }
+  }
+  return null;
+}
+
+/**
+ * Promote a generated cell image into a character's FROZEN reference set
+ * (newest first, deduped, capped). This is the only sanctioned way canon refs
+ * grow: a human picks a good cell and blesses it as the design of record for
+ * that identity. Combine/regen then resolve that character's char_id to these
+ * exact refs (bypassing CCIP). Returns false if there is no character DB or the
+ * id is unknown.
+ */
+export function promoteCellToCharacter(charId: string, mediaId: string): boolean {
+  if (!charId || !mediaId) return false;
+  const node = findCharacterDbNode();
+  if (!node) return false;
+  const chars = node.characters.map((c) => ({ ...c }));
+  const c = chars.find((x) => x.id === charId);
+  if (!c) return false;
+  const prev = Array.isArray(c.refMediaIds) ? c.refMediaIds.filter((m) => m !== mediaId) : [];
+  c.refMediaIds = [mediaId, ...prev].slice(0, 8); // newest first, capped
+  if (Array.isArray(c.refViews) && c.refViews.length) {
+    // Keep the typed-view store in sync: a promoted cell has no known view kind,
+    // so it joins as "auto" (generic fallback after the typed views).
+    const prevViews = c.refViews.filter((v) => v.mediaId !== mediaId);
+    c.refViews = [{ mediaId, kind: "auto" as const }, ...prevViews].slice(0, 12);
+  }
+  if (!c.sampleMediaId) c.sampleMediaId = mediaId;
+  patchComicNode(node.rfId, { characters: chars });
+  return true;
+}
+
+/** The board's comic_chars node, creating one if none exists (so cold-start —
+ * defining characters by hand instead of via CCIP clustering — works). Returns
+ * its rfId, or null if the board isn't ready. */
+export async function ensureCharsNode(): Promise<string | null> {
+  const existing = findCharacterDbNode();
+  if (existing) return existing.rfId;
+  const store = useBoardStore.getState();
+  const up = store.nodes.find((n) => n.data.type === "comic_import");
+  const pos = up ? { x: up.position.x, y: up.position.y + 520 } : { x: 40, y: 40 };
+  return store.addNodeOfType("comic_chars", pos);
+}
+
+/**
+ * Define a NEW character by hand (cold-start, no CCIP) — creating the character
+ * DB node if needed — optionally seeded with a first frozen reference (e.g. the
+ * combine cell the user is blessing). Returns the new char id, or null.
+ */
+export async function addCharacter(name: string, firstRefMediaId?: string): Promise<string | null> {
+  const rfId = await ensureCharsNode();
+  if (!rfId) return null;
+  const node = useBoardStore.getState().nodes.find((n) => n.id === rfId);
+  const chars = (Array.isArray(node?.data?.characters) ? node!.data!.characters : []) as CharacterItem[];
+  const ids = new Set(chars.map((c) => c.id));
+  let n = chars.length;
+  let id = `char_${n}`;
+  while (ids.has(id)) id = `char_${++n}`;
+  const refs = firstRefMediaId ? [firstRefMediaId] : [];
+  const newChar: CharacterItem = {
+    id,
+    name: name.trim() || `Character ${chars.length + 1}`,
+    count: 0,
+    refMediaIds: refs,
+    sampleMediaId: firstRefMediaId ?? "",
+  };
+  patchComicNode(rfId, { characters: [...chars, newChar] });
+  return id;
 }
 
 export interface DownstreamPage {

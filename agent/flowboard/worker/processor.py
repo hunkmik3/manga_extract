@@ -1113,17 +1113,130 @@ def _match_and_load_char_refs(panel_bytes: bytes, chars: list) -> list[bytes]:
     return refs
 
 
+def _find_char(chars: object, char_id: object) -> Optional[dict]:
+    if not isinstance(chars, list) or not isinstance(char_id, str) or not char_id:
+        return None
+    return next((c for c in chars if isinstance(c, dict) and str(c.get("id")) == char_id), None)
+
+
+def _order_views_for_panel(views: list, shot: object, orientation: object) -> list[str]:
+    """Order a character's typed reference views (``refViews``: [{mediaId, kind}])
+    to best match the panel's camera: a close-up wants the FACE view, a wide
+    shot wants the BODY view, a back-facing panel wants the BACK view. Attaching
+    the wrong-scale view is what caused the reproduced failures (full-body sheet
+    hijacking a close-up; face ref rotating a back view). Unknown/auto kinds are
+    kept as generic fallbacks after the preferred kinds."""
+    if orientation == "back":
+        pref = ["back", "body", "face"]
+    elif shot in ("closeup", "close-up"):
+        pref = ["face", "body", "back"]
+    elif shot == "wide":
+        pref = ["body", "face", "back"]
+    else:  # medium / untagged — current default: face first, then body
+        pref = ["face", "body", "back"]
+    rank = {k: i for i, k in enumerate(pref)}
+    by_pref = sorted(
+        range(len(views)),
+        key=lambda i: (
+            rank.get(str((views[i] or {}).get("kind")), len(pref)),  # preferred kinds first
+            i,                                                        # stable within a kind
+        ),
+    )
+    # KIND-DIVERSE pick: at most ONE view per kind (the best face + the best
+    # body + …), not three near-identical sheet crops. Several clean white-bg
+    # sheet views of the same kind OVERPOWER the source panel — the model (esp.
+    # the lighter flash tier) just reproduces the sheet instead of editing the
+    # panel. One identity anchor + one scale anchor carries the same signal at
+    # half the pull.
+    ordered: list[str] = []
+    seen_kinds: set = set()
+    leftovers: list[str] = []
+    for idx in by_pref:
+        v = views[idx]
+        mid = v.get("mediaId") if isinstance(v, dict) else None
+        if not (isinstance(mid, str) and mid) or mid in ordered or mid in leftovers:
+            continue
+        kind = str(v.get("kind"))
+        if kind not in seen_kinds:
+            seen_kinds.add(kind)
+            ordered.append(mid)
+        else:
+            leftovers.append(mid)
+    return ordered + leftovers
+
+
+def _assigned_char_refs(spec: object, chars: object, limit: int = 2) -> list[bytes]:
+    """If the panel spec names an explicit ``char_id``, load that character's
+    reference crops directly — bypassing CCIP entirely. This is the
+    human/Director-assigned path that replaces the appearance-clustering CCIP
+    match, which can't separate this comic's characters.
+
+    When the character carries typed ``refViews`` (face/body/back crops from a
+    segmented character sheet), the views are reordered to match the panel's
+    ``shot`` + ``orientation`` tags so a close-up gets the face view and a wide
+    gets the body view. Falls back to the flat ``refMediaIds`` (newest first —
+    canon is prepended on promote). Returns [] when no char_id / no such
+    character / no readable refs."""
+    char = _find_char(chars, spec.get("char_id") if isinstance(spec, dict) else None)
+    if char is None:
+        return []
+    views = char.get("refViews")
+    if isinstance(views, list) and views:
+        sp = spec if isinstance(spec, dict) else {}
+        media_ids = _order_views_for_panel(views, sp.get("shot"), sp.get("orientation"))
+    else:
+        media_ids = [m for m in (char.get("refMediaIds") or []) if isinstance(m, str)]
+    refs: list[bytes] = []
+    for mid in media_ids[:limit]:
+        p = media_service.cached_path(mid)
+        if p is None:
+            continue
+        try:
+            refs.append(p.read_bytes())
+        except OSError:
+            continue
+    return refs
+
+
+def _assigned_char_name(spec: object, chars: object) -> Optional[str]:
+    """Human-readable name of the spec's assigned character (for prompt wording)."""
+    char = _find_char(chars, spec.get("char_id") if isinstance(spec, dict) else None)
+    name = char.get("name") if isinstance(char, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def _assigned_char_desc(spec: object, chars: object) -> Optional[str]:
+    """The character's canonical text descriptor — reused VERBATIM in every
+    prompt that character appears in (prompt-token consistency)."""
+    char = _find_char(chars, spec.get("char_id") if isinstance(spec, dict) else None)
+    desc = char.get("descriptor") if isinstance(char, dict) else None
+    desc = desc.strip() if isinstance(desc, str) else ""
+    return desc or None
+
+
 def _panel_reference_bytes(
-    panel_bytes: bytes, panel_params: dict, chars: object, *, include_page: bool = True
+    panel_bytes: bytes,
+    panel_params: dict,
+    chars: object,
+    *,
+    include_page: bool = True,
+    auto_match: bool = True,
 ) -> list[bytes]:
     """References for a comic panel edit: the full source page for environment
-    continuity plus matched Character DB crops for identity/costume continuity."""
+    continuity plus character crops for identity/costume continuity.
+
+    Character refs are resolved in priority order: an explicit per-cell
+    ``char_id`` (human-assigned, frozen canon — always used) wins; otherwise, only
+    when ``auto_match`` is on, fall back to the CCIP appearance match."""
     refs: list[bytes] = []
     if include_page:
         page_ref = _page_ref_bytes(panel_params)
         if page_ref:
             refs.append(page_ref)
-    if isinstance(chars, list) and chars:
+    assigned = _assigned_char_refs(panel_params, chars)
+    if assigned:
+        refs.extend(assigned)
+    elif auto_match and isinstance(chars, list) and chars:
         refs.extend(_match_and_load_char_refs(panel_bytes, chars))
     return refs[:5]
 
@@ -1244,6 +1357,9 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
     chars = params.get("characters")
+    # CCIP appearance-match is the opt-in fallback; an explicit per-cell char_id
+    # always wins regardless of this flag.
+    auto_match = bool(params.get("auto_match", True))
     pid = project_id.strip()
 
     raws = await asyncio.to_thread(
@@ -1261,20 +1377,38 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     async def _clean_one(spec, raw) -> tuple[Optional["object"], Optional[str]]:
         if raw is None:
             return None, None
+        sp = spec if isinstance(spec, dict) else {}
         refs = await asyncio.to_thread(
-            lambda: _panel_reference_bytes(
-                raw, spec if isinstance(spec, dict) else {}, chars, include_page=False
+            lambda: _panel_reference_bytes(raw, sp, chars, include_page=False, auto_match=auto_match)
+        )
+        # Pre-pad the panel onto a 9:16 canvas with edge-replicated seed bands
+        # (same trick as the standalone clean node): the model then OUTPAINTS
+        # the full frame instead of letterboxing. Without this, an extreme-wide
+        # strip (e.g. a letterboxed close-up) comes back as a face with empty
+        # bars instead of a fully painted 9:16 panel.
+        def _prep() -> bytes:
+            try:
+                return panel_svc.encode_png(
+                    panel_svc.pad_to_aspect(panel_svc.decode_bgr(raw), 9, 16, mode="replicate")
+                )
+            except Exception:  # noqa: BLE001
+                return raw
+        raw916 = await asyncio.to_thread(_prep)
+        clause = (
+            prompts.combine_reference_clause(
+                char_name=_assigned_char_name(sp, chars),
+                char_desc=_assigned_char_desc(sp, chars),
+                outfit=sp.get("outfit"),
+                override_axes=sp.get("override_axes"),
             )
+            if refs
+            else ""
         )
-        prompt = (
-            prompts.CLEAN_PROMPT
-            + prompts.EXTEND_9_16
-            + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
-        )
+        prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16 + clause
         async with sem:
             try:
                 out = await bridge.edit_image(
-                    raw, prompt, reference_images=refs or None, project_id=pid,
+                    raw916, prompt, reference_images=refs or None, project_id=pid,
                     aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
                 )
             except bridge.BridgeEditError as exc:
@@ -1356,19 +1490,42 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
     chars = params.get("characters")
+    auto_match = bool(params.get("auto_match", True))
 
     raw = await asyncio.to_thread(_source_image_bytes, panel)
     if raw is None:
         return {}, "no_source_image"
     refs = await asyncio.to_thread(
-        lambda: _panel_reference_bytes(raw, panel, chars, include_page=False)
+        lambda: _panel_reference_bytes(raw, panel, chars, include_page=False, auto_match=auto_match)
     )
     # Optional custom prompt — lets the user steer a single re-gen (e.g. "make
     # the lighting warmer") instead of the default clean+extend. Blank → default.
     custom = params.get("prompt")
     custom = custom.strip() if isinstance(custom, str) else ""
     base = custom or (prompts.CLEAN_PROMPT + prompts.EXTEND_9_16)
-    prompt = base + (prompts.COMBINE_CHARACTER_REFERENCE_CLAUSE if refs else "")
+    clause = (
+        prompts.combine_reference_clause(
+            char_name=_assigned_char_name(panel, chars),
+            char_desc=_assigned_char_desc(panel, chars),
+            outfit=panel.get("outfit"),
+            override_axes=panel.get("override_axes"),
+        )
+        if refs
+        else ""
+    )
+    prompt = base + clause
+
+    # Same 9:16 pre-pad as the combine path: give the model a full-frame canvas
+    # with edge-replicated seed bands to outpaint, so a wide strip doesn't come
+    # back letterboxed.
+    def _prep() -> bytes:
+        try:
+            return panel_svc.encode_png(
+                panel_svc.pad_to_aspect(panel_svc.decode_bgr(raw), 9, 16, mode="replicate")
+            )
+        except Exception:  # noqa: BLE001
+            return raw
+    raw = await asyncio.to_thread(_prep)
     n = max(1, min(int(params.get("variant_count") or 1), 4))
     try:
         if n == 1:
@@ -1440,6 +1597,322 @@ async def _handle_export_all_panels(params: dict) -> tuple[dict, Optional[str]]:
     mid = str(uuid.uuid4())
     media_service.ingest_inline_bytes(mid, zip_bytes, kind="file", mime="application/zip")
     return {"mediaId": mid, "count": count, "node_id": params.get("__node_id")}, None
+
+
+# ── Comic pipeline — Director: chapter-wide WHO via magiv2 ───────────────────
+# One local pass (no Flow, no LLM): magiv2 reads the chapter pages with a named
+# character bank built from the Character DB's reference views and returns
+# character boxes per page. Each named box is mapped to the panel box that
+# contains it; the largest named figure in a panel becomes that panel's
+# char_id. The frontend then routes those assignments into every combine
+# node's per-cell settings.
+
+
+def _box_containment(inner: tuple, outer: tuple) -> float:
+    """Fraction of ``inner``'s area inside ``outer`` (both (x, y, w, h))."""
+    ix, iy, iw, ih = inner
+    ox, oy, ow, oh = outer
+    x0, y0 = max(ix, ox), max(iy, oy)
+    x1, y1 = min(ix + iw, ox + ow), min(iy + ih, oy + oh)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0) / float(max(1, iw * ih))
+
+
+def _primary_char_per_panel(
+    panel_boxes: list[dict], char_boxes: list[tuple], min_containment: float = 0.4
+) -> dict:
+    """Map detected character boxes to panel boxes → {panel box id: char_id}.
+
+    A character belongs to the panel that contains most of it; per panel the
+    LARGEST assigned character wins (the focal figure). Unnamed detections
+    ("Other") never made it into ``char_boxes``."""
+    best: dict = {}
+    area: dict = {}
+    for (cbox, char_id) in char_boxes:
+        panel_id, panel_frac = None, min_containment
+        for pb in panel_boxes:
+            frac = _box_containment(cbox, (pb["x"], pb["y"], pb["w"], pb["h"]))
+            if frac > panel_frac:
+                panel_id, panel_frac = pb["id"], frac
+        if panel_id is None:
+            continue
+        c_area = cbox[2] * cbox[3]
+        if c_area > area.get(panel_id, 0):
+            best[panel_id] = char_id
+            area[panel_id] = c_area
+    return best
+
+
+async def _handle_magi_assign_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Chapter-wide character assignment: run magiv2 over the given pages with a
+    character bank from the Character DB, then map each named character box to
+    its panel box. Returns {assignments: {page_media_id: {box_id: char_id}}}.
+    Pure local (no bridge / no LLM call)."""
+    from flowboard.services.comic import panels as panel_svc
+    from flowboard.services.comic.panel_ml import MLUnavailable
+
+    pages_in = params.get("pages")
+    if not isinstance(pages_in, list) or not pages_in:
+        return {}, "missing_pages"
+    chars = params.get("characters")
+    chars = [c for c in chars if isinstance(c, dict)] if isinstance(chars, list) else []
+    if not chars:
+        return {}, "missing_characters"
+
+    def _run() -> Optional[tuple[dict, int]]:
+        from flowboard.services.comic import magi as magi_svc
+
+        # Character bank: up to 2 reference crops per character (face + body
+        # views carry the most identity signal), all sharing the char_id name.
+        bank_imgs: list = []
+        bank_names: list[str] = []
+        for c in chars:
+            mids = [m for m in (c.get("refMediaIds") or []) if isinstance(m, str)][:2]
+            for mid in mids:
+                p = media_service.cached_path(mid)
+                if p is None:
+                    continue
+                try:
+                    bank_imgs.append(panel_svc.decode_bgr(p.read_bytes()))
+                    bank_names.append(str(c.get("id")))
+                except Exception:  # noqa: BLE001
+                    continue
+        if not bank_imgs:
+            return None
+
+        page_bgrs: list = []
+        page_meta: list[tuple[str, list[dict]]] = []  # (media_id, boxes)
+        for pg in pages_in:
+            if not isinstance(pg, dict):
+                continue
+            mid = pg.get("media_id") or pg.get("mediaId")
+            boxes = pg.get("boxes")
+            if not isinstance(mid, str) or not isinstance(boxes, list) or not boxes:
+                continue
+            p = media_service.cached_path(mid)
+            if p is None:
+                continue
+            try:
+                page_bgrs.append(panel_svc.decode_bgr(p.read_bytes()))
+            except Exception:  # noqa: BLE001
+                continue
+            page_meta.append((mid, [b for b in boxes if isinstance(b, dict) and "id" in b]))
+        if not page_bgrs:
+            return None
+
+        per_page = magi_svc.predict_page_characters(page_bgrs, bank_imgs, bank_names)
+        known = {str(c.get("id")) for c in chars}
+        assignments: dict = {}
+        n_assigned = 0
+        for (mid, boxes), detections in zip(page_meta, per_page):
+            named = [(box, name) for (box, name) in detections if name in known]
+            mapping = _primary_char_per_panel(boxes, named)
+            if mapping:
+                assignments[mid] = mapping
+                n_assigned += len(mapping)
+        return assignments, n_assigned
+
+    try:
+        res = await asyncio.to_thread(_run)
+    except MLUnavailable as exc:
+        return {}, f"ml_unavailable: {str(exc)[:200]}"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("magi_assign_panels failed")
+        return {}, f"magi_failed: {str(exc)[:200]}"
+    if res is None:
+        return {}, "no_readable_inputs"
+    assignments, n_assigned = res
+    return {
+        "assignments": assignments,
+        "panels_assigned": n_assigned,
+        "node_id": params.get("__node_id"),
+    }, None
+
+
+# ── Comic pipeline — Director: auto-tag panels (who / shot / orientation) ────
+# One vision call per combine group: the configured Vision provider (the same
+# LLM CLI already used for aiBriefs — zero Flow cost) looks at the cast's
+# sample crops + the panel crops and returns, per panel, WHICH character is the
+# primary figure, the SHOT scale, and the facing ORIENTATION. The frontend
+# turns those tags into per-cell routing (char_id, view selection, and
+# auto-disabling the identity override on back/profile panels — the tag that
+# prevents the "back of head rotated to face camera" failure).
+
+_TAG_SYSTEM = (
+    "You are a comic panel annotator. You are given character reference images "
+    "followed by comic panel images. For EACH panel, identify: (1) which listed "
+    "character is the PRIMARY (largest / focal) figure, or null if none of the "
+    "listed characters is present or you are unsure; (2) the shot scale: "
+    "\"closeup\" (face or a detail fills the panel), \"medium\" (roughly "
+    "waist-up), or \"wide\" (full body or environment dominates); (3) the "
+    "primary figure's facing: \"front\" (face mostly visible), \"profile\" "
+    "(side view), or \"back\" (facing away / back of head). Respond with ONLY a "
+    "JSON array, one object per panel, in panel order: "
+    '[{"panel": 1, "char_id": "char_0" | null, "shot": "closeup|medium|wide", '
+    '"orientation": "front|profile|back", "confidence": 0.0-1.0}]. '
+    "No prose, no markdown fences — just the JSON array."
+)
+
+_VALID_SHOTS = {"closeup", "medium", "wide"}
+_VALID_ORIENTATIONS = {"front", "profile", "back"}
+
+
+def _parse_panel_tags(text: str, n_panels: int, char_ids: set) -> Optional[list[dict]]:
+    """Parse + sanitize the model's JSON tag array. Returns None if unusable."""
+    import json
+    import re
+
+    raw = (text or "").strip()
+    m = re.search(r"\[.*\]", raw, re.DOTALL)  # tolerate prose / fences around the array
+    if not m:
+        return None
+    try:
+        arr = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(arr, list):
+        return None
+    tags: list[dict] = []
+    for i in range(n_panels):
+        entry = arr[i] if i < len(arr) and isinstance(arr[i], dict) else {}
+        cid = entry.get("char_id")
+        shot = str(entry.get("shot") or "").lower().replace("close-up", "closeup")
+        ori = str(entry.get("orientation") or "").lower()
+        conf = entry.get("confidence")
+        tags.append({
+            "char_id": cid if isinstance(cid, str) and cid in char_ids else None,
+            "shot": shot if shot in _VALID_SHOTS else None,
+            "orientation": ori if ori in _VALID_ORIENTATIONS else None,
+            "confidence": float(conf) if isinstance(conf, (int, float)) else None,
+        })
+    return tags
+
+
+async def _handle_tag_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Auto-tag up to 4 panels: primary character (from the cast), shot scale,
+    and facing orientation — via the configured Vision provider. Local + LLM CLI
+    only; no Flow generation is spent."""
+    import shutil
+    import tempfile
+
+    from flowboard.services.llm.base import LLMError
+    from flowboard.services.llm.registry import run_llm
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+    chars = params.get("characters")
+    chars = [c for c in chars if isinstance(c, dict)] if isinstance(chars, list) else []
+
+    tmpdir = tempfile.mkdtemp(prefix="flowboard-tag-")
+
+    def _prepare() -> Optional[tuple[list[str], list[str], int]]:
+        """Write cast samples + panel crops as files → (paths, cast_lines, n_panels)."""
+        paths: list[str] = []
+        cast_lines: list[str] = []
+        for c in chars:
+            sid = c.get("sampleMediaId")
+            p = media_service.cached_path(sid) if isinstance(sid, str) else None
+            if p is None:
+                continue
+            dst = f"{tmpdir}/cast_{len(cast_lines)}.png"
+            try:
+                shutil.copyfile(p, dst)
+            except OSError:
+                continue
+            paths.append(dst)
+            cast_lines.append(f"Image {len(paths)}: character id \"{c.get('id')}\" — {c.get('name') or c.get('id')}")
+        n_panels = 0
+        for s in specs[:4]:
+            if not isinstance(s, dict):
+                continue
+            b = _source_image_bytes(s)
+            if not b:
+                continue
+            dst = f"{tmpdir}/panel_{n_panels}.png"
+            try:
+                with open(dst, "wb") as f:
+                    f.write(b)
+            except OSError:
+                continue
+            paths.append(dst)
+            n_panels += 1
+        if n_panels == 0:
+            return None
+        return paths, cast_lines, n_panels
+
+    prepared = await asyncio.to_thread(_prepare)
+    if prepared is None:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return {}, "no_source_image"
+    paths, cast_lines, n_panels = prepared
+
+    user_prompt = (
+        (("Character references:\n" + "\n".join(cast_lines) + "\n\n") if cast_lines else "")
+        + f"Images {len(cast_lines) + 1}-{len(cast_lines) + n_panels}: comic panels 1-{n_panels} in order.\n"
+        + f"Tag the {n_panels} panel(s)."
+    )
+    try:
+        text = await run_llm(
+            "vision", user_prompt, system_prompt=_TAG_SYSTEM,
+            attachments=paths, timeout=180.0,
+        )
+    except LLMError as exc:
+        return {}, f"vision_failed: {str(exc)[:160]}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    tags = _parse_panel_tags(text, n_panels, {str(c.get("id")) for c in chars})
+    if tags is None:
+        return {}, "bad_tag_response"
+    return {"tags": tags, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_segment_character_sheet(params: dict) -> tuple[dict, Optional[str]]:
+    """Auto-split an uploaded character turnaround/reference sheet into individual
+    keyed views (face close-ups + full-body views) and ingest each crop as media.
+    The frontend turns the kept views into a character's frozen canon refs. Pure
+    local (no bridge call)."""
+    import uuid
+
+    from flowboard.services.comic import panels as panel_svc, sheet as sheet_svc
+
+    media_id = params.get("media_id")
+    if not isinstance(media_id, str) or not media_id:
+        return {}, "missing_media_id"
+    path = media_service.cached_path(media_id)
+    if path is None:
+        return {}, "no_source_image"
+
+    def _run() -> Optional[list[tuple[str, bytes, dict]]]:
+        try:
+            bgr = panel_svc.decode_bgr(path.read_bytes())
+        except Exception:  # noqa: BLE001
+            return None
+        seg = sheet_svc.segment_character_sheet(bgr)
+        H, W = bgr.shape[0], bgr.shape[1]
+        crops: list[tuple[str, bytes, dict]] = []
+        for plural, singular in (("faces", "face"), ("bodies", "body")):
+            for (x, y, w, h) in seg.get(plural, []):
+                x2, y2 = min(W, x + w), min(H, y + h)
+                if x2 <= x or y2 <= y:
+                    continue
+                crops.append((singular, panel_svc.encode_png(bgr[y:y2, x:x2]),
+                              {"x": x, "y": y, "w": w, "h": h}))
+        return crops
+
+    crops = await asyncio.to_thread(_run)
+    if crops is None:
+        return {}, "decode_failed"
+    if not crops:
+        return {}, "no_views_found"
+    views: list[dict] = []
+    for kind, png, box in crops:
+        mid = str(uuid.uuid4())
+        media_service.ingest_inline_bytes(mid, png, kind="image", mime="image/png")
+        views.append({"kind": kind, "mediaId": mid, "box": box})
+    return {"views": views, "node_id": params.get("__node_id")}, None
 
 
 async def _handle_restitch_cells(params: dict) -> tuple[dict, Optional[str]]:
@@ -1514,6 +1987,9 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "regen_cell": _handle_regen_cell,
     "restitch_cells": _handle_restitch_cells,
     "export_all_panels": _handle_export_all_panels,
+    "segment_character_sheet": _handle_segment_character_sheet,
+    "tag_panels": _handle_tag_panels,
+    "magi_assign_panels": _handle_magi_assign_panels,
     "upsample_image": _handle_upsample_image,
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { mediaUrl } from "../api/client";
 import { type BoxItem, type PageItem } from "./comicShared";
 
@@ -7,17 +7,32 @@ const DEFAULT_BOX = 220; // default new-box size (page px)
 let _boxSeq = 0;
 const newId = () => `b${Date.now().toString(36)}${(_boxSeq++).toString(36)}`;
 
+// 8 resize handles: 4 corners + 4 edge midpoints. The letters in `h` say which
+// edges that handle moves (n/s = top/bottom, w/e = left/right); the opposite
+// edges stay anchored.
+type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+const RESIZE_HANDLES: { h: ResizeHandle; cursor: string; style: CSSProperties }[] = [
+  { h: "nw", cursor: "nwse-resize", style: { left: -6, top: -6 } },
+  { h: "n", cursor: "ns-resize", style: { left: "calc(50% - 5.5px)", top: -6 } },
+  { h: "ne", cursor: "nesw-resize", style: { right: -6, top: -6 } },
+  { h: "e", cursor: "ew-resize", style: { right: -6, top: "calc(50% - 5.5px)" } },
+  { h: "se", cursor: "nwse-resize", style: { right: -6, bottom: -6 } },
+  { h: "s", cursor: "ns-resize", style: { left: "calc(50% - 5.5px)", bottom: -6 } },
+  { h: "sw", cursor: "nesw-resize", style: { left: -6, bottom: -6 } },
+  { h: "w", cursor: "ew-resize", style: { left: -6, top: "calc(50% - 5.5px)" } },
+];
+
 type Drag =
   | { mode: "draw"; x0: number; y0: number }
   | { mode: "move"; id: string; dx: number; dy: number }
-  | { mode: "resize"; id: string };
+  | { mode: "resize"; id: string; handle: ResizeHandle };
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 /**
  * Interactive panel-box editor for ONE page. Add a box by dragging an empty
- * area OR right-click → "Add box". Drag a box to move, drag the corner to
- * resize, click to select, ✕ / Delete / right-click → "Delete box" to remove.
+ * area OR right-click → "Add box". Drag a box to move, drag any corner or edge
+ * handle to resize, click to select, ✕ / Delete / right-click → "Delete box" to remove.
  * `onChange` gets the full box list after each edit. Coordinates are zoom-aware
  * (overlay scaled by image clientWidth; pointer mapping via live rect).
  */
@@ -98,7 +113,12 @@ export function PanelBoxEditor({
       } else if (d.mode === "resize") {
         const b = boxes.find((bb) => bb.id === d.id);
         if (!b) return;
-        setDraft({ ...b, w: clamp(p.x - b.x, MIN_SIZE, pageW - b.x), h: clamp(p.y - b.y, MIN_SIZE, pageH - b.y) });
+        let left = b.x, right = b.x + b.w, top = b.y, bottom = b.y + b.h;
+        if (d.handle.includes("w")) left = clamp(p.x, 0, right - MIN_SIZE);
+        if (d.handle.includes("e")) right = clamp(p.x, left + MIN_SIZE, pageW);
+        if (d.handle.includes("n")) top = clamp(p.y, 0, bottom - MIN_SIZE);
+        if (d.handle.includes("s")) bottom = clamp(p.y, top + MIN_SIZE, pageH);
+        setDraft({ ...b, x: left, y: top, w: right - left, h: bottom - top });
       }
     }
     function onUp() {
@@ -179,10 +199,13 @@ export function PanelBoxEditor({
                   title="Delete box"
                   style={{ position: "absolute", top: -10, right: -10, width: 18, height: 18, borderRadius: 9, border: "none", background: "#ef4444", color: "#fff", fontSize: 11, lineHeight: "18px", cursor: "pointer", padding: 0 }}
                 >×</button>
-                <div
-                  onPointerDown={(e) => { if (e.button !== 0) return; e.stopPropagation(); dragRef.current = { mode: "resize", id: b.id }; }}
-                  style={{ position: "absolute", right: -6, bottom: -6, width: 12, height: 12, background: "#f5b301", border: "1px solid #fff", cursor: "nwse-resize" }}
-                />
+                {RESIZE_HANDLES.map((H) => (
+                  <div
+                    key={H.h}
+                    onPointerDown={(e) => { if (e.button !== 0) return; e.stopPropagation(); dragRef.current = { mode: "resize", id: b.id, handle: H.h }; }}
+                    style={{ position: "absolute", width: 11, height: 11, background: "#f5b301", border: "1px solid #fff", borderRadius: 2, ...H.style, cursor: H.cursor }}
+                  />
+                ))}
               </>
             )}
           </div>

@@ -50,6 +50,28 @@ RETRY_BACKOFF_S = 1.5
 # Comic panels default to portrait; callers (Node 2 9:16, Node 3) override.
 DEFAULT_ASPECT_RATIO = "IMAGE_ASPECT_RATIO_LANDSCAPE"
 
+# Errors that retrying can NEVER fix — fail fast instead of burning the
+# remaining attempts. A daily quota or anti-abuse flag does not clear in 1.5 s,
+# and hammering Flow with doomed repeats both slows the user down and makes the
+# account look MORE bot-like (the very behaviour that triggers
+# UNUSUAL_ACTIVITY in the first place). Content-filter rejections are
+# deterministic for identical input, so a verbatim retry is wasted too.
+_NON_RETRYABLE_MARKERS: tuple[str, ...] = (
+    "PER_MODEL_DAILY_QUOTA",       # PUBLIC_ERROR_PER_MODEL_DAILY_QUOTA_REACHED
+    "DAILY_QUOTA",                 # any other daily-quota phrasing
+    "QUOTA_EXCEEDED",
+    "UNUSUAL_ACTIVITY",            # anti-abuse flag — more retries = worse
+    "PROMINENT_PEOPLE_FILTER",     # RAI content filters — deterministic reject
+    "AUDIO_FILTERED",
+    "RAI_FILTERED",
+    "PAYGATE",                     # tier/subscription gating
+)
+
+
+def _is_non_retryable(error_text: str) -> bool:
+    up = (error_text or "").upper()
+    return any(m in up for m in _NON_RETRYABLE_MARKERS)
+
 # Upload de-dupe cache: (project_id, sha256(bytes)) → Flow media_id. The same
 # bytes (a shared character ref across 4 combine panels, or the same source on a
 # re-gen) upload only once per project. Flow media_ids are stable for the
@@ -177,6 +199,18 @@ async def edit_image_variants(
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
 
+    # Engine routing: any `gemini-*` model goes straight to the Gemini API
+    # (key in .env) — no extension, no Flow tab, no reCAPTCHA, separate quota.
+    # Routed BEFORE the paygate-tier gate on purpose: the API path must work
+    # even when no Flow session exists at all.
+    if isinstance(image_model, str) and image_model.startswith("gemini-"):
+        from flowboard.services.comic import gemini_api
+        return await gemini_api.edit_image_variants(
+            bytes(image_bytes), prompt.strip(), reference_images,
+            image_model=image_model, aspect_ratio=aspect_ratio, mime=mime,
+            variant_count=variant_count,
+        )
+
     tier = paygate_tier or flow_client.paygate_tier
     if tier is None:
         # Same failure the worker handler raises — the extension hasn't sniffed
@@ -219,6 +253,11 @@ async def edit_image_variants(
 
         if not isinstance(resp, dict) or resp.get("error"):
             last_reason = str(resp.get("error") if isinstance(resp, dict) else resp)[:200]
+            if _is_non_retryable(last_reason):
+                # Quota / anti-abuse / content-filter: retrying is pure harm —
+                # surface immediately so the user can switch model or stop.
+                logger.warning("edit_image non-retryable error (failing fast): %s", last_reason)
+                raise BridgeEditError(last_reason, attempts=attempt)
             logger.warning("edit_image attempt %d/%d error: %s", attempt, max_attempts, last_reason)
             await _backoff(attempt, max_attempts)
             continue
@@ -305,6 +344,9 @@ async def upsample_image(
             continue
         if not isinstance(resp, dict) or resp.get("error"):
             last_reason = str(resp.get("error") if isinstance(resp, dict) else resp)[:200]
+            if _is_non_retryable(last_reason):
+                logger.warning("upsample non-retryable error (failing fast): %s", last_reason)
+                raise BridgeEditError(last_reason, attempts=attempt)
             logger.warning("upsample attempt %d/%d error: %s", attempt, max_attempts, last_reason)
             await _backoff(attempt, max_attempts)
             continue

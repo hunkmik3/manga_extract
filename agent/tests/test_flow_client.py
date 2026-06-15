@@ -200,3 +200,54 @@ async def test_handle_message_updates_target_connection_only():
     conns = {c["id"]: c for c in client.list_connections()}
     assert conns[cb]["email"] == "b@x.com"
     assert conns[ca]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_keyless_first_connection_yields_to_keyed_one():
+    """The extension opens one WS per browser context; the first is often a
+    keyless context (service worker). When a LATER connection announces it has
+    the Flow key / captures the token, it must take over the active slot —
+    otherwise the bridge stays pinned to the keyless connection and every call
+    401s while a perfectly good session sits ignored."""
+    client = FlowClient()
+    keyless = client.add_connection(FakeWs())   # becomes active (first)
+    keyed = client.add_connection(FakeWs())
+    assert client._active == keyless
+
+    # keyed context announces it actually holds the Flow key → auto-promote
+    await client.handle_message({"type": "extension_ready", "flowKeyPresent": True}, conn_id=keyed)
+    assert client._active == keyed
+    assert client._flow_key_present is True
+
+    # token then lands on the (now-active) keyed connection and mirrors out
+    await client.handle_message({"type": "token_captured", "flowKey": "k" * 50}, conn_id=keyed)
+    assert client._flow_key == "k" * 50
+    assert client._token_captured_at is not None
+
+
+@pytest.mark.asyncio
+async def test_keyed_active_connection_is_never_hijacked():
+    """Multi-account safety: once the active connection holds a key, another
+    connection announcing a key must NOT steal the slot mid-use."""
+    client = FlowClient()
+    first = client.add_connection(FakeWs())
+    await client.handle_message({"type": "token_captured", "flowKey": "a" * 50}, conn_id=first)
+    second = client.add_connection(FakeWs())
+    await client.handle_message({"type": "extension_ready", "flowKeyPresent": True}, conn_id=second)
+    assert client._active == first              # untouched
+    assert client._flow_key == "a" * 50
+
+
+@pytest.mark.asyncio
+async def test_active_close_promotes_keyed_connection_over_keyless():
+    client = FlowClient()
+    active = client.add_connection(FakeWs())
+    keyless = client.add_connection(FakeWs())
+    keyed = client.add_connection(FakeWs())
+    await client.handle_message({"type": "token_captured", "flowKey": "z" * 50}, conn_id=active)
+    await client.handle_message({"type": "extension_ready", "flowKeyPresent": True}, conn_id=keyed)
+    assert client._active == active
+    client.remove_connection(active)
+    assert client._active == keyed              # keyed wins over older keyless
+    assert client._flow_key_present is True
+    del keyless

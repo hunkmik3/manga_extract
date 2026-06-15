@@ -493,6 +493,21 @@ export async function uploadComicPages(
   return res.json() as Promise<RequestDTO>;
 }
 
+/**
+ * Upload a single character reference / turnaround sheet. Cached LOCALLY on the
+ * agent (no Flow) and returned as a media_id; the caller then dispatches
+ * `segment_character_sheet` to auto-crop it into face / body views.
+ */
+export async function uploadComicSheet(file: File): Promise<{ media_id: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch("/api/comic/upload-sheet", { method: "POST", body: form });
+  if (!res.ok) {
+    throw new Error(await extractErrorMessage(res));
+  }
+  return res.json() as Promise<{ media_id: string }>;
+}
+
 // ── Plans + Pipeline runs ────────────────────────────────────────────────────
 
 export interface PipelineRunDTO {
