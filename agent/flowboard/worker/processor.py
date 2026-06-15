@@ -1214,6 +1214,20 @@ def _assigned_char_desc(spec: object, chars: object) -> Optional[str]:
     return desc or None
 
 
+def _style_ref_bytes(media_id: object) -> Optional[bytes]:
+    """Load the project's STYLE FRAME reference image bytes (a uniform look
+    applied across every panel), or None."""
+    if not isinstance(media_id, str) or not media_id:
+        return None
+    p = media_service.cached_path(media_id)
+    if p is None:
+        return None
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
 def _panel_reference_bytes(
     panel_bytes: bytes,
     panel_params: dict,
@@ -1360,6 +1374,10 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     # CCIP appearance-match is the opt-in fallback; an explicit per-cell char_id
     # always wins regardless of this flag.
     auto_match = bool(params.get("auto_match", True))
+    # Project-wide STYLE FRAME: a uniform target art style applied to every panel
+    # (ref image and/or text descriptor). Loaded once for the whole combine.
+    style_bytes = await asyncio.to_thread(_style_ref_bytes, params.get("style_ref_media_id"))
+    style_desc = params.get("style_descriptor")
     pid = project_id.strip()
 
     raws = await asyncio.to_thread(
@@ -1378,9 +1396,12 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
         if raw is None:
             return None, None
         sp = spec if isinstance(spec, dict) else {}
-        refs = await asyncio.to_thread(
+        char_refs = await asyncio.to_thread(
             lambda: _panel_reference_bytes(raw, sp, chars, include_page=False, auto_match=auto_match)
         )
+        # Char identity/view refs first, then the project style frame LAST; cap
+        # at the bridge ref budget so the style ref never crowds out identity.
+        refs = (char_refs + [style_bytes])[:5] if style_bytes else char_refs
         # Pre-pad the panel onto a 9:16 canvas with edge-replicated seed bands
         # (same trick as the standalone clean node): the model then OUTPAINTS
         # the full frame instead of letterboxing. Without this, an extreme-wide
@@ -1401,9 +1422,13 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
                 outfit=sp.get("outfit"),
                 override_axes=sp.get("override_axes"),
             )
-            if refs
+            if char_refs
             else ""
         )
+        if sp.get("bg_type") not in prompts.NO_ENV_BG_TYPES:
+            clause += prompts.environment_clause(sp.get("env_descriptor"))
+        clause += prompts.mood_clause(sp.get("mood"))
+        clause += prompts.style_frame_clause(style_desc, has_ref=bool(style_bytes))
         prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16 + clause
         async with sem:
             try:
@@ -1491,13 +1516,16 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     image_model = image_model if isinstance(image_model, str) and image_model else None
     chars = params.get("characters")
     auto_match = bool(params.get("auto_match", True))
+    style_bytes = await asyncio.to_thread(_style_ref_bytes, params.get("style_ref_media_id"))
+    style_desc = params.get("style_descriptor")
 
     raw = await asyncio.to_thread(_source_image_bytes, panel)
     if raw is None:
         return {}, "no_source_image"
-    refs = await asyncio.to_thread(
+    char_refs = await asyncio.to_thread(
         lambda: _panel_reference_bytes(raw, panel, chars, include_page=False, auto_match=auto_match)
     )
+    refs = (char_refs + [style_bytes])[:5] if style_bytes else char_refs
     # Optional custom prompt — lets the user steer a single re-gen (e.g. "make
     # the lighting warmer") instead of the default clean+extend. Blank → default.
     custom = params.get("prompt")
@@ -1510,9 +1538,13 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
             outfit=panel.get("outfit"),
             override_axes=panel.get("override_axes"),
         )
-        if refs
+        if char_refs
         else ""
     )
+    if panel.get("bg_type") not in prompts.NO_ENV_BG_TYPES:
+        clause += prompts.environment_clause(panel.get("env_descriptor"))
+    clause += prompts.mood_clause(panel.get("mood"))
+    clause += prompts.style_frame_clause(style_desc, has_ref=bool(style_bytes))
     prompt = base + clause
 
     # Same 9:16 pre-pad as the combine path: give the model a full-frame canvas
@@ -1807,11 +1839,19 @@ async def _handle_tag_panels(params: dict) -> tuple[dict, Optional[str]]:
 
     tmpdir = tempfile.mkdtemp(prefix="flowboard-tag-")
 
+    from flowboard.services.llm.cli_utils import MAX_ATTACHMENTS
+
     def _prepare() -> Optional[tuple[list[str], list[str], int]]:
-        """Write cast samples + panel crops as files → (paths, cast_lines, n_panels)."""
+        """Write cast samples + panel crops as files → (paths, cast_lines, n_panels).
+        Total attachments are capped at MAX_ATTACHMENTS — panels (≤4) take
+        priority, the cast bank fills the rest."""
+        n_specs = min(len([s for s in specs[:4] if isinstance(s, dict)]), 4)
+        cast_budget = max(0, MAX_ATTACHMENTS - n_specs)
         paths: list[str] = []
         cast_lines: list[str] = []
         for c in chars:
+            if len(cast_lines) >= cast_budget:
+                break
             sid = c.get("sampleMediaId")
             p = media_service.cached_path(sid) if isinstance(sid, str) else None
             if p is None:
@@ -1867,6 +1907,148 @@ async def _handle_tag_panels(params: dict) -> tuple[dict, Optional[str]]:
     if tags is None:
         return {}, "bad_tag_response"
     return {"tags": tags, "node_id": params.get("__node_id")}, None
+
+
+# ── Comic pipeline — Director: chapter-wide SCENE / ENVIRONMENT segmentation ──
+# A cheap VLM pass (the wired LLM CLI — no Flow cost) reads the chapter's panels
+# in reading order and groups them by SETTING, so every panel of one scene gets
+# the SAME environment descriptor (an airport scene all shows the same airport).
+# Keyed by location_label, not a fragile running scene-id: a label seen again
+# later (a place the story revisits) reuses its canonical descriptor for free,
+# and same-label panels get byte-identical wording → strong consistency.
+
+_SCENE_SYSTEM = (
+    "You are a comic SCENE annotator. You are given comic panels in READING ORDER. For EACH panel "
+    "decide its SETTING and return a JSON object: "
+    "{\"panel\": <1-based index>, \"location_label\": <short stable name for the place, e.g. "
+    "\"forest clearing\", \"HQ control room\", \"airport interior\">, \"env_descriptor\": <ONE "
+    "concrete sentence describing the background/setting for image generation: architecture or "
+    "terrain, time of day, palette>, \"bg_type\": one of \"real-location\" (a real place is or "
+    "would be shown), \"flat-band\" (plain/solid/dramatic colour band, no real setting), "
+    "\"abstract-action\" (speed-lines / impact / emotional rays, no real setting), \"mood\": "
+    "<optional short tag like \"flashback-pale\", \"night\", \"\">}. "
+    "REUSE an earlier location_label verbatim when a panel returns to a place already listed under "
+    "\"Locations so far\". Respond with ONLY a JSON array, one object per panel, in order. No prose."
+)
+
+
+def _parse_scene_tags(text: str, n_panels: int) -> Optional[list[dict]]:
+    import json
+    import re
+
+    m = re.search(r"\[.*\]", (text or "").strip(), re.DOTALL)
+    if not m:
+        return None
+    try:
+        arr = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(arr, list):
+        return None
+    out: list[dict] = []
+    for i in range(n_panels):
+        e = arr[i] if i < len(arr) and isinstance(arr[i], dict) else {}
+        label = str(e.get("location_label") or "").strip()
+        bg = str(e.get("bg_type") or "").strip().lower()
+        out.append({
+            "location_label": label or None,
+            "env_descriptor": str(e.get("env_descriptor") or "").strip() or None,
+            "bg_type": bg if bg in ("real-location", "flat-band", "abstract-action") else "real-location",
+            "mood": str(e.get("mood") or "").strip() or None,
+        })
+    return out
+
+
+async def _handle_scene_assign_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Tag every panel (chapter-wide, reading order) with its scene SETTING via
+    the configured Vision provider, then canonicalize: all panels sharing a
+    location_label get that label's first env_descriptor. Returns per-panel tags
+    (aligned to input order) + a locations map. Local + LLM CLI only (no Flow)."""
+    import shutil
+    import tempfile
+
+    from flowboard.services.llm.base import LLMError
+    from flowboard.services.llm.registry import run_llm
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+    # The wired vision CLIs cap attachments at MAX_ATTACHMENTS (10) per call, so
+    # a scene chunk is ≤ that; cross-chunk continuity is carried via the
+    # "Locations so far" text.
+    from flowboard.services.llm.cli_utils import MAX_ATTACHMENTS
+    chunk_size = max(4, min(int(params.get("chunk_size") or MAX_ATTACHMENTS), MAX_ATTACHMENTS))
+
+    # Crop every panel up front (off-thread); keep only the readable ones, but
+    # remember each one's original index so tags map back exactly.
+    def _crops() -> list[tuple[int, bytes]]:
+        out = []
+        for i, s in enumerate(specs):
+            if not isinstance(s, dict):
+                continue
+            b = _source_image_bytes(s)
+            if b:
+                out.append((i, b))
+        return out
+
+    crops = await asyncio.to_thread(_crops)
+    if not crops:
+        return {}, "no_source_image"
+
+    tags_by_index: dict[int, dict] = {}
+    locations: dict[str, str] = {}  # label → canonical descriptor (first seen)
+    for start in range(0, len(crops), chunk_size):
+        chunk = crops[start:start + chunk_size]
+        tmpdir = tempfile.mkdtemp(prefix="flowboard-scene-")
+        try:
+            def _write() -> list[str]:
+                paths = []
+                for j, (_idx, b) in enumerate(chunk):
+                    p = f"{tmpdir}/panel_{j}.png"
+                    with open(p, "wb") as f:
+                        f.write(b)
+                    paths.append(p)
+                return paths
+            paths = await asyncio.to_thread(_write)
+            seen = "; ".join(f"\"{lbl}\"" for lbl in list(locations)[:30]) or "(none yet)"
+            user = (
+                f"Locations so far: {seen}.\n"
+                f"Here are {len(paths)} comic panels in reading order. Tag all {len(paths)}."
+            )
+            try:
+                text = await run_llm("vision", user, system_prompt=_SCENE_SYSTEM,
+                                     attachments=paths, timeout=180.0)
+            except LLMError as exc:
+                return {}, f"vision_failed: {str(exc)[:160]}"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        parsed = _parse_scene_tags(text, len(chunk))
+        if parsed is None:
+            return {}, "bad_scene_response"
+        for (orig_idx, _b), tag in zip(chunk, parsed):
+            label = tag["location_label"]
+            if label and tag["env_descriptor"] and label not in locations:
+                locations[label] = tag["env_descriptor"]
+            tags_by_index[orig_idx] = tag
+
+    # Canonicalize: every panel inherits its label's first descriptor, so a
+    # revisited place reads identically across the whole chapter.
+    result_tags: list[dict] = []
+    for i in range(len(specs)):
+        t = tags_by_index.get(i)
+        if t is None:
+            result_tags.append({"location_label": None, "env_descriptor": None, "bg_type": "real-location", "mood": None})
+            continue
+        canon = locations.get(t["location_label"]) if t["location_label"] else None
+        result_tags.append({**t, "env_descriptor": canon or t["env_descriptor"]})
+
+    return {
+        "tags": result_tags,
+        "locations": locations,
+        "scene_count": len(locations),
+        "node_id": params.get("__node_id"),
+    }, None
 
 
 async def _handle_segment_character_sheet(params: dict) -> tuple[dict, Optional[str]]:
@@ -1990,6 +2172,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "segment_character_sheet": _handle_segment_character_sheet,
     "tag_panels": _handle_tag_panels,
     "magi_assign_panels": _handle_magi_assign_panels,
+    "scene_assign_panels": _handle_scene_assign_panels,
     "upsample_image": _handle_upsample_image,
 }
 

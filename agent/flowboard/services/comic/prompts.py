@@ -143,6 +143,75 @@ _STYLE_OVERRIDE = (
 )
 
 
+# Background types where an environment MUST NOT be imposed — the blank /
+# speed-line / dramatic-band backdrop is an intentional storytelling device, not
+# a missing background. The Director's per-panel classifier tags these; combine/
+# regen then skip the environment clause for them.
+NO_ENV_BG_TYPES = ("flat-band", "abstract-action")
+
+
+def environment_clause(env_descriptor: str | None = None) -> str:
+    """Clause that anchors a panel's SETTING to its scene's environment, so every
+    panel of one sequence shares a consistent background (e.g. all airport panels
+    show the same airport). Applies the setting to whatever background is visible
+    or newly extended — never adds characters/props not in the source, never
+    touches the panel's own pose/framing."""
+    desc = env_descriptor.strip() if isinstance(env_descriptor, str) else ""
+    if not desc:
+        return ""
+    return (
+        f" SCENE SETTING — this panel takes place here: {desc}. Render any visible background, and "
+        "any area you extend to fill the frame, to match this setting consistently with the rest of "
+        "the scene. Keep the panel's own characters, poses, framing, and composition unchanged; do "
+        "NOT introduce new characters or objects that are not in the source panel."
+    )
+
+
+def mood_clause(mood: str | None) -> str:
+    """A light atmosphere/grade modifier for a panel, from the scene's mood tag.
+    Only KNOWN moods emit a clause (free-text VLM moods are ignored) so arbitrary
+    model output never leaks into the prompt. Flashback panels keep their pale
+    wash — an explicit storytelling signal that a full render would erase."""
+    m = mood.strip().lower() if isinstance(mood, str) else ""
+    if not m:
+        return ""
+    if "flashback" in m or "memory" in m or "pale" in m:
+        return (
+            " Render this panel as a flashback/memory: a pale, soft, desaturated wash with lower "
+            "contrast and muted colours — keep this faded look, do not render it as a full-saturation present-day scene."
+        )
+    if "night" in m or "dark" in m:
+        return " Light this panel as a night scene: cool, low-key lighting and muted tones."
+    if "sunset" in m or "dusk" in m or "golden" in m:
+        return " Light this panel with warm golden-hour / dusk lighting."
+    return ""
+
+
+def style_frame_clause(descriptor: str | None = None, *, has_ref: bool = False) -> str:
+    """Clause that pins a project-wide STYLE FRAME onto a panel render — a
+    uniform target art style applied across every panel of the chapter.
+
+    The style is supplied as a reference IMAGE (``has_ref``), a text
+    ``descriptor``, or both. Critically it must apply ONLY to the rendering
+    style, never drag the reference's subject/composition into the panel (the
+    same leak guard as character refs)."""
+    desc = descriptor.strip() if isinstance(descriptor, str) else ""
+    if has_ref:
+        mid = f" Target style notes: {desc}." if desc else ""
+        return (
+            " Render the FINAL image in the art style of the attached STYLE-REFERENCE image: match "
+            "its line weight, shading and rendering technique, colour palette, lighting treatment, "
+            "and level of finish." + mid + " Use the style reference ONLY for visual style — do NOT "
+            "copy its subject, characters, poses, composition, or background into this panel."
+        )
+    if desc:
+        return (
+            f" Render the FINAL image in this target art style: {desc}. Keep the source panel's own "
+            "content, characters, pose, and composition; change only the rendering style."
+        )
+    return ""
+
+
 def _char_sentence(char_name: str | None, char_desc: str | None) -> str:
     """Verbatim character anchor appended to every prompt that carries refs.
     Reusing the EXACT same descriptor wording across panels measurably improves

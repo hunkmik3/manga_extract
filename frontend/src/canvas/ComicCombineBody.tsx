@@ -5,6 +5,7 @@ import {
   addCharacter,
   createRequest,
   findCharacterDb,
+  findStyleFrame,
   patchComicNode,
   promoteCellToCharacter,
   relayoutComicCombineChains,
@@ -32,9 +33,12 @@ interface CellAssign {
   override?: string[];
   shot?: string;        // closeup | medium | wide
   orientation?: string; // front | profile | back
+  env?: string;         // scene setting descriptor (from 🎬 Auto-scenes)
+  bgType?: string;      // real-location | flat-band | abstract-action
+  mood?: string;        // flashback-pale | night | … (atmosphere grade)
 }
 
-/** Build a combine/regen panel spec, merging the per-cell character assignment. */
+/** Build a combine/regen panel spec, merging the per-cell character + scene assignment. */
 function buildCellSpec(p: PanelSpec, a: CellAssign | undefined): Record<string, unknown> {
   const s: Record<string, unknown> = { page_media_id: p.pageMediaId, box: p.box };
   if (a?.charId) s.char_id = a.charId;
@@ -42,6 +46,9 @@ function buildCellSpec(p: PanelSpec, a: CellAssign | undefined): Record<string, 
   if (Array.isArray(a?.override) && a.override.length) s.override_axes = a.override;
   if (a?.shot) s.shot = a.shot;
   if (a?.orientation) s.orientation = a.orientation;
+  if (a?.env && a.env.trim()) s.env_descriptor = a.env.trim();
+  if (a?.bgType) s.bg_type = a.bgType;
+  if (a?.mood) s.mood = a.mood;
   return s;
 }
 
@@ -133,6 +140,15 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     }
   }
 
+  // Edit a cell's scene setting by hand — fixes a mis-tagged insert/cutaway
+  // panel (e.g. a TV-screen or map insert that 🎬 grouped with the wrong scene).
+  function editEnv(i: number) {
+    const cur = cellAssign[String(i)]?.env ?? "";
+    const next = window.prompt("Scene setting for this cell (blank = none):", cur);
+    if (next === null) return;
+    setCellAssign(i, { env: next.trim() || undefined });
+  }
+
   // 🔒 force — when on, the canon ref OVERRIDES the source's face/hair + outfit
   // (for off-model panels). Off = gentle identity hint, source stays faithful.
   function toggleForce(i: number) {
@@ -194,6 +210,14 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     setCellAssign(i, { charId: value || undefined });
   }
 
+  // Merge the project-wide style frame (ref image + descriptor) into a request's
+  // params. Read live from the board so the freshest style applies.
+  function applyStyleFrame(params: Record<string, unknown>) {
+    const sf = findStyleFrame();
+    if (sf?.styleRefMediaId) params.style_ref_media_id = sf.styleRefMediaId;
+    if (sf?.styleDescriptor && sf.styleDescriptor.trim()) params.style_descriptor = sf.styleDescriptor.trim();
+  }
+
   async function project(opts?: { needsFlow?: boolean }): Promise<string | null> {
     // API engine doesn't touch Flow at all — skip the board→Flow-project
     // handshake (which needs a live extension token) and use a placeholder id,
@@ -222,6 +246,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     if (characterRefs?.length) params.characters = characterRefs;
     params.auto_match = useCharacterRefs;
     params.image_model = imageModel;
+    applyStyleFrame(params);
     runComicRequest(
       rfId,
       () => createRequest({ type: "combine_panels", node_id: parseInt(rfId, 10), params }),
@@ -283,6 +308,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       if (L.characterRefs?.length) params.characters = L.characterRefs;
       params.auto_match = L.useCharacterRefs;
       params.image_model = L.imageModel;
+      applyStyleFrame(params);
       if (L.regenPrompt.trim()) params.prompt = L.regenPrompt.trim();
       if (L.regenVariants > 1) params.variant_count = L.regenVariants;
       try {
@@ -557,6 +583,12 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                     style={{ fontSize: 8, opacity: 0.55, margin: "1px 0 0", textAlign: "center" }}
                   >🎬 {camTag}</p>
                 ) : null}
+                <p
+                  className="nodrag"
+                  onClick={() => editEnv(i)}
+                  title={assign.env ? `Scene setting (click to edit): ${assign.env}` : "Set a scene setting for this cell"}
+                  style={{ fontSize: 8, opacity: assign.env ? 0.55 : 0.35, margin: 0, textAlign: "center", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" }}
+                >🏞 {assign.env || "set scene ✎"}</p>
               </div>
             );
           })}
@@ -668,6 +700,14 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                       title="Director camera tags (shot scale · facing). Drive which sheet view is attached; 🔒 is auto-disabled on back/profile."
                       style={{ fontSize: 8, opacity: 0.55, margin: "1px 0 0", textAlign: "center" }}
                     >🎬 {camTag}</p>
+                  ) : null}
+                  {cells[i] ? (
+                    <p
+                      className="nodrag"
+                      onClick={() => editEnv(i)}
+                      title={assign.env ? `Scene setting (click to edit): ${assign.env}` : "Set a scene setting for this cell"}
+                      style={{ fontSize: 8, opacity: assign.env ? 0.55 : 0.35, margin: 0, textAlign: "center", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" }}
+                    >🏞 {assign.env || "set scene ✎"}</p>
                   ) : null}
                 </div>
               );

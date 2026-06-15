@@ -42,7 +42,7 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
   const isImporting = status === "queued" || status === "running";
 
   const [draftFolder, setDraftFolder] = useState(folder);
-  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download" | "assign">(null);
+  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download" | "assign" | "scenes">(null);
   const [spawnErr, setSpawnErr] = useState<string | undefined>();
   const [assignInfo, setAssignInfo] = useState<string | undefined>();
   const dirInputRef = useRef<HTMLInputElement | null>(null);
@@ -249,6 +249,55 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
     }
   }
 
+  // 🎬 Director (chapter-wide WHERE): a VLM reads every combine cell in reading
+  // order, groups them by SETTING, and writes each cell's scene environment +
+  // background type into the combine nodes' per-cell settings. No Flow calls.
+  async function sceneAssignChapter() {
+    if (busy) return;
+    const store = useBoardStore.getState();
+    const combineNodes = store.nodes.filter((n) => n.data.type === "comic_combine");
+    if (combineNodes.length === 0) { setSpawnErr("Create combine nodes first (③)"); return; }
+    setSpawnErr(undefined);
+    setAssignInfo(undefined);
+    setBusy("scenes");
+    try {
+      // Gather every combine cell in reading order, remembering (node, cell) so
+      // results map back exactly.
+      const ordered: Array<{ node: string; cell: number; page_media_id: string; box: unknown }> = [];
+      for (const n of combineNodes) {
+        const panels = Array.isArray(n.data.panels) ? (n.data.panels as Array<Record<string, unknown>>) : [];
+        panels.slice(0, 4).forEach((p, i) => {
+          const pid = p.pageMediaId as string | undefined;
+          if (typeof pid === "string" && pid && p.box) ordered.push({ node: n.id, cell: i, page_media_id: pid, box: p.box });
+        });
+      }
+      if (ordered.length === 0) { setSpawnErr("No combine cells found"); setBusy(null); return; }
+      const result = await runRequestToResult(
+        createRequest({ type: "scene_assign_panels", node_id: parseInt(rfId, 10), params: { panels: ordered.map((o) => ({ page_media_id: o.page_media_id, box: o.box })) } }),
+      );
+      const tags = (result.tags as Array<{ env_descriptor?: string | null; bg_type?: string | null; mood?: string | null }>) ?? [];
+      // Merge env + bg_type into each combine node's cellAssign (preserving
+      // char/override choices). Build per-node from the freshest stored map.
+      const byNode = new Map<string, Record<string, Record<string, unknown>>>();
+      ordered.forEach((o, i) => {
+        const t = tags[i];
+        if (!t) return;
+        if (!byNode.has(o.node)) {
+          const node = store.nodes.find((n) => n.id === o.node);
+          byNode.set(o.node, { ...((node?.data.cellAssign as Record<string, Record<string, unknown>>) ?? {}) });
+        }
+        const ca = byNode.get(o.node)!;
+        ca[String(o.cell)] = { ...(ca[String(o.cell)] ?? {}), env: t.env_descriptor ?? undefined, bgType: t.bg_type ?? undefined, mood: t.mood ?? undefined };
+      });
+      for (const [nodeId, ca] of byNode) patchComicNode(nodeId, { cellAssign: ca });
+      setAssignInfo(`🎬 ${Number(result.scene_count ?? 0)} scene(s) tagged across ${ordered.length} cell(s)`);
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   // ③ flatten panels in reading order → groups of 4 → one Combine (2×2) node each
   async function spawnCombine() {
     if (busy) return;
@@ -390,6 +439,15 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
             title="Director (local Magi v2): read the whole chapter with the Character DB as a named bank and auto-assign each panel's character into every combine cell. No Flow calls. First run loads the model (~30s), then ~2-3s per page."
           >
             {busy === "assign" ? "Assigning… (local model)" : "🪄 Auto-assign characters (chapter)"}
+          </button>
+          <button
+            className="comic-btn"
+            onClick={sceneAssignChapter}
+            disabled={busy !== null}
+            style={{ fontSize: 12, padding: "4px 10px" }}
+            title="Director (VLM): read every combine cell in reading order, group them by scene/setting, and write each cell's environment + background type. Uses your Vision provider (no Flow gen). Run AFTER ③ Combine."
+          >
+            {busy === "scenes" ? "Reading scenes…" : "🎬 Auto-scenes (environment)"}
           </button>
         </>
       )}

@@ -536,6 +536,189 @@ async def test_magi_assign_panels_errors():
     assert (await _handle_magi_assign_panels(bad))[1] == "no_readable_inputs"
 
 
+@pytest.mark.asyncio
+async def test_combine_attaches_style_frame_ref_and_clause():
+    """A project STYLE FRAME (ref image + descriptor) attaches its image as the
+    LAST reference and weaves the style clause into the prompt."""
+    page = _ingest(_png(900, 1200))
+    style = _ingest(_png(64, 64, 30))
+    specs = [{"page_media_id": page, "box": {"x": 10, "y": 10, "w": 400, "h": 180}}]
+
+    edit = AsyncMock(return_value=_png(400, 711))
+    with patch("flowboard.services.comic.bridge.edit_image", edit):
+        _, err = await _handle_combine_panels({
+            "project_id": "p", "panels": specs,
+            "style_ref_media_id": style, "style_descriptor": "flat cel-shaded webtoon, pastel palette",
+        })
+    assert err is None
+    refs = edit.await_args.kwargs["reference_images"]
+    assert refs == [media_service.cached_path(style).read_bytes()]   # style ref attached
+    prompt = edit.await_args.args[1]
+    assert "STYLE-REFERENCE image" in prompt
+    assert "flat cel-shaded webtoon, pastel palette" in prompt
+
+
+@pytest.mark.asyncio
+async def test_combine_style_descriptor_only_no_extra_ref():
+    page = _ingest(_png(900, 1200))
+    specs = [{"page_media_id": page, "box": {"x": 10, "y": 10, "w": 400, "h": 180}}]
+    edit = AsyncMock(return_value=_png(400, 711))
+    with patch("flowboard.services.comic.bridge.edit_image", edit):
+        _, err = await _handle_combine_panels({
+            "project_id": "p", "panels": specs, "style_descriptor": "1990s anime film cel",
+        })
+    assert err is None
+    assert edit.await_args.kwargs["reference_images"] is None        # no ref, text only
+    prompt = edit.await_args.args[1]
+    assert "1990s anime film cel" in prompt and "STYLE-REFERENCE image" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_combine_style_ref_appends_after_character_refs():
+    """Style ref must come AFTER the character refs (identity primacy), still
+    within the ref budget."""
+    page = _ingest(_png(900, 1200))
+    cref = _ingest(_png(80, 120, 200))
+    style = _ingest(_png(64, 64, 30))
+    specs = [{"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 180}, "char_id": "char_0"}]
+    chars = [{"id": "char_0", "name": "Zero", "sampleMediaId": cref, "refMediaIds": [cref]}]
+    edit = AsyncMock(return_value=_png(400, 711))
+    with patch("flowboard.services.comic.bridge.edit_image", edit):
+        _, err = await _handle_combine_panels({
+            "project_id": "p", "panels": specs, "characters": chars, "style_ref_media_id": style,
+        })
+    assert err is None
+    refs = edit.await_args.kwargs["reference_images"]
+    assert refs == [media_service.cached_path(cref).read_bytes(),
+                    media_service.cached_path(style).read_bytes()]   # char first, style last
+
+
+@pytest.mark.asyncio
+async def test_combine_injects_env_descriptor_unless_abstract_bg():
+    page = _ingest(_png(900, 1200))
+    specs = [
+        {"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 180},
+         "env_descriptor": "rocky mountain slope, pine trees, overcast"},
+        {"page_media_id": page, "box": {"x": 0, "y": 200, "w": 400, "h": 180},
+         "env_descriptor": "rocky mountain slope, pine trees, overcast", "bg_type": "abstract-action"},
+    ]
+    prompts_seen = []
+    async def fake_edit(image_bytes, prompt, **kw):
+        prompts_seen.append(prompt)
+        return _png(400, 711)
+    with patch("flowboard.services.comic.bridge.edit_image", side_effect=fake_edit):
+        _, err = await _handle_combine_panels({"project_id": "p", "panels": specs})
+    assert err is None
+    # The two cleans run concurrently → order-independent: exactly ONE prompt
+    # carries the setting (the real-location panel), the abstract one has none.
+    assert sum("SCENE SETTING" in p for p in prompts_seen) == 1
+    assert any("SCENE SETTING" in p and "rocky mountain slope" in p for p in prompts_seen)
+
+
+def test_mood_clause_known_only():
+    from flowboard.services.comic import prompts
+    assert prompts.mood_clause(None) == "" and prompts.mood_clause("whatever-random") == ""
+    assert "flashback" in prompts.mood_clause("flashback-pale").lower()
+    assert "night scene" in prompts.mood_clause("Night").lower()
+    assert "golden-hour" in prompts.mood_clause("dusk").lower()
+
+
+@pytest.mark.asyncio
+async def test_combine_injects_mood_clause():
+    page = _ingest(_png(900, 1200))
+    specs = [{"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 180}, "mood": "flashback-pale"}]
+    seen = []
+    async def fake_edit(image_bytes, prompt, **kw):
+        seen.append(prompt)
+        return _png(400, 711)
+    with patch("flowboard.services.comic.bridge.edit_image", side_effect=fake_edit):
+        _, err = await _handle_combine_panels({"project_id": "p", "panels": specs})
+    assert err is None
+    assert "flashback/memory" in seen[0]
+
+
+def test_environment_clause_variants():
+    from flowboard.services.comic import prompts
+    assert prompts.environment_clause() == "" and prompts.environment_clause("  ") == ""
+    c = prompts.environment_clause("airport interior, glass roof, daylight")
+    assert "airport interior, glass roof, daylight" in c and "do NOT introduce new characters" in c
+
+
+def test_parse_scene_tags_normalizes_and_pads():
+    from flowboard.worker.processor import _parse_scene_tags
+    out = _parse_scene_tags(
+        'noise [{"panel":1,"location_label":"forest","env_descriptor":"green woods","bg_type":"real-location"},'
+        '{"panel":2,"location_label":"","env_descriptor":"","bg_type":"speedlines"}]', 3)
+    assert out[0]["location_label"] == "forest" and out[0]["bg_type"] == "real-location"
+    assert out[1]["location_label"] is None and out[1]["bg_type"] == "real-location"  # bad bg → default
+    assert out[2] == {"location_label": None, "env_descriptor": None, "bg_type": "real-location", "mood": None}
+    assert _parse_scene_tags("no json", 1) is None
+
+
+@pytest.mark.asyncio
+async def test_scene_assign_canonicalizes_env_per_location():
+    """Same location_label → same canonical env descriptor across the chapter
+    (so a revisited place reads identically), keyed by label not scene-id."""
+    from flowboard.worker.processor import _handle_scene_assign_panels
+    page = _ingest(_png(800, 1600))
+    specs = [
+        {"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 300}},
+        {"page_media_id": page, "box": {"x": 0, "y": 300, "w": 400, "h": 300}},
+        {"page_media_id": page, "box": {"x": 0, "y": 600, "w": 400, "h": 300}},
+    ]
+    async def fake_llm(feature, user_prompt, **kw):
+        assert feature == "vision"
+        return ('[{"panel":1,"location_label":"HQ room","env_descriptor":"blue-tiled control room","bg_type":"real-location"},'
+                '{"panel":2,"location_label":"forest","env_descriptor":"green woods at dusk","bg_type":"real-location"},'
+                '{"panel":3,"location_label":"HQ room","env_descriptor":"blue tiles different wording","bg_type":"real-location"}]')
+    with patch("flowboard.services.llm.registry.run_llm", side_effect=fake_llm):
+        result, err = await _handle_scene_assign_panels({"panels": specs})
+    assert err is None
+    tags = result["tags"]
+    # panel 3 revisits "HQ room" → inherits panel 1's canonical descriptor
+    assert tags[2]["env_descriptor"] == "blue-tiled control room"
+    assert tags[0]["env_descriptor"] == "blue-tiled control room"
+    assert result["scene_count"] == 2  # two distinct locations
+
+
+@pytest.mark.asyncio
+async def test_scene_assign_chunks_within_attachment_cap():
+    """>10 panels must be split into chunks each within the vision CLI's 10-image
+    cap (the bug that crashed 🎬 with 14 attachments)."""
+    from flowboard.worker.processor import _handle_scene_assign_panels
+    from flowboard.services.llm.cli_utils import MAX_ATTACHMENTS
+    page = _ingest(_png(400, 4000))
+    specs = [{"page_media_id": page, "box": {"x": 0, "y": i * 200, "w": 300, "h": 180}} for i in range(12)]
+    calls = []
+    async def fake_llm(feature, user_prompt, **kw):
+        n = len(kw.get("attachments") or [])
+        calls.append(n)
+        return "[" + ",".join('{"location_label":"x","env_descriptor":"d","bg_type":"real-location"}' for _ in range(n)) + "]"
+    with patch("flowboard.services.llm.registry.run_llm", side_effect=fake_llm):
+        result, err = await _handle_scene_assign_panels({"panels": specs})
+    assert err is None
+    assert len(calls) >= 2 and all(n <= MAX_ATTACHMENTS for n in calls)  # chunked, each ≤ cap
+    assert len(result["tags"]) == 12
+
+
+@pytest.mark.asyncio
+async def test_scene_assign_errors():
+    from flowboard.worker.processor import _handle_scene_assign_panels
+    assert (await _handle_scene_assign_panels({}))[1] == "missing_panels"
+    bad = {"panels": [{"page_media_id": "ghost", "box": {"x": 0, "y": 0, "w": 9, "h": 9}}]}
+    assert (await _handle_scene_assign_panels(bad))[1] == "no_source_image"
+
+
+def test_style_frame_clause_variants():
+    from flowboard.services.comic import prompts
+    assert prompts.style_frame_clause() == ""                        # nothing → empty
+    only_text = prompts.style_frame_clause("noir ink")
+    assert "noir ink" in only_text and "STYLE-REFERENCE image" not in only_text
+    with_ref = prompts.style_frame_clause("noir ink", has_ref=True)
+    assert "STYLE-REFERENCE image" in with_ref and "noir ink" in with_ref
+    assert "do NOT" in prompts.style_frame_clause(has_ref=True)       # leak guard present
+
+
 def test_combine_reference_clause_default_and_overrides():
     from flowboard.services.comic import prompts
     # default = the gentle faithful hint + the shot/framing lock

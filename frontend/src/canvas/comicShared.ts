@@ -252,6 +252,23 @@ export function promoteCellToCharacter(charId: string, mediaId: string): boolean
   return true;
 }
 
+export interface StyleFrame {
+  styleRefMediaId?: string;
+  styleDescriptor?: string;
+}
+/** Project-wide STYLE FRAME (uniform target art style applied to every panel),
+ * stored on the comic_chars node alongside the character canon. */
+export function findStyleFrame(): StyleFrame | null {
+  const { nodes } = useBoardStore.getState();
+  for (const n of nodes) {
+    if (n.data.type !== "comic_chars") continue;
+    const ref = typeof n.data.styleRefMediaId === "string" ? n.data.styleRefMediaId : undefined;
+    const desc = typeof n.data.styleDescriptor === "string" ? n.data.styleDescriptor : undefined;
+    if (ref || desc) return { styleRefMediaId: ref, styleDescriptor: desc };
+  }
+  return null;
+}
+
 /** The board's comic_chars node, creating one if none exists (so cold-start —
  * defining characters by hand instead of via CCIP clustering — works). Returns
  * its rfId, or null if the board isn't ready. */
