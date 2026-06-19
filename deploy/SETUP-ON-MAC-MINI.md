@@ -47,8 +47,11 @@ Key facts about this app:
 ## Step 0 — Collect inputs (ASK USER first)
 
 Ask the user for, and write down:
-1. **Repo location** on this machine (full path), or how to obtain it (git
-   clone URL / transfer). Everything below uses `$ROOT` = that path.
+1. **Where to install** — a folder path; default `$HOME/flow-studio`. This Mac
+   is **bare** (no code yet), so you will `git clone` it in Step 2. Confirm the
+   user can authenticate to the **private** GitHub repo
+   `hunkmik3/manga_extract` (a GitHub account with access; you'll use
+   `gh auth login`). `$ROOT` = this install folder for everything below.
 2. **Public hostname** to use, e.g. `flow.theircompany.com`. They must have
    that **domain on their Cloudflare account** (named tunnels require it).
 3. **Who can log in** — an email domain (e.g. `@otsulabs.com`) or an explicit
@@ -57,11 +60,10 @@ Ask the user for, and write down:
 4. The **`.env` secret values** (see Step 4). Have them paste the values; never
    print them back in full and never commit them.
 
-Then set, in your shell for the rest of the session:
+Then set, for the rest of the session (the folder is created by the clone in
+Step 2):
 ```bash
-ROOT="<the path the user gave>"        # e.g. /Users/<user>/flow-studio
-cd "$ROOT"
-test -f "$ROOT/agent/flowboard/main.py" && echo "repo OK" || echo "WRONG PATH — re-ask user"
+ROOT="$HOME/flow-studio"               # or the path the user chose
 ```
 
 ---
@@ -71,20 +73,31 @@ test -f "$ROOT/agent/flowboard/main.py" && echo "repo OK" || echo "WRONG PATH �
 ```bash
 # Homebrew
 which brew || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-# Tools
-brew install python@3.12 node cloudflared
+# Tools (git + gh are for cloning the private repo in Step 2)
+brew install git gh python@3.12 node cloudflared
 python3 --version    # expect 3.11+
 node --version       # expect 18+
 cloudflared --version
+gh --version
 ```
 
 ---
 
-## Step 2 — Code + Python deps
+## Step 2 — Get the code + Python deps
 
+**2a. Clone the repo** (it's private — authenticate first). The Flow Studio code
+lives on the **`feat/windows-desktop-build`** branch.
+```bash
+gh auth login                 # ASK USER to complete the device/browser login
+git clone --branch feat/windows-desktop-build \
+  https://github.com/hunkmik3/manga_extract.git "$ROOT"
+cd "$ROOT"
+test -f "$ROOT/agent/flowboard/main.py" && echo "repo OK" || echo "clone failed — re-check auth/branch"
+```
+
+**2b. Python venv + deps**
 ```bash
 cd "$ROOT"
-# (if not cloned yet, clone/transfer first, then cd in)
 python3 -m venv agent/.venv
 agent/.venv/bin/python3 -m pip install --upgrade pip
 agent/.venv/bin/python3 -m pip install -r agent/requirements.txt
