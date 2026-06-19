@@ -45,12 +45,11 @@ export type FlowAspect = (typeof FLOW_ASPECTS)[number];
 export const FLOW_SIZES = ["1K", "2K", "4K"] as const;
 export type FlowSize = (typeof FLOW_SIZES)[number];
 
-// Image engine behind the studio. "gemini" = direct Gemini API key (refs/edit
-// work locally, sent inline). "atrium" = Atrium passthrough (refs/edit need a
-// public media URL / tunnel; plain text→image works anywhere).
+// Image engine behind the studio. Atrium passthrough is the only engine; the
+// direct-Gemini option was retired. ("gemini" stays in the type only as the
+// backend's internal fallback if Atrium can't read a referenced image.)
 export type FlowProvider = "gemini" | "atrium";
 export const FLOW_PROVIDERS: { id: FlowProvider; label: string }[] = [
-  { id: "gemini", label: "Gemini trực tiếp" },
   { id: "atrium", label: "Atrium" },
 ];
 
@@ -151,7 +150,7 @@ function loadPersisted(): { settings: FlowGenSettings; recentPrompts: string[] }
     count: 2,
     model: "gemini-2.5-flash-image", // by id, not index — cheapest default, order-independent
     size: "1K",
-    provider: "gemini",
+    provider: "atrium",
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -163,10 +162,10 @@ function loadPersisted(): { settings: FlowGenSettings; recentPrompts: string[] }
         aspect: (FLOW_ASPECTS as readonly string[]).includes(s.aspect ?? "")
           ? (s.aspect as FlowAspect)
           : fallback.aspect,
-        count: s.count && s.count >= 1 && s.count <= 2 ? s.count : fallback.count,
+        count: s.count && s.count >= 1 && s.count <= 4 ? s.count : fallback.count,
         model: FLOW_MODELS.some((m) => m.id === s.model) ? (s.model as string) : fallback.model,
         size: (FLOW_SIZES as readonly string[]).includes(s.size ?? "") ? (s.size as FlowSize) : fallback.size,
-        provider: s.provider === "atrium" ? "atrium" : "gemini",
+        provider: "atrium", // Gemini engine retired — always Atrium
       },
       recentPrompts: Array.isArray(p.recentPrompts) ? p.recentPrompts.slice(0, 8) : [],
     };

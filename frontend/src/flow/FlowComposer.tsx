@@ -4,7 +4,6 @@ import {
   CHAR_PREFIX,
   FLOW_ASPECTS,
   FLOW_MODELS,
-  FLOW_PROVIDERS,
   FLOW_SIZES,
   SCENE_PREFIX,
   deriveGroups,
@@ -333,21 +332,6 @@ export function FlowComposer() {
           {openSet && (
             <div className="fc__pop" role="dialog">
               <div className="fc__pop-section">
-                <label className="fc__pop-label">Engine</label>
-                <div className="fc__seg">
-                  {FLOW_PROVIDERS.map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      className={`fc__seg-btn${settings.provider === p.id ? " is-on" : ""}`}
-                      onClick={() => setSettings({ provider: p.id })}
-                    >
-                      {p.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="fc__pop-section">
                 <label className="fc__pop-label">Model</label>
                 <select className="fc__select" value={settings.model} onChange={(e) => setSettings({ model: e.target.value })}>
                   {FLOW_MODELS.map((m) => (
@@ -368,7 +352,7 @@ export function FlowComposer() {
               <div className="fc__pop-section">
                 <label className="fc__pop-label">Số lượng</label>
                 <div className="fc__chips">
-                  {[1, 2].map((n) => (
+                  {[1, 2, 3, 4].map((n) => (
                     <button key={n} type="button" className={`fc__chip${settings.count === n ? " is-on" : ""}`} onClick={() => setSettings({ count: n })}>
                       {n}x
                     </button>
