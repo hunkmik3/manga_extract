@@ -29,11 +29,15 @@ const SAFE_DEVICE_PX = 12000;
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** Largest zoom that keeps the scaled image's device-pixel size safe for the
- *  GPU. Derived from the rendered fit-size and devicePixelRatio. */
-function safeMaxScale(fitMaxPx: number): number {
-  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-  const cap = SAFE_DEVICE_PX / dpr / Math.max(1, fitMaxPx);
-  return clamp(cap, 2, 16);
+ *  GPU. Derived from the VIEWPORT (not the image), so it never depends on image
+ *  load timing — the previous image-measured version could race and momentarily
+ *  allow a catastrophic cap, which blacked out the layer when panning. The fit
+ *  image is at most 88vw × 84vh, so that × scale × dpr is the surface bound. */
+function safeMaxScale(): number {
+  if (typeof window === "undefined") return DEFAULT_MAX_SCALE;
+  const dpr = window.devicePixelRatio || 1;
+  const vfit = Math.max(window.innerWidth * 0.88, window.innerHeight * 0.84);
+  return clamp(SAFE_DEVICE_PX / dpr / Math.max(1, vfit), 1, 16);
 }
 
 /** Keep the view sane: never NaN/Infinity, never zoomed past the GPU-safe cap,
@@ -66,7 +70,6 @@ export function FlowViewer() {
   const addRef = useFlowStudioStore((s) => s.addRef);
   const togglePin = useFlowStudioStore((s) => s.togglePin);
   const remove = useFlowStudioStore((s) => s.remove);
-  const generating = useFlowStudioStore((s) => s.generating);
   const model = useFlowStudioStore((s) => s.settings.model);
   const setSettings = useFlowStudioStore((s) => s.setSettings);
 
@@ -80,7 +83,6 @@ export function FlowViewer() {
   // full original only once the user zooms in to inspect detail.
   const [hiRes, setHiRes] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
-  const imgRef = useRef<HTMLImageElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const stripRef = useRef<HTMLDivElement>(null);
   const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
@@ -89,11 +91,20 @@ export function FlowViewer() {
   // Reset zoom + hide the (still-loading) full image whenever we switch — the
   // thumbnail placeholder shows instantly until the full image is ready.
   useEffect(() => {
-    maxScaleRef.current = DEFAULT_MAX_SCALE;
     setView(RESET);
     setFullReady(false);
     setHiRes(false);
   }, [mediaId]);
+
+  // GPU-safe zoom cap from the viewport (stable; recomputed on resize).
+  useEffect(() => {
+    const update = () => {
+      maxScaleRef.current = safeMaxScale();
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
 
   // Once zoomed in past ~1.8×, swap the light view image for the full original
   // so deep zoom stays crisp.
@@ -126,6 +137,34 @@ export function FlowViewer() {
     });
     return () => imgs.forEach((im) => (im.src = "")); // cancel if we navigate away fast
   }, [mediaId, assets]);
+
+  // Upload image file(s) and attach them as references for the edit.
+  const addEditRefs = useCallback(async (files: File[]) => {
+    for (const f of files) {
+      try {
+        const { media_id } = await uploadComicSheet(f);
+        setEditRefs((r) => (r.includes(media_id) ? r : [...r, media_id]));
+      } catch {
+        /* ignore a single bad file */
+      }
+    }
+  }, []);
+
+  // Paste an image while the viewer is open → attach it as an edit reference.
+  useEffect(() => {
+    if (!mediaId) return;
+    const onPaste = (e: ClipboardEvent) => {
+      const files = Array.from(e.clipboardData?.items ?? [])
+        .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => !!f);
+      if (!files.length) return;
+      e.preventDefault();
+      addEditRefs(files);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [mediaId, addEditRefs]);
 
   // Keyboard: Esc closes; ←/→ step through images (unless typing in the composer).
   useEffect(() => {
@@ -215,22 +254,10 @@ export function FlowViewer() {
 
   const submitEdit = () => {
     const t = edit.trim();
-    if (!t || generating) return;
+    if (!t) return;
     refine(mediaId, t, editRefs.length ? editRefs : undefined);
     setEdit("");
     setEditRefs([]);
-  };
-
-  const onPickRefs = async (files: FileList | null) => {
-    if (!files?.length) return;
-    for (const f of Array.from(files)) {
-      try {
-        const { media_id } = await uploadComicSheet(f);
-        setEditRefs((r) => (r.includes(media_id) ? r : [...r, media_id]));
-      } catch {
-        /* ignore a single bad file */
-      }
-    }
   };
 
   return (
@@ -263,7 +290,6 @@ export function FlowViewer() {
             type="button"
             className="fv__tool"
             title="Tạo lại"
-            disabled={generating}
             onClick={() => regenerate(mediaId)}
           >
             ♻
@@ -343,19 +369,12 @@ export function FlowViewer() {
           <img className="fv__ph" src={thumbUrl(mediaId, 1536)} alt="" draggable={false} aria-hidden="true" />
           <img
             className="fv__full"
-            ref={imgRef}
             src={hiRes ? mediaUrl(mediaId) : thumbUrl(mediaId, 2048)}
             alt={asset?.label ?? ""}
             draggable={false}
             decoding="async"
             style={{ opacity: fullReady ? 1 : 0 }}
-            onLoad={(e) => {
-              // Derive the GPU-safe zoom cap from the actual rendered fit-size.
-              const img = e.currentTarget;
-              const fit = Math.max(img.clientWidth, img.clientHeight);
-              maxScaleRef.current = safeMaxScale(fit);
-              setFullReady(true);
-            }}
+            onLoad={() => setFullReady(true)}
           />
         </div>
       </div>
@@ -422,7 +441,7 @@ export function FlowViewer() {
             multiple
             hidden
             onChange={(e) => {
-              onPickRefs(e.target.files);
+              addEditRefs(Array.from(e.target.files ?? []));
               e.target.value = "";
             }}
           />
@@ -478,10 +497,10 @@ export function FlowViewer() {
             type="button"
             className="fv__bar-send"
             title="Sửa bằng AI"
-            disabled={generating || !edit.trim()}
+            disabled={!edit.trim()}
             onClick={submitEdit}
           >
-            {generating ? "…" : "→"}
+            →
           </button>
         </div>
       </div>

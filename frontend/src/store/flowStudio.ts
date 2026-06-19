@@ -97,14 +97,22 @@ interface FlowGenSettings {
   provider: FlowProvider;
 }
 
+/** One in-flight generation batch. Several can run at once (no wait-for-finish);
+ *  each tracks its own progress so the grid can show all pending tiles. */
+export interface GenJob {
+  id: number;
+  done: number;
+  total: number;
+}
+
 interface FlowStudioState {
   assets: FlowAsset[];
   loading: boolean;
-  generating: boolean;
+  generating: boolean; // = genJobs.length > 0 (kept in sync for convenience)
+  genJobs: GenJob[]; // every generation currently in flight
   tab: FlowTab;
   error: string | null;
   notice: string | null; // non-error info (e.g. engine auto-fell-back to Gemini)
-  genProgress: { done: number; total: number } | null; // live "k/N" while generating
   selectedMediaId: string | null; // drives the inspector detail pane
   composerRefs: string[]; // media ids attached as references for the next gen
   composerPrompt: string; // shared prompt text (composer input + history fill)
@@ -127,7 +135,7 @@ interface FlowStudioState {
   generate(prompt: string): Promise<void>;
   regenerate(mediaId: string): Promise<void>;
   refine(mediaId: string, prompt: string, refs?: string[]): Promise<void>;
-  uploadAsset(file: File): Promise<void>;
+  uploadAsset(file: File): Promise<string | null>; // returns the new media_id
   setCharacter(mediaId: string, name: string | null): Promise<void>;
   setScene(mediaId: string, name: string | null): Promise<void>;
   togglePin(refId: number): Promise<void>;
@@ -226,6 +234,8 @@ export function deriveGroups(
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+let _jobSeq = 0; // monotonic id for in-flight generation jobs
+
 /** Build the gen params, honouring model resolution caps (4K is Pro-only). */
 function genParams(
   prompt: string,
@@ -292,10 +302,10 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
   assets: [],
   loading: false,
   generating: false,
+  genJobs: [],
   tab: "all",
   error: null,
   notice: null,
-  genProgress: null,
   selectedMediaId: null,
   composerRefs: [],
   composerPrompt: "",
@@ -407,9 +417,14 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
 
   async generate(prompt) {
     const text = prompt.trim();
-    if (!text || get().generating) return;
+    if (!text) return; // no wait-for-finish: multiple generations can run at once
     const settings = get().settings;
-    set({ generating: true, error: null, genProgress: { done: 0, total: settings.count } });
+    const jobId = ++_jobSeq;
+    set((s) => ({
+      genJobs: [...s.genJobs, { id: jobId, done: 0, total: settings.count }],
+      generating: true,
+      error: null,
+    }));
     const refs = [...new Set([...get().composerRefs, ...get().resolveMentions(text)])];
     // Sent → clear the composer (prompt + attached refs) like Flow does; the
     // in-flight generation already captured `text` and `refs`.
@@ -417,12 +432,13 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     try {
       const { mediaIds, providerUsed } = await dispatchFlow(
         genParams(text, settings, refs),
-        (done, total) => set({ genProgress: { done, total } }),
+        (done, total) =>
+          set((s) => ({ genJobs: s.genJobs.map((j) => (j.id === jobId ? { ...j, done, total } : j)) })),
       );
       const created = await persistGenerated(mediaIds, text, settings.aspect, refs);
       set((s) => ({
         assets: [...created, ...s.assets],
-        selectedMediaId: created[0]?.mediaId ?? s.selectedMediaId,
+        // Results just land in the grid — don't auto-open the detail popup.
         recentPrompts: pushRecent(s.recentPrompts, text),
         notice: fallbackNotice(settings.provider, providerUsed),
       }));
@@ -430,7 +446,10 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     } catch (err) {
       set({ error: err instanceof Error ? err.message : "generation failed" });
     } finally {
-      set({ generating: false, genProgress: null });
+      set((s) => {
+        const genJobs = s.genJobs.filter((j) => j.id !== jobId);
+        return { genJobs, generating: genJobs.length > 0 };
+      });
     }
   },
 
@@ -442,17 +461,20 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
 
   async refine(mediaId, prompt, refs) {
     const text = prompt.trim();
-    if (!text || get().generating) return;
-    set({ generating: true, error: null, genProgress: { done: 0, total: 1 } });
+    if (!text) return; // concurrent allowed
+    const jobId = ++_jobSeq;
+    set((s) => ({ genJobs: [...s.genJobs, { id: jobId, done: 0, total: 1 }], generating: true, error: null }));
     const settings = get().settings;
     try {
       const { mediaIds, providerUsed } = await dispatchFlow(
         genParams(text, { ...settings, count: 1 }, refs ?? [], { source_media_id: mediaId }),
-        (done, total) => set({ genProgress: { done, total } }),
+        (done, total) =>
+          set((s) => ({ genJobs: s.genJobs.map((j) => (j.id === jobId ? { ...j, done, total } : j)) })),
       );
       const created = await persistGenerated(mediaIds, text, null, [mediaId, ...(refs ?? [])]);
       set((s) => ({
         assets: [...created, ...s.assets],
+        // A refine is "show me the edited result" → switch the viewer to it.
         selectedMediaId: created[0]?.mediaId ?? s.selectedMediaId,
         recentPrompts: pushRecent(s.recentPrompts, text),
         notice: fallbackNotice(settings.provider, providerUsed),
@@ -461,7 +483,10 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     } catch (err) {
       set({ error: err instanceof Error ? err.message : "refine failed" });
     } finally {
-      set({ generating: false, genProgress: null });
+      set((s) => {
+        const genJobs = s.genJobs.filter((j) => j.id !== jobId);
+        return { genJobs, generating: genJobs.length > 0 };
+      });
     }
   },
 
@@ -477,12 +502,14 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
         source_board_id: currentBoardId() ?? undefined,
       });
       const asset = toAsset(ref);
-      // Just drop it into the grid — don't auto-open the detail viewer.
+      // Drop it into the grid — don't auto-open the detail viewer.
       set((s) => ({
         assets: [asset, ...s.assets.filter((a) => a.refId !== asset.refId)],
       }));
+      return media_id;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : "upload failed" });
+      return null;
     }
   },
 

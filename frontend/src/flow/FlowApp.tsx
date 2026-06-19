@@ -337,13 +337,15 @@ function useTilePcts(
 /** Flow-style loading tiles — gradient frame in the chosen aspect ratio, image
  *  icon top-left, own climbing % top-right. */
 function GenPlaceholders() {
-  const generating = useFlowStudioStore((s) => s.generating);
-  const progress = useFlowStudioStore((s) => s.genProgress);
+  // Aggregate every in-flight generation into one set of tiles (several can run
+  // at once now), so each pending image shows its own climbing %.
+  const jobs = useFlowStudioStore((s) => s.genJobs);
   const aspect = useFlowStudioStore((s) => s.settings.aspect);
   const model = useFlowStudioStore((s) => s.settings.model);
   const size = useFlowStudioStore((s) => s.settings.size);
-  const total = Math.max(1, progress?.total ?? 1);
-  const pcts = useTilePcts(progress, generating, total, expectedSecondsPerImage(model, size));
+  const total = Math.max(1, jobs.reduce((n, j) => n + j.total, 0));
+  const done = jobs.reduce((n, j) => n + j.done, 0);
+  const pcts = useTilePcts({ done, total }, jobs.length > 0, total, expectedSecondsPerImage(model, size));
   return (
     <>
       {Array.from({ length: total }).map((_, i) => (

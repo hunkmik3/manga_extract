@@ -69,7 +69,6 @@ function renderMirror(
 }
 
 export function FlowComposer() {
-  const generating = useFlowStudioStore((s) => s.generating);
   const settings = useFlowStudioStore((s) => s.settings);
   const setSettings = useFlowStudioStore((s) => s.setSettings);
   const generate = useFlowStudioStore((s) => s.generate);
@@ -109,6 +108,26 @@ export function FlowComposer() {
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
   }, [prompt]);
+
+  // Paste an image anywhere → upload it and attach it as a reference. (When the
+  // detail viewer is open it handles its own paste, so bail here.)
+  useEffect(() => {
+    const onPaste = async (e: ClipboardEvent) => {
+      if (useFlowStudioStore.getState().selectedMediaId) return; // viewer handles it
+      const files = Array.from(e.clipboardData?.items ?? [])
+        .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => !!f);
+      if (!files.length) return; // let normal text paste through
+      e.preventDefault();
+      for (const f of files) {
+        const id = await uploadAsset(f);
+        if (id) addRef(id);
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [uploadAsset, addRef]);
 
   const modelLabel = FLOW_MODELS.find((m) => m.id === settings.model)?.label ?? settings.model;
   const cap = modelMaxSize(settings.model);
@@ -195,7 +214,7 @@ export function FlowComposer() {
   };
 
   const submit = () => {
-    if (generating || !prompt.trim()) return;
+    if (!prompt.trim()) return; // no wait-for-finish — fire as many as you like
     generate(prompt); // clears composerPrompt + refs + mentions in the store
   };
 
@@ -254,11 +273,15 @@ export function FlowComposer() {
           ref={fileInput}
           type="file"
           accept="image/*"
+          multiple
           hidden
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) uploadAsset(f);
+          onChange={async (e) => {
+            const files = Array.from(e.target.files ?? []);
             e.target.value = "";
+            for (const f of files) {
+              const id = await uploadAsset(f);
+              if (id) addRef(id); // attach as a reference, ready to use
+            }
           }}
         />
 
@@ -381,8 +404,8 @@ export function FlowComposer() {
           )}
         </div>
 
-        <button type="button" className="fc__send" onClick={submit} disabled={generating || !prompt.trim()} title={generating ? "Đang tạo…" : "Tạo (Enter)"}>
-          {generating ? "…" : "→"}
+        <button type="button" className="fc__send" onClick={submit} disabled={!prompt.trim()} title="Tạo (Enter)">
+          →
         </button>
       </div>
     </div>

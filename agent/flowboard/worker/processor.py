@@ -2455,8 +2455,14 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
 }
 
 
+# How many requests the worker runs concurrently. Atrium has no per-second /
+# concurrency limit (only a daily quota), and the API-key path has no reCAPTCHA,
+# so several generations can run at once; capped so the host isn't overwhelmed.
+WORKER_CONCURRENCY = max(1, int(os.getenv("FLOWBOARD_WORKER_CONCURRENCY", "3")))
+
+
 class WorkerController:
-    """Single-consumer async queue worker."""
+    """Async queue worker that processes up to WORKER_CONCURRENCY requests at once."""
 
     def __init__(self, handlers: Optional[dict[str, Handler]] = None) -> None:
         self._queue: asyncio.Queue[int] = asyncio.Queue()
@@ -2464,6 +2470,8 @@ class WorkerController:
         self._shutdown = asyncio.Event()
         self._active = 0
         self._started_at: Optional[float] = None
+        self._sem = asyncio.Semaphore(WORKER_CONCURRENCY)
+        self._tasks: set[asyncio.Task] = set()
 
     # ── enqueue ────────────────────────────────────────────────────────────
     def enqueue(self, request_id: int) -> None:
@@ -2472,12 +2480,20 @@ class WorkerController:
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self) -> None:
         self._started_at = time.time()
-        logger.info("worker started")
+        logger.info("worker started (concurrency=%d)", WORKER_CONCURRENCY)
         while not self._shutdown.is_set():
             try:
                 rid = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
+            # Run concurrently up to the semaphore cap; don't block the loop so
+            # other queued requests can start while this one is in flight.
+            task = asyncio.create_task(self._run_capped(rid))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _run_capped(self, rid: int) -> None:
+        async with self._sem:
             await self._process_one(rid)
 
     def request_shutdown(self) -> None:
