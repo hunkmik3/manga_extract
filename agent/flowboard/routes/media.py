@@ -53,9 +53,11 @@ def get_media_thumb(media_id: str, w: int = 256):
     media_id = media_service.normalize_media_id(media_id)
     if not media_service.is_valid_media_id(media_id):
         raise HTTPException(status_code=400, detail="invalid media_id")
-    # Up to 1536 so the viewer can use a sharp-but-light "preview" thumb as an
-    # instant placeholder while the full image loads (grids still ask for ≤640).
-    w = max(64, min(int(w), 1536))
+    # Up to 2048: the viewer streams a light "view" image (~hundreds of KB) at
+    # this size instead of the multi-MB original, so switching images is fast
+    # over a tunnel; the full original is only fetched on deep zoom / download.
+    # Grids/pickers still ask for ≤640.
+    w = max(64, min(int(w), 2048))
     src = media_service.cached_path(media_id)
     if src is None:
         raise HTTPException(status_code=404, detail="not cached")
@@ -73,7 +75,10 @@ def get_media_thumb(media_id: str, w: int = 256):
             if max(h, wd) > w:
                 s = w / max(h, wd)
                 img = cv2.resize(img, (max(1, round(wd * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
-            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            # Higher quality for the large "view" sizes (keeps lineart crisp);
+            # small grid thumbs stay at 80 to stay tiny.
+            quality = 90 if w >= 1024 else 80
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
             if not ok:
                 return FileResponse(path=str(src))
             thumb.write_bytes(buf.tobytes())

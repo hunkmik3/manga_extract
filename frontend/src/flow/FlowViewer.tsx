@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { mediaUrl, thumbUrl, uploadComicSheet } from "../api/client";
-import { FLOW_MODELS, useFlowStudioStore } from "../store/flowStudio";
+import { FLOW_MODELS, useFlowStudioStore, type FlowAsset } from "../store/flowStudio";
 
 /**
  * Flow-style image viewer — a clean full-screen overlay opened by clicking a
@@ -76,6 +76,9 @@ export function FlowViewer() {
   const [view, setView] = useState<View>(RESET);
   const [grabbing, setGrabbing] = useState(false);
   const [fullReady, setFullReady] = useState(false);
+  // Browse on a light ~2048 "view" image (fast over a tunnel); upgrade to the
+  // full original only once the user zooms in to inspect detail.
+  const [hiRes, setHiRes] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -89,7 +92,14 @@ export function FlowViewer() {
     maxScaleRef.current = DEFAULT_MAX_SCALE;
     setView(RESET);
     setFullReady(false);
+    setHiRes(false);
   }, [mediaId]);
+
+  // Once zoomed in past ~1.8×, swap the light view image for the full original
+  // so deep zoom stays crisp.
+  useEffect(() => {
+    if (view.scale > 1.8) setHiRes(true);
+  }, [view.scale]);
 
   // Keep the active filmstrip thumbnail scrolled into view.
   useEffect(() => {
@@ -97,19 +107,21 @@ export function FlowViewer() {
     el?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
   }, [mediaId]);
 
-  // Warm the browser cache with the neighbouring full images so ←/→ (and
-  // back-and-forth between two images) shows instantly instead of re-fetching.
+  // Warm the cache with the light view image (and its placeholder) for the
+  // images within ±2 so ←/→ and nearby filmstrip clicks show instantly. We
+  // preload the light versions, not the multi-MB originals, to stay tunnel-cheap.
   useEffect(() => {
     if (!mediaId) return;
     const i = assets.findIndex((a) => a.mediaId === mediaId);
     if (i < 0) return;
-    const neighbours = [assets[i - 1]?.mediaId, assets[i + 1]?.mediaId].filter(
-      (x): x is string => typeof x === "string",
-    );
-    const imgs = neighbours.map((id) => {
+    const neighbours = [assets[i - 2], assets[i - 1], assets[i + 1], assets[i + 2]]
+      .filter((a): a is FlowAsset => !!a)
+      .map((a) => a.mediaId);
+    const urls = neighbours.flatMap((id) => [thumbUrl(id, 2048), thumbUrl(id, 1536)]);
+    const imgs = urls.map((u) => {
       const im = new Image();
       im.decoding = "async";
-      im.src = mediaUrl(id);
+      im.src = u;
       return im;
     });
     return () => imgs.forEach((im) => (im.src = "")); // cancel if we navigate away fast
@@ -332,7 +344,7 @@ export function FlowViewer() {
           <img
             className="fv__full"
             ref={imgRef}
-            src={mediaUrl(mediaId)}
+            src={hiRes ? mediaUrl(mediaId) : thumbUrl(mediaId, 2048)}
             alt={asset?.label ?? ""}
             draggable={false}
             decoding="async"

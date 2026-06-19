@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { thumbUrl } from "../api/client";
 import { FLOW_ONLY, useAppModeStore } from "../store/appMode";
 import { useFlowProjectsStore } from "../store/flowProjects";
-import { CHAR_PREFIX, SCENE_PREFIX, groupName, useFlowStudioStore } from "../store/flowStudio";
+import { CHAR_PREFIX, REF_PREFIX, SCENE_PREFIX, groupName, useFlowStudioStore } from "../store/flowStudio";
 import { FlowComposer } from "./FlowComposer";
 import { FlowViewer } from "./FlowViewer";
 
@@ -22,7 +22,7 @@ export function FlowApp() {
   const select = useFlowStudioStore((s) => s.select);
   const selectedMediaId = useFlowStudioStore((s) => s.selectedMediaId);
   const uploadAsset = useFlowStudioStore((s) => s.uploadAsset);
-  const setComposerPrompt = useFlowStudioStore((s) => s.setComposerPrompt);
+  const reusePrompt = useFlowStudioStore((s) => s.reusePrompt);
   const togglePin = useFlowStudioStore((s) => s.togglePin);
   const tagToPrompt = useFlowStudioStore((s) => s.tagToPrompt);
   const error = useFlowStudioStore((s) => s.error);
@@ -252,7 +252,10 @@ export function FlowApp() {
                         title="Sử dụng lại câu lệnh"
                         onClick={(e) => {
                           e.stopPropagation();
-                          setComposerPrompt(a.prompt ?? "");
+                          const refIds = a.tags
+                            .filter((t) => t.startsWith(REF_PREFIX))
+                            .map((t) => t.slice(REF_PREFIX.length));
+                          reusePrompt(a.prompt ?? "", refIds);
                         }}
                       >
                         ↩

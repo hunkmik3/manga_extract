@@ -368,7 +368,7 @@ export function FlowComposer() {
               <div className="fc__pop-section">
                 <label className="fc__pop-label">Số lượng</label>
                 <div className="fc__chips">
-                  {[1, 2, 3, 4].map((n) => (
+                  {[1, 2].map((n) => (
                     <button key={n} type="button" className={`fc__chip${settings.count === n ? " is-on" : ""}`} onClick={() => setSettings({ count: n })}>
                       {n}x
                     </button>

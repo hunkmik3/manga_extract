@@ -35,6 +35,9 @@ function currentBoardId(): number | null {
 export const FLOW_TAG = "flow";
 export const CHAR_PREFIX = "char:";
 export const SCENE_PREFIX = "scene:";
+// Reference media ids used to generate this image, stored as tags so "reuse
+// prompt" can re-attach + re-tag the same images (not just the text).
+export const REF_PREFIX = "ref:";
 
 export const FLOW_ASPECTS = ["16:9", "4:3", "1:1", "3:4", "9:16"] as const;
 export type FlowAspect = (typeof FLOW_ASPECTS)[number];
@@ -119,6 +122,9 @@ interface FlowStudioState {
   tagToPrompt(name: string, cover: string, mediaIds: string[]): void;
   addComposerMention(m: Mention): void;
   removeComposerMention(token: string): void;
+  // Reuse a past prompt: load its text AND re-attach + re-tag the images it
+  // referenced (from the asset's ref: tags), so @tokens light up again.
+  reusePrompt(prompt: string, refMediaIds: string[]): void;
   generate(prompt: string): Promise<void>;
   regenerate(mediaId: string): Promise<void>;
   refine(mediaId: string, prompt: string, refs?: string[]): Promise<void>;
@@ -157,7 +163,7 @@ function loadPersisted(): { settings: FlowGenSettings; recentPrompts: string[] }
         aspect: (FLOW_ASPECTS as readonly string[]).includes(s.aspect ?? "")
           ? (s.aspect as FlowAspect)
           : fallback.aspect,
-        count: s.count && s.count >= 1 && s.count <= 4 ? s.count : fallback.count,
+        count: s.count && s.count >= 1 && s.count <= 2 ? s.count : fallback.count,
         model: FLOW_MODELS.some((m) => m.id === s.model) ? (s.model as string) : fallback.model,
         size: (FLOW_SIZES as readonly string[]).includes(s.size ?? "") ? (s.size as FlowSize) : fallback.size,
         provider: s.provider === "atrium" ? "atrium" : "gemini",
@@ -337,6 +343,41 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     set((s) => ({ composerMentions: s.composerMentions.filter((x) => x.token !== token) }));
   },
 
+  reusePrompt(prompt, refMediaIds) {
+    const assets = get().assets;
+    const nameOf = (a: FlowAsset) =>
+      groupName(a.tags, CHAR_PREFIX) || groupName(a.tags, SCENE_PREFIX) || a.label || "ảnh";
+    const ids = new Set<string>();
+    // 1. Exact: the refs stored with the image when it was generated.
+    for (const id of refMediaIds) if (assets.some((a) => a.mediaId === id)) ids.add(id);
+    // 2. Fallback (also covers images made before refs were stored): re-resolve
+    //    the @tokens in the text against the names/labels of existing images.
+    for (const a of assets) {
+      const n = nameOf(a);
+      if (n && n !== "ảnh" && prompt.includes(`@${n}`)) ids.add(a.mediaId);
+    }
+    // Rebuild the @token pills, grouping refs under their derived token (a
+    // character/scene → all its views; otherwise the image's own label) so the
+    // tokens match those baked into the prompt text and light up again.
+    const byToken = new Map<string, { cover: string; mediaIds: string[] }>();
+    for (const id of ids) {
+      const a = assets.find((x) => x.mediaId === id)!;
+      const token = `@${nameOf(a)}`;
+      const cur = byToken.get(token);
+      if (cur) cur.mediaIds.push(id);
+      else byToken.set(token, { cover: id, mediaIds: [id] });
+    }
+    set({
+      composerPrompt: prompt,
+      composerRefs: [...ids],
+      composerMentions: [...byToken.entries()].map(([token, v]) => ({
+        token,
+        cover: v.cover,
+        mediaIds: v.mediaIds,
+      })),
+    });
+  },
+
   setComposerPrompt(value) {
     set({ composerPrompt: value });
   },
@@ -379,7 +420,7 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
         genParams(text, settings, refs),
         (done, total) => set({ genProgress: { done, total } }),
       );
-      const created = await persistGenerated(mediaIds, text, settings.aspect);
+      const created = await persistGenerated(mediaIds, text, settings.aspect, refs);
       set((s) => ({
         assets: [...created, ...s.assets],
         selectedMediaId: created[0]?.mediaId ?? s.selectedMediaId,
@@ -410,7 +451,7 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
         genParams(text, { ...settings, count: 1 }, refs ?? [], { source_media_id: mediaId }),
         (done, total) => set({ genProgress: { done, total } }),
       );
-      const created = await persistGenerated(mediaIds, text, null);
+      const created = await persistGenerated(mediaIds, text, null, [mediaId, ...(refs ?? [])]);
       set((s) => ({
         assets: [...created, ...s.assets],
         selectedMediaId: created[0]?.mediaId ?? s.selectedMediaId,
@@ -530,7 +571,9 @@ async function persistGenerated(
   mediaIds: string[],
   prompt: string,
   aspect: string | null,
+  refs: string[] = [],
 ): Promise<FlowAsset[]> {
+  const refTags = [...new Set(refs)].map((id) => REF_PREFIX + id);
   const created: FlowAsset[] = [];
   for (const mid of mediaIds) {
     try {
@@ -540,7 +583,7 @@ async function persistGenerated(
         label: prompt.slice(0, 60),
         ai_brief: prompt,
         aspect_ratio: aspect,
-        tags: [FLOW_TAG],
+        tags: [FLOW_TAG, ...refTags],
         source_board_id: currentBoardId() ?? undefined,
       });
       created.push(toAsset(ref));

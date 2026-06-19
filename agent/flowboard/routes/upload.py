@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["upload"])
 
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 ALLOWED_UPLOAD_MIMES = {
     "image/jpeg",
     "image/png",
