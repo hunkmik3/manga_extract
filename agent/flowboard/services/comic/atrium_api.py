@@ -30,7 +30,16 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BASE = "https://studio.atrium.art"
 _TIMEOUT_S = 240.0
 MAX_ATTEMPTS = 5
+# An empty (no-image) response is usually a safety filter — often a FALSE
+# POSITIVE on anime art that clears on retry. Retry a few times only (a genuine
+# block won't pass and each try costs quota).
+SAFETY_MAX_ATTEMPTS = 3
 _BACKOFF_S = 2.0
+
+
+class _AtriumSafetyEmpty(RuntimeError):
+    """200 OK but no image — likely a (often transient) safety block."""
+
 
 # Fail fast only on errors retrying can't fix: bad request, auth, not-found.
 # 429 is retried — Atrium confirmed it's an intermittent Nano Banana / Veo model
@@ -137,7 +146,9 @@ async def _generate_once(client: httpx.AsyncClient, headers: dict, body: dict) -
 
     url = _extract_download_url(resp.json())
     if not url:
-        raise BridgeEditError("atrium: no image in response (safety block?)", attempts=1)
+        # Retryable: empty responses are frequently a transient false-positive
+        # safety block on anime art (see SAFETY_MAX_ATTEMPTS).
+        raise _AtriumSafetyEmpty("atrium: no image in response (safety block?)")
     # The downloadUrl is a presigned S3 link — fetch with no auth headers.
     img = await client.get(url)
     if img.status_code != 200 or not img.content:
@@ -176,6 +187,7 @@ async def generate_image_variants(
     async def _one(client: httpx.AsyncClient) -> bytes:
         nonlocal completed
         last = "unknown"
+        safety_tries = 0
         for attempt in range(1, max_attempts + 1):
             try:
                 out = await _generate_once(client, headers, body)
@@ -185,6 +197,15 @@ async def generate_image_variants(
                 return out
             except BridgeEditError:
                 raise  # fatal for this variant
+            except _AtriumSafetyEmpty as exc:
+                safety_tries += 1
+                last = str(exc)[:200]
+                logger.warning("atrium safety-empty %d/%d", safety_tries, SAFETY_MAX_ATTEMPTS)
+                if safety_tries >= SAFETY_MAX_ATTEMPTS:
+                    raise BridgeEditError(
+                        f"{last} — blocked after {safety_tries} tries", attempts=safety_tries
+                    )
+                await asyncio.sleep(_BACKOFF_S * attempt)
             except Exception as exc:  # noqa: BLE001 — 5xx / 429 / timeouts / transport
                 last = f"{type(exc).__name__}: {exc}"[:200].rstrip(": ")
                 logger.warning("atrium attempt %d/%d: %s", attempt, max_attempts, last)
