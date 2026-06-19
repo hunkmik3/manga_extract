@@ -1,14 +1,15 @@
 # Deploy — Flow Studio (Flow-only) on the Mac Mini M4
 
 A single Python process serves both the API **and** the compiled web UI on
-`127.0.0.1:8101`. The public entry point is a Cloudflare **named tunnel** gated
-by **Cloudflare Access**, so the 10-person team opens one link, signs in with
-their email, and each creates their own Flow project. The Mac Mini's port is
-never exposed directly.
+`127.0.0.1:8101`. The public entry point is a Cloudflare **named tunnel**. The
+link is **open (no login gate)** — the 10-person team just opens it and each
+creates their own Flow project; share the URL privately since it's the only
+thing keeping randoms out. The Mac Mini's port is never exposed directly. (An
+optional Cloudflare Access login gate can be added later — see step 5.)
 
 ```
   teammate browser
-        │  https://flow.otsulabs.com   (TLS + Cloudflare Access login)
+        │  https://flow.otsulabs.com   (TLS; open link)
         ▼
   Cloudflare edge ──► cloudflared (named tunnel, runs on the Mac Mini)
         │  http://127.0.0.1:8101
@@ -73,15 +74,14 @@ cp deploy/cloudflared-config.example.yml ~/.cloudflared/config.yml
 sudo cloudflared service install        # runs at boot, restarts on crash
 ```
 
-### 5. Cloudflare Access (the login gate)
-Cloudflare **Zero Trust** dashboard → Access → Applications → **Add a
-self-hosted application**:
-- Application domain: `flow.otsulabs.com`
-- Policy: **Allow** → Include → *Emails ending in* `@otsulabs.com`
-  (or list the 10 specific emails)
-- Identity: One-time PIN (email) or Google — whichever the team uses.
+### 5. (Optional) Cloudflare Access — a login gate
+Left **off** by default: the link is open and shared privately with the team.
+To add a login gate later (no redeploy, toggle anytime): Cloudflare **Zero
+Trust** → Access → Applications → **Add a self-hosted application** → domain
+`flow.otsulabs.com` → policy **Allow** → *Emails ending in* `@otsulabs.com` (or
+the 10 specific emails) → identity **One-time PIN**.
 
-Done. Share `https://flow.otsulabs.com`; everyone signs in and lands on Flow.
+Done. Share `https://flow.otsulabs.com`; it opens straight into Flow Studio.
 
 ---
 

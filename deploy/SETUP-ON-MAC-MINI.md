@@ -15,7 +15,9 @@ and **stop to ask the user** wherever this doc says ASK USER.
 
 One Python process serves **both** the JSON API and the compiled web UI on
 `127.0.0.1:8101`. That port is **never exposed** — the public entry is a
-Cloudflare **named tunnel** gated by **Cloudflare Access** (email login).
+Cloudflare **named tunnel**. The link is intentionally **open (no login gate)**:
+the user trusts their team and will share the URL privately. (A login gate can
+be added later without redeploying — see the optional note in Step 8.)
 
 ```
  teammate browser ──https──► Cloudflare edge ──► cloudflared (this Mac)
@@ -54,10 +56,9 @@ Ask the user for, and write down:
    `gh auth login`). `$ROOT` = this install folder for everything below.
 2. **Public hostname** to use, e.g. `flow.theircompany.com`. They must have
    that **domain on their Cloudflare account** (named tunnels require it).
-3. **Who can log in** — an email domain (e.g. `@otsulabs.com`) or an explicit
-   list of teammate emails — and the login method (**One-time PIN by email** is
-   simplest; or Google).
-4. The **`.env` secret values** (see Step 4). Have them paste the values; never
+   Pick a non-obvious subdomain — since the link is open, the URL is the only
+   thing keeping randoms out.
+3. The **`.env` secret values** (see Step 4). Have them paste the values; never
    print them back in full and never commit them.
 
 Then set, for the rest of the session (the folder is created by the clone in
@@ -223,29 +224,29 @@ cloudflared tunnel info flow-studio
 
 ---
 
-## Step 8 — Cloudflare Access (login gate)
+## Step 8 — Access: open link (no login gate)
 
-This is a dashboard step — **guide the USER through it** (you can't click it):
-1. Go to Cloudflare **Zero Trust** → **Access** → **Applications** → **Add an
-   application** → **Self-hosted**.
-2. Application domain = the hostname from Step 0.
-3. Add a policy: **Action: Allow** → Include → either *Emails ending in*
-   `@theircompany.com` or the explicit teammate email list.
-4. Identity / login method: **One-time PIN** (email) unless the user chose
-   Google.
-5. Save.
+The user has chosen to leave the app **open** — there is **no Cloudflare Access
+to configure**. The tunnel from Step 7 already serves it publicly. Anyone with
+the URL can use it (and spend the user's Gemini/Atrium quota), so **share the
+link privately** and treat it like a password.
+
+> **Optional — add a login gate later** (no redeploy, ~5 min, toggle anytime):
+> Cloudflare **Zero Trust → Access → Applications → Add → Self-hosted**, set the
+> application domain to `$HOST`, add an **Allow** policy (e.g. *Emails ending in*
+> the team's domain), and pick **One-time PIN** as the login method.
 
 ---
 
 ## Step 9 — Final verification
 
 - Local: `curl -s http://127.0.0.1:8101/api/health` → `{"ok": true, ...}`.
-- Public: open `https://$HOST` in a browser → you should hit the Cloudflare
-  Access login, sign in, then land on **Flow Studio** (no "Manga" anywhere).
+- Public: open `https://$HOST` in a browser → it lands **directly** on
+  **Flow Studio** (no login screen, no "Manga" anywhere).
 - Generate one test image to confirm the keys work end to end.
 
-Report back to the user: the public link, the login method, and confirm a test
-generation succeeded.
+Report back to the user: the public link and confirm a test generation
+succeeded.
 
 ---
 
