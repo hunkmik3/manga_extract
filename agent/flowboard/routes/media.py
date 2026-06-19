@@ -53,7 +53,9 @@ def get_media_thumb(media_id: str, w: int = 256):
     media_id = media_service.normalize_media_id(media_id)
     if not media_service.is_valid_media_id(media_id):
         raise HTTPException(status_code=400, detail="invalid media_id")
-    w = max(64, min(int(w), 640))
+    # Up to 1536 so the viewer can use a sharp-but-light "preview" thumb as an
+    # instant placeholder while the full image loads (grids still ask for ≤640).
+    w = max(64, min(int(w), 1536))
     src = media_service.cached_path(media_id)
     if src is None:
         raise HTTPException(status_code=404, detail="not cached")

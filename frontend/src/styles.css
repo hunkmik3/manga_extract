@@ -6694,12 +6694,28 @@ button:disabled {
 .fv__stage.is-grabbing {
   cursor: grabbing;
 }
-.fv__stage img {
+/* Canvas wraps the placeholder + full image; the zoom/pan transform lives here
+   so both layers move together. The placeholder (in-flow) sizes the box; the
+   full image is absolutely overlaid and fades in once loaded. */
+.fv__canvas {
+  position: relative;
+  user-select: none;
+}
+.fv__ph {
+  display: block;
   max-width: 88vw;
   max-height: 84vh;
   object-fit: contain;
-  user-select: none;
   -webkit-user-drag: none;
+}
+.fv__full {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  -webkit-user-drag: none;
+  transition: opacity 0.12s ease-out;
 }
 
 /* Close (top-right). */

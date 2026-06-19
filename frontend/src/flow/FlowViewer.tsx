@@ -75,6 +75,7 @@ export function FlowViewer() {
   const [modelOpen, setModelOpen] = useState(false);
   const [view, setView] = useState<View>(RESET);
   const [grabbing, setGrabbing] = useState(false);
+  const [fullReady, setFullReady] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -82,10 +83,12 @@ export function FlowViewer() {
   const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
   const maxScaleRef = useRef(DEFAULT_MAX_SCALE);
 
-  // Reset zoom whenever a different image is shown.
+  // Reset zoom + hide the (still-loading) full image whenever we switch — the
+  // thumbnail placeholder shows instantly until the full image is ready.
   useEffect(() => {
     maxScaleRef.current = DEFAULT_MAX_SCALE;
     setView(RESET);
+    setFullReady(false);
   }, [mediaId]);
 
   // Keep the active filmstrip thumbnail scrolled into view.
@@ -93,6 +96,24 @@ export function FlowViewer() {
     const el = stripRef.current?.querySelector<HTMLElement>('[data-active="1"]');
     el?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
   }, [mediaId]);
+
+  // Warm the browser cache with the neighbouring full images so ←/→ (and
+  // back-and-forth between two images) shows instantly instead of re-fetching.
+  useEffect(() => {
+    if (!mediaId) return;
+    const i = assets.findIndex((a) => a.mediaId === mediaId);
+    if (i < 0) return;
+    const neighbours = [assets[i - 1]?.mediaId, assets[i + 1]?.mediaId].filter(
+      (x): x is string => typeof x === "string",
+    );
+    const imgs = neighbours.map((id) => {
+      const im = new Image();
+      im.decoding = "async";
+      im.src = mediaUrl(id);
+      return im;
+    });
+    return () => imgs.forEach((im) => (im.src = "")); // cancel if we navigate away fast
+  }, [mediaId, assets]);
 
   // Keyboard: Esc closes; ←/→ step through images (unless typing in the composer).
   useEffect(() => {
@@ -302,21 +323,29 @@ export function FlowViewer() {
         onPointerCancel={onPointerUp}
         onDoubleClick={() => setView(RESET)}
       >
-        <img
-          ref={imgRef}
-          src={mediaUrl(mediaId)}
-          alt={asset?.label ?? ""}
-          draggable={false}
-          onLoad={(e) => {
-            // Derive the GPU-safe zoom cap from the actual rendered fit-size.
-            const img = e.currentTarget;
-            const fit = Math.max(img.clientWidth, img.clientHeight);
-            maxScaleRef.current = safeMaxScale(fit);
-          }}
-          style={{
-            transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`,
-          }}
-        />
+        <div
+          className="fv__canvas"
+          style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})` }}
+        >
+          {/* Sharp-but-light thumbnail — shows instantly while the full loads. */}
+          <img className="fv__ph" src={thumbUrl(mediaId, 1536)} alt="" draggable={false} aria-hidden="true" />
+          <img
+            className="fv__full"
+            ref={imgRef}
+            src={mediaUrl(mediaId)}
+            alt={asset?.label ?? ""}
+            draggable={false}
+            decoding="async"
+            style={{ opacity: fullReady ? 1 : 0 }}
+            onLoad={(e) => {
+              // Derive the GPU-safe zoom cap from the actual rendered fit-size.
+              const img = e.currentTarget;
+              const fit = Math.max(img.clientWidth, img.clientHeight);
+              maxScaleRef.current = safeMaxScale(fit);
+              setFullReady(true);
+            }}
+          />
+        </div>
       </div>
 
       {/* Zoom controls (bottom-left). */}
