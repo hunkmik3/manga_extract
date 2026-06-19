@@ -6805,6 +6805,83 @@ button:disabled {
   backdrop-filter: blur(6px);
 }
 
+/* Annotation drawing layer + toolbar. */
+.fv__stage.is-drawing {
+  cursor: crosshair;
+}
+.fv__draw {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  cursor: crosshair;
+  touch-action: none;
+}
+.fv__draw-bar {
+  position: absolute;
+  top: 64px;
+  left: 14px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 168px;
+  padding: 10px;
+  background: rgba(20, 22, 28, 0.82);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(8px);
+}
+.fv__swatches {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 5px;
+}
+.fv__swatch {
+  width: 100%;
+  aspect-ratio: 1;
+  border: 2px solid transparent;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.15) inset;
+}
+.fv__swatch.is-on {
+  border-color: #fff;
+}
+.fv__draw-size {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.fv__draw-size input {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.fv__draw-actions {
+  display: flex;
+  gap: 6px;
+}
+.fv__draw-btn {
+  flex: 1;
+  height: 30px;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--panel-high);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.fv__draw-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.fv__draw-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* On-screen prev / next arrows. */
 .fv__nav {
   position: absolute;

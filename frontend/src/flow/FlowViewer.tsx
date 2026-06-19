@@ -19,6 +19,23 @@ interface View {
   ty: number;
 }
 const RESET: View = { scale: 1, tx: 0, ty: 0 };
+
+/** A freehand annotation stroke, in displayed-image (canvas CSS) coordinates. */
+interface Stroke {
+  color: string;
+  size: number;
+  pts: { x: number; y: number }[];
+}
+const BRUSH_COLORS = ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#ffffff", "#111111"];
+const COLOR_NAMES: Record<string, string> = {
+  "#ff3b30": "red",
+  "#ffcc00": "yellow",
+  "#34c759": "green",
+  "#0a84ff": "blue",
+  "#ffffff": "white",
+  "#111111": "black",
+};
+
 const MIN_SCALE = 0.2;
 const DEFAULT_MAX_SCALE = 8;
 // GPU hard limit on a single raster surface is ~16384px; on a Retina display
@@ -82,9 +99,17 @@ export function FlowViewer() {
   // Browse on a light ~2048 "view" image (fast over a tunnel); upgrade to the
   // full original only once the user zooms in to inspect detail.
   const [hiRes, setHiRes] = useState(false);
+  // Freehand annotation ("khoanh vùng"): draw marks on the image to guide the
+  // edit; on submit the marks are flattened onto the image and sent as source.
+  const [drawMode, setDrawMode] = useState(false);
+  const [strokes, setStrokes] = useState<Stroke[]>([]);
+  const [brushColor, setBrushColor] = useState(BRUSH_COLORS[0]);
+  const [brushSize, setBrushSize] = useState(6);
   const stageRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const stripRef = useRef<HTMLDivElement>(null);
+  const drawRef = useRef<HTMLCanvasElement>(null);
+  const curStroke = useRef<Stroke | null>(null);
   const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
   const maxScaleRef = useRef(DEFAULT_MAX_SCALE);
 
@@ -94,7 +119,42 @@ export function FlowViewer() {
     setView(RESET);
     setFullReady(false);
     setHiRes(false);
+    setDrawMode(false);
+    setStrokes([]);
   }, [mediaId]);
+
+  // Drawing forces the image to fit (scale 1, no pan) so canvas coords line up.
+  useEffect(() => {
+    if (drawMode) setView(RESET);
+  }, [drawMode]);
+
+  // Redraw the annotation canvas whenever strokes change or we enter draw mode.
+  const redrawStrokes = useCallback(() => {
+    const cv = drawRef.current;
+    if (!cv) return;
+    if (cv.width !== cv.clientWidth || cv.height !== cv.clientHeight) {
+      cv.width = cv.clientWidth;
+      cv.height = cv.clientHeight;
+    }
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    const all = curStroke.current ? [...strokes, curStroke.current] : strokes;
+    for (const s of all) {
+      if (s.pts.length === 0) continue;
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = s.size;
+      ctx.beginPath();
+      s.pts.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+      ctx.stroke();
+    }
+  }, [strokes]);
+
+  useEffect(() => {
+    if (drawMode) redrawStrokes();
+  }, [drawMode, strokes, redrawStrokes]);
 
   // GPU-safe zoom cap from the viewport (stable; recomputed on resize).
   useEffect(() => {
@@ -176,6 +236,7 @@ export function FlowViewer() {
         return;
       }
       if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        if (drawMode) return; // don't switch images mid-drawing
         const tag = (document.activeElement?.tagName ?? "").toLowerCase();
         if (tag === "input" || tag === "textarea") return; // let the caret move
         const st = useFlowStudioStore.getState();
@@ -190,7 +251,7 @@ export function FlowViewer() {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [mediaId, close, modelOpen]);
+  }, [mediaId, close, modelOpen, drawMode]);
 
   // Infinity zoom: wheel zooms toward the cursor (keeps the point under the
   // pointer fixed). Non-passive listener so we can preventDefault the page
@@ -213,12 +274,13 @@ export function FlowViewer() {
     const el = stageRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
+      if (drawMode) return; // no zoom while annotating
       e.preventDefault();
       zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, [zoomAt, mediaId]);
+  }, [zoomAt, mediaId, drawMode]);
 
   if (!mediaId) return null;
   const modelLabel = FLOW_MODELS.find((m) => m.id === model)?.label ?? model;
@@ -252,12 +314,91 @@ export function FlowViewer() {
     setGrabbing(false);
   };
 
-  const submitEdit = () => {
+  // ── annotation drawing (only when drawMode) ──
+  const drawDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.button !== 0) return;
+    e.stopPropagation(); // don't let the stage pan
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    curStroke.current = { color: brushColor, size: brushSize, pts: [{ x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY }] };
+    redrawStrokes();
+  };
+  const drawMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!curStroke.current) return;
+    e.stopPropagation();
+    curStroke.current.pts.push({ x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY });
+    redrawStrokes();
+  };
+  const drawUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!curStroke.current) return;
+    e.stopPropagation();
+    const s = curStroke.current;
+    curStroke.current = null;
+    setStrokes((prev) => [...prev, s]);
+  };
+
+  // Flatten the original image + the strokes into one PNG to send as the edit
+  // source, scaling strokes from display coords up to the image's native size.
+  const flattenAnnotated = (): Promise<File | null> =>
+    new Promise((resolve) => {
+      const cv = drawRef.current;
+      if (!cv || strokes.length === 0) return resolve(null);
+      const boxW = cv.clientWidth || cv.width;
+      const img = new Image();
+      img.onload = () => {
+        const off = document.createElement("canvas");
+        off.width = img.naturalWidth;
+        off.height = img.naturalHeight;
+        const ctx = off.getContext("2d");
+        if (!ctx) return resolve(null);
+        ctx.drawImage(img, 0, 0, off.width, off.height);
+        const k = off.width / Math.max(1, boxW); // display → native
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        for (const s of strokes) {
+          ctx.strokeStyle = s.color;
+          ctx.lineWidth = s.size * k;
+          ctx.beginPath();
+          s.pts.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x * k, p.y * k) : ctx.lineTo(p.x * k, p.y * k)));
+          ctx.stroke();
+        }
+        try {
+          off.toBlob(
+            (b) => resolve(b ? new File([b], "annotated.png", { type: "image/png" }) : null),
+            "image/png",
+          );
+        } catch {
+          resolve(null); // tainted canvas / encode failure → fall back
+        }
+      };
+      img.onerror = () => resolve(null);
+      img.src = mediaUrl(mediaId);
+    });
+
+  const submitEdit = async () => {
     const t = edit.trim();
     if (!t) return;
-    refine(mediaId, t, editRefs.length ? editRefs : undefined);
+    let sourceId = mediaId;
+    let promptText = t;
+    if (drawMode && strokes.length) {
+      const file = await flattenAnnotated();
+      if (file) {
+        try {
+          const up = await uploadComicSheet(file);
+          sourceId = up.media_id; // edit the marked-up image
+          // Tell the model the marks are annotations indicating the region, so
+          // it acts on that area AND removes the outline from the result.
+          const names = [...new Set(strokes.map((s) => COLOR_NAMES[s.color] ?? "colored"))].join(" and ");
+          promptText = `${t}\n\n(Note: the image has a hand-drawn ${names} outline I added to mark the target region — apply the instruction to that marked area, and remove the ${names} outline itself from the final image.)`;
+        } catch {
+          /* upload failed → fall back to the un-annotated source + plain prompt */
+        }
+      }
+    }
+    refine(sourceId, promptText, editRefs.length ? editRefs : undefined);
     setEdit("");
     setEditRefs([]);
+    setStrokes([]);
+    setDrawMode(false);
   };
 
   return (
@@ -284,6 +425,14 @@ export function FlowViewer() {
       <div className="fv__tools">
         <button type="button" className="fv__tool" title="Dùng làm tham chiếu" onClick={() => addRef(mediaId)}>
           ➕
+        </button>
+        <button
+          type="button"
+          className={`fv__tool${drawMode ? " is-on" : ""}`}
+          title="Khoanh vùng / vẽ lên ảnh để chỉ định vùng sửa"
+          onClick={() => setDrawMode((d) => !d)}
+        >
+          ✏️
         </button>
         {asset?.prompt && (
           <button
@@ -325,6 +474,54 @@ export function FlowViewer() {
         )}
       </div>
 
+      {/* Annotation sub-toolbar (only while drawing). */}
+      {drawMode && (
+        <div className="fv__draw-bar" onPointerDown={(e) => e.stopPropagation()}>
+          <div className="fv__swatches">
+            {BRUSH_COLORS.map((c) => (
+              <button
+                key={c}
+                type="button"
+                className={`fv__swatch${brushColor === c ? " is-on" : ""}`}
+                style={{ background: c }}
+                title={c}
+                onClick={() => setBrushColor(c)}
+              />
+            ))}
+          </div>
+          <label className="fv__draw-size">
+            {brushSize}px
+            <input
+              type="range"
+              min={2}
+              max={40}
+              value={brushSize}
+              onChange={(e) => setBrushSize(Number(e.target.value))}
+            />
+          </label>
+          <div className="fv__draw-actions">
+            <button
+              type="button"
+              className="fv__draw-btn"
+              title="Hoàn tác nét vẽ"
+              disabled={strokes.length === 0}
+              onClick={() => setStrokes((s) => s.slice(0, -1))}
+            >
+              ↶
+            </button>
+            <button
+              type="button"
+              className="fv__draw-btn"
+              title="Xoá hết nét vẽ"
+              disabled={strokes.length === 0}
+              onClick={() => setStrokes([])}
+            >
+              🗑
+            </button>
+          </div>
+        </div>
+      )}
+
       <button type="button" className="fv__close" onClick={() => close(null)} aria-label="Đóng">
         ✕
       </button>
@@ -354,12 +551,12 @@ export function FlowViewer() {
       {/* Infinity-zoom stage. */}
       <div
         ref={stageRef}
-        className={`fv__stage${grabbing ? " is-grabbing" : ""}`}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        onDoubleClick={() => setView(RESET)}
+        className={`fv__stage${grabbing ? " is-grabbing" : ""}${drawMode ? " is-drawing" : ""}`}
+        onPointerDown={drawMode ? undefined : onPointerDown}
+        onPointerMove={drawMode ? undefined : onPointerMove}
+        onPointerUp={drawMode ? undefined : onPointerUp}
+        onPointerCancel={drawMode ? undefined : onPointerUp}
+        onDoubleClick={drawMode ? undefined : () => setView(RESET)}
       >
         <div
           className="fv__canvas"
@@ -376,6 +573,17 @@ export function FlowViewer() {
             style={{ opacity: fullReady ? 1 : 0 }}
             onLoad={() => setFullReady(true)}
           />
+          {/* Annotation layer — draw on top of the image to mark a region. */}
+          {drawMode && (
+            <canvas
+              ref={drawRef}
+              className="fv__draw"
+              onPointerDown={drawDown}
+              onPointerMove={drawMove}
+              onPointerUp={drawUp}
+              onPointerCancel={drawUp}
+            />
+          )}
         </div>
       </div>
 
