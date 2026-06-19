@@ -1,12 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { mediaUrl, thumbUrl, uploadComicSheet } from "../api/client";
-import {
-  CHAR_PREFIX,
-  FLOW_MODELS,
-  SCENE_PREFIX,
-  groupName,
-  useFlowStudioStore,
-} from "../store/flowStudio";
+import { FLOW_MODELS, useFlowStudioStore } from "../store/flowStudio";
 
 /**
  * Flow-style image viewer — a clean full-screen overlay opened by clicking a
@@ -62,6 +56,7 @@ function clampView(v: View, rect: DOMRect | null, maxScale: number): View {
 
 export function FlowViewer() {
   const mediaId = useFlowStudioStore((s) => s.selectedMediaId);
+  const assets = useFlowStudioStore((s) => s.assets);
   const asset = useFlowStudioStore((s) =>
     s.assets.find((a) => a.mediaId === s.selectedMediaId) ?? null,
   );
@@ -70,8 +65,6 @@ export function FlowViewer() {
   const regenerate = useFlowStudioStore((s) => s.regenerate);
   const addRef = useFlowStudioStore((s) => s.addRef);
   const togglePin = useFlowStudioStore((s) => s.togglePin);
-  const setCharacter = useFlowStudioStore((s) => s.setCharacter);
-  const setScene = useFlowStudioStore((s) => s.setScene);
   const remove = useFlowStudioStore((s) => s.remove);
   const generating = useFlowStudioStore((s) => s.generating);
   const model = useFlowStudioStore((s) => s.settings.model);
@@ -85,6 +78,7 @@ export function FlowViewer() {
   const stageRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
   const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
   const maxScaleRef = useRef(DEFAULT_MAX_SCALE);
 
@@ -94,13 +88,32 @@ export function FlowViewer() {
     setView(RESET);
   }, [mediaId]);
 
-  // Esc closes the overlay.
+  // Keep the active filmstrip thumbnail scrolled into view.
+  useEffect(() => {
+    const el = stripRef.current?.querySelector<HTMLElement>('[data-active="1"]');
+    el?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+  }, [mediaId]);
+
+  // Keyboard: Esc closes; ←/→ step through images (unless typing in the composer).
   useEffect(() => {
     if (!mediaId) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         if (modelOpen) setModelOpen(false);
         else close(null);
+        return;
+      }
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        const tag = (document.activeElement?.tagName ?? "").toLowerCase();
+        if (tag === "input" || tag === "textarea") return; // let the caret move
+        const st = useFlowStudioStore.getState();
+        const i = st.assets.findIndex((a) => a.mediaId === st.selectedMediaId);
+        if (i < 0) return;
+        const ni = e.key === "ArrowLeft" ? i - 1 : i + 1;
+        if (ni >= 0 && ni < st.assets.length) {
+          e.preventDefault();
+          st.select(st.assets[ni].mediaId);
+        }
       }
     };
     document.addEventListener("keydown", onKey);
@@ -136,9 +149,10 @@ export function FlowViewer() {
   }, [zoomAt, mediaId]);
 
   if (!mediaId) return null;
-  const charName = asset ? groupName(asset.tags, CHAR_PREFIX) : null;
-  const sceneName = asset ? groupName(asset.tags, SCENE_PREFIX) : null;
   const modelLabel = FLOW_MODELS.find((m) => m.id === model)?.label ?? model;
+  const index = assets.findIndex((a) => a.mediaId === mediaId);
+  const prevId = index > 0 ? assets[index - 1].mediaId : null;
+  const nextId = index >= 0 && index < assets.length - 1 ? assets[index + 1].mediaId : null;
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
@@ -188,7 +202,25 @@ export function FlowViewer() {
 
   return (
     <div className="fv" role="dialog" aria-modal="true">
-      {/* Slim floating toolbar — secondary actions, icon-only. */}
+      {/* Filmstrip of all images (top-center). */}
+      {assets.length > 1 && (
+        <div className="fv__strip" ref={stripRef}>
+          {assets.map((a) => (
+            <button
+              key={a.refId}
+              type="button"
+              data-active={a.mediaId === mediaId ? "1" : undefined}
+              className={`fv__thumb${a.mediaId === mediaId ? " is-active" : ""}`}
+              title={a.label}
+              onClick={() => close(a.mediaId)}
+            >
+              <img src={thumbUrl(a.mediaId, 96)} alt="" loading="lazy" decoding="async" />
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Action toolbar — top-left, in the dark margin (off the image). */}
       <div className="fv__tools">
         <button type="button" className="fv__tool" title="Dùng làm tham chiếu" onClick={() => addRef(mediaId)}>
           ➕
@@ -214,28 +246,6 @@ export function FlowViewer() {
             📌
           </button>
         )}
-        <button
-          type="button"
-          className={`fv__tool${charName ? " is-on" : ""}`}
-          title={charName ? `Nhân vật: ${charName}` : "Gắn nhân vật"}
-          onClick={() => {
-            const n = window.prompt("Tên nhân vật (để trống = bỏ gắn):", charName ?? "");
-            if (n !== null) setCharacter(mediaId, n.trim() || null);
-          }}
-        >
-          👤
-        </button>
-        <button
-          type="button"
-          className={`fv__tool${sceneName ? " is-on" : ""}`}
-          title={sceneName ? `Cảnh: ${sceneName}` : "Gắn cảnh"}
-          onClick={() => {
-            const n = window.prompt("Tên cảnh (để trống = bỏ gắn):", sceneName ?? "");
-            if (n !== null) setScene(mediaId, n.trim() || null);
-          }}
-        >
-          🎬
-        </button>
         <a className="fv__tool" title="Tải" href={mediaUrl(mediaId)} download={`${mediaId}.png`}>
           ⬇
         </a>
@@ -259,6 +269,28 @@ export function FlowViewer() {
       <button type="button" className="fv__close" onClick={() => close(null)} aria-label="Đóng">
         ✕
       </button>
+
+      {/* On-screen prev / next (also ←/→ keys). */}
+      {prevId && (
+        <button
+          type="button"
+          className="fv__nav fv__nav--prev"
+          title="Ảnh trước (←)"
+          onClick={() => close(prevId)}
+        >
+          ‹
+        </button>
+      )}
+      {nextId && (
+        <button
+          type="button"
+          className="fv__nav fv__nav--next"
+          title="Ảnh sau (→)"
+          onClick={() => close(nextId)}
+        >
+          ›
+        </button>
+      )}
 
       {/* Infinity-zoom stage. */}
       <div

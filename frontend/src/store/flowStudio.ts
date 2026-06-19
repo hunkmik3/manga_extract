@@ -57,6 +57,7 @@ export interface FlowModelOption {
   max: FlowSize; // largest resolution this model supports
 }
 export const FLOW_MODELS: FlowModelOption[] = [
+  { id: "gemini-3.1-flash-image", label: "Nano Banana 2", max: "4K" },
   { id: "gemini-3-pro-image", label: "Nano Banana Pro", max: "4K" },
   { id: "gemini-2.5-flash-image", label: "Nano Banana", max: "2K" },
 ];
@@ -142,7 +143,7 @@ function loadPersisted(): { settings: FlowGenSettings; recentPrompts: string[] }
   const fallback: FlowGenSettings = {
     aspect: "16:9",
     count: 2,
-    model: FLOW_MODELS[1].id,
+    model: "gemini-2.5-flash-image", // by id, not index — cheapest default, order-independent
     size: "1K",
     provider: "gemini",
   };

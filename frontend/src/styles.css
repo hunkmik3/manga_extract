@@ -6723,11 +6723,62 @@ button:disabled {
 }
 
 /* Slim floating toolbar (top-center) — icon-only secondary actions. */
-.fv__tools {
+/* Filmstrip — top-center. */
+.fv__strip {
   position: absolute;
-  top: 14px;
+  top: 12px;
   left: 50%;
   transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  gap: 6px;
+  max-width: min(620px, 70vw);
+  padding: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: rgba(20, 22, 28, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(6px);
+  scrollbar-width: thin;
+}
+.fv__strip::-webkit-scrollbar {
+  height: 6px;
+}
+.fv__strip::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+.fv__thumb {
+  flex: none;
+  width: 40px;
+  height: 52px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.12s, border-color 0.12s;
+}
+.fv__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 5px;
+  display: block;
+}
+.fv__thumb:hover {
+  opacity: 0.85;
+}
+.fv__thumb.is-active {
+  opacity: 1;
+  border-color: var(--accent);
+}
+.fv__tools {
+  position: absolute;
+  top: 12px;
+  left: 14px;
   z-index: 6;
   display: flex;
   gap: 4px;
@@ -6736,6 +6787,33 @@ button:disabled {
   border: 1px solid var(--border);
   border-radius: 12px;
   backdrop-filter: blur(6px);
+}
+
+/* On-screen prev / next arrows. */
+.fv__nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 6;
+  width: 44px;
+  height: 44px;
+  font-size: 26px;
+  line-height: 1;
+  color: var(--text);
+  background: rgba(20, 22, 28, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+}
+.fv__nav:hover {
+  border-color: var(--accent);
+}
+.fv__nav--prev {
+  left: 18px;
+}
+.fv__nav--next {
+  right: 18px;
 }
 .fv__tool {
   width: 34px;
