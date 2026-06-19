@@ -10,11 +10,21 @@ public link and tunnel stay the same.
 > secrets or user data.
 
 ## What's new in this update
-- **Nano Banana 2** (`gemini-3.1-flash-image`) added to the model picker, up to **4K**.
-- Image viewer: a **filmstrip** of all images on top — click a thumbnail,
-  press **← / →**, or use the on-screen **‹ ›** to move between images.
-- The viewer's action toolbar moved off the image (top-left); the
-  Character/Scene buttons were removed.
+- **Concurrent generations** — no more one-at-a-time; fire several at once. The
+  agent runs up to `FLOWBOARD_WORKER_CONCURRENCY` requests in parallel
+  (default 3; raise it on this box if the M4 has headroom).
+- **Paste an image** (Cmd/Ctrl+V) to upload + attach it as a reference.
+- **Atrium-only** engine (the direct-Gemini option was removed); variant counts
+  back to **1×–4×**.
+- Viewer streams a light **~2048px view image** (fast over the tunnel), upgrades
+  to the original on deep zoom; **fixed the black-screen on zoom+pan**.
+- Generation no longer **auto-opens** the detail popup (results land in the grid).
+- **Reuse prompt** now re-attaches the referenced images; **upload limit 20 MB**;
+  **Nano Banana 2** (`gemini-3.1-flash-image`, up to 4K) in the model picker;
+  viewer **filmstrip** with ← / → navigation.
+
+> The 20 MB upload, the 2048 view image, and the concurrency change are
+> **backend** — they only take effect after the agent restart in step 5.
 
 ---
 
