@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd service for the Flow Studio agent (FastAPI + worker + bundled SPA).
+
+  Binds 127.0.0.1 ONLY — never network-reachable directly; the public entry is
+  the Cloudflare tunnel (see cloudflared-config.example.yml). Auto-starts at
+  login and restarts on crash.
+
+  Install:
+    cp deploy/com.otsu.flowstudio.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.otsu.flowstudio.plist
+    launchctl enable gui/$(id -u)/com.otsu.flowstudio
+  Restart after a new build:
+    launchctl kickstart -k gui/$(id -u)/com.otsu.flowstudio
+  Stop / uninstall:
+    launchctl bootout gui/$(id -u)/com.otsu.flowstudio
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.otsu.flowstudio</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mac/manga_extract/manga_extract/agent/.venv/bin/python3</string>
+        <string>-m</string>
+        <string>uvicorn</string>
+        <string>flowboard.main:app</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8101</string>
+    </array>
+
+    <!-- CWD must be agent/ so `flowboard.*` imports resolve; .env is auto-loaded
+         from the repo root by flowboard/__init__.py. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/mac/manga_extract/manga_extract/agent</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mac/manga_extract/manga_extract/agent/storage/agent.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mac/manga_extract/manga_extract/agent/storage/agent.err.log</string>
+</dict>
+</plist>

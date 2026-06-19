@@ -20,7 +20,7 @@ import asyncio
 import base64
 import logging
 import os
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import httpx
 
@@ -32,7 +32,7 @@ _API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 # spurious failure. (Observed: same call timing out at 120 s, then completing
 # in 11-17 s once load eased.)
 _TIMEOUT_S = 240.0
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 5
 _BACKOFF_S = 2.0
 
 # Flow aspect enum → Gemini imageConfig.aspectRatio
@@ -42,10 +42,11 @@ _ASPECTS = {
     "IMAGE_ASPECT_RATIO_SQUARE": "1:1",
 }
 
-# API errors retrying can never fix → fail fast (mirrors the Flow bridge's
-# classifier): quota, auth, and content blocks. 503/504/timeouts ARE retried —
-# that's the "high demand" case that does clear.
-_FATAL_STATUSES = {400, 401, 403, 404, 429}
+# API errors retrying can never fix → fail fast: bad request, auth, not-found.
+# 429 (RESOURCE_EXHAUSTED) is NOT here on purpose — Atrium confirmed it's an
+# intermittent Nano Banana / Veo model error (not a real quota) that "in most
+# cases succeeds after one or more retries", so we retry it like 503.
+_FATAL_STATUSES = {400, 401, 403, 404}
 
 
 def is_api_model(image_model: object) -> bool:
@@ -119,6 +120,112 @@ async def _generate_once(client: httpx.AsyncClient, model: str, key: str, body: 
     return out
 
 
+def _build_generate_body(
+    prompt: str,
+    reference_images: Optional[Sequence[bytes]],
+    aspect_ratio: Optional[str],
+    image_size: Optional[str],
+) -> dict:
+    """Text→image body (no source frame) for the Flow-clone studio.
+
+    Optional reference images (``@character`` / ``@scene`` views) are
+    attached BEFORE the instruction text so the model conditions on them
+    for consistency without treating any one as the literal canvas.
+    ``aspect_ratio`` is the native Gemini string ("16:9" / "4:3" / "1:1"
+    / "3:4" / "9:16"); ``image_size`` is "1K" / "2K" / "4K" (Nano Banana
+    Pro only) — both go straight into ``imageConfig``.
+    """
+    parts: list[dict] = []
+    for ref in reference_images or []:
+        if ref:
+            parts.append({"inline_data": {"mime_type": "image/png", "data": _b64(bytes(ref))}})
+    parts.append({"text": prompt})
+    body: dict = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"responseModalities": ["IMAGE"]},
+    }
+    image_config: dict = {}
+    if aspect_ratio:
+        image_config["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_config["imageSize"] = image_size
+    if image_config:
+        body["generationConfig"]["imageConfig"] = image_config
+    return body
+
+
+async def _run_variants(
+    image_model: str, key: str, body: dict, n: int, max_attempts: int, *, tag: str,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> list[bytes]:
+    """Issue ``n`` generate calls IN PARALLEL (the API yields one image each).
+    Each variant retries 503/"high demand"/transport/429 with backoff; fatal API
+    errors fail that variant. Partial success wins (return whatever landed).
+    ``on_progress(done, total)`` fires as each variant completes (out of order)."""
+    from flowboard.services.comic.bridge import BridgeEditError
+
+    completed = 0
+
+    async def _one(client: httpx.AsyncClient) -> bytes:
+        nonlocal completed
+        last = "unknown"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                out = await _generate_once(client, image_model, key, body)
+                completed += 1  # asyncio is single-threaded → no lock needed
+                if on_progress:
+                    on_progress(completed, n)
+                return out
+            except BridgeEditError:
+                raise  # fatal for this variant — don't retry
+            except Exception as exc:  # noqa: BLE001 — 503 / 429 / timeouts / transport
+                last = f"{type(exc).__name__}: {exc}"[:200].rstrip(": ")
+                logger.warning("gemini_api(%s) attempt %d/%d: %s", tag, attempt, max_attempts, last)
+                if attempt < max_attempts:
+                    await asyncio.sleep(_BACKOFF_S * attempt)
+        raise BridgeEditError(f"gemini_api: {last}", attempts=max_attempts)
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
+        results = await asyncio.gather(*[_one(client) for _ in range(n)], return_exceptions=True)
+
+    outs = [r for r in results if not isinstance(r, BaseException)]
+    if outs:
+        if len(outs) < n:
+            logger.warning("gemini_api(%s): %d/%d variant(s) ok (partial)", tag, len(outs), n)
+        else:
+            logger.info("gemini_api(%s) ok: %d/%d via %s", tag, len(outs), n, image_model)
+        return outs
+    first = next((r for r in results if isinstance(r, BaseException)), None)
+    if isinstance(first, BridgeEditError):
+        raise first
+    raise BridgeEditError(f"gemini_api: {first}", attempts=max_attempts)
+
+
+async def generate_image_variants(
+    prompt: str,
+    reference_images: Optional[Sequence[bytes]] = None,
+    *,
+    image_model: str,
+    aspect_ratio: str = "1:1",
+    variant_count: int = 1,
+    image_size: Optional[str] = None,
+    max_attempts: int = MAX_ATTEMPTS,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> list[bytes]:
+    """Pure text→image (Flow-clone studio): prompt + optional reference images
+    → 1-4 generated images. No source frame. Raises ``BridgeEditError`` if the
+    key is missing or the model fails fatally before any variant lands."""
+    from flowboard.services.comic.bridge import BridgeEditError
+
+    key = api_key()
+    if not key:
+        raise BridgeEditError("gemini_api: GEMINI_API_KEY not set in .env", attempts=0)
+
+    body = _build_generate_body(prompt, reference_images, aspect_ratio, image_size)
+    n = max(1, min(int(variant_count or 1), 4))
+    return await _run_variants(image_model, key, body, n, max_attempts, tag="gen", on_progress=on_progress)
+
+
 async def edit_image_variants(
     image_bytes: bytes,
     prompt: str,
@@ -129,6 +236,7 @@ async def edit_image_variants(
     mime: str = "image/png",
     variant_count: int = 1,
     max_attempts: int = MAX_ATTEMPTS,
+    on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> list[bytes]:
     """Drop-in equivalent of the Flow bridge's ``edit_image_variants`` for
     ``gemini-*`` models. Variants are separate sequential calls (the API yields
@@ -143,31 +251,4 @@ async def edit_image_variants(
 
     body = _build_body(image_bytes, prompt, reference_images, aspect_ratio, mime)
     n = max(1, min(int(variant_count or 1), 4))
-    outs: list[bytes] = []
-    last = "unknown"
-    async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
-        for _ in range(n):
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    outs.append(await _generate_once(client, image_model, key, body))
-                    break
-                except BridgeEditError:
-                    if outs:
-                        # Partial success (some variants already in hand) — a
-                        # later variant hitting a block shouldn't void them.
-                        logger.warning("gemini_api: variant failed fatally after %d ok", len(outs))
-                        return outs
-                    raise
-                except Exception as exc:  # noqa: BLE001 — 503 / timeouts / transport
-                    # httpx timeout exceptions stringify to "" — keep the class
-                    # name so the surfaced error is never blank.
-                    last = f"{type(exc).__name__}: {exc}"[:200].rstrip(": ")
-                    logger.warning("gemini_api attempt %d/%d: %s", attempt, max_attempts, last)
-                    if attempt < max_attempts:
-                        await asyncio.sleep(_BACKOFF_S * attempt)
-            else:
-                if outs:
-                    return outs
-                raise BridgeEditError(f"gemini_api: {last}", attempts=max_attempts)
-    logger.info("gemini_api ok: %d/%d variant(s) via %s", len(outs), n, image_model)
-    return outs
+    return await _run_variants(image_model, key, body, n, max_attempts, tag="edit", on_progress=on_progress)

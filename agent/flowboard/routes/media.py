@@ -41,6 +41,50 @@ async def get_media_bytes(media_id: str):
     return FileResponse(path=str(path), media_type=mime)
 
 
+_THUMB_DIR = media_service.MEDIA_CACHE_DIR / "thumbs"
+_THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@api_router.get("/{media_id}/thumb")
+def get_media_thumb(media_id: str, w: int = 256):
+    """Downscaled JPEG thumbnail for grids/pickers — avoids shipping multi-MB
+    full-res images to render 40-250px tiles. Generated once, cached on disk and
+    in the browser (Cache-Control)."""
+    media_id = media_service.normalize_media_id(media_id)
+    if not media_service.is_valid_media_id(media_id):
+        raise HTTPException(status_code=400, detail="invalid media_id")
+    w = max(64, min(int(w), 640))
+    src = media_service.cached_path(media_id)
+    if src is None:
+        raise HTTPException(status_code=404, detail="not cached")
+
+    thumb = _THUMB_DIR / f"{media_id}_{w}.jpg"
+    if not thumb.exists() or thumb.stat().st_mtime < src.stat().st_mtime:
+        try:
+            import cv2
+            import numpy as np
+
+            img = cv2.imdecode(np.frombuffer(src.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                return FileResponse(path=str(src))  # not decodable → original
+            h, wd = img.shape[:2]
+            if max(h, wd) > w:
+                s = w / max(h, wd)
+                img = cv2.resize(img, (max(1, round(wd * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                return FileResponse(path=str(src))
+            thumb.write_bytes(buf.tobytes())
+        except Exception:  # noqa: BLE001 — any failure → serve the original
+            return FileResponse(path=str(src))
+
+    return FileResponse(
+        path=str(thumb),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @api_router.get("/{media_id}/status")
 def get_media_status(media_id: str):
     media_id = media_service.normalize_media_id(media_id)

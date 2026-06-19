@@ -1,0 +1,19 @@
+# Cloudflare *named* tunnel config (durable; not the throwaway trycloudflare URL).
+#
+# Copy to ~/.cloudflared/config.yml and fill in your tunnel UUID + hostname.
+# Prereqs: a domain on your Cloudflare account (e.g. otsulabs.com).
+#
+#   cloudflared tunnel login                       # browser auth → picks the zone
+#   cloudflared tunnel create flow-studio          # → prints UUID, writes ~/.cloudflared/<UUID>.json
+#   cloudflared tunnel route dns flow-studio flow.otsulabs.com
+#   # put this file at ~/.cloudflared/config.yml, then install as a service:
+#   sudo cloudflared service install                # runs at boot, restarts on crash
+#
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /Users/mac/.cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: flow.otsulabs.com
+    service: http://127.0.0.1:8101
+  # everything else → 404
+  - service: http_status:404

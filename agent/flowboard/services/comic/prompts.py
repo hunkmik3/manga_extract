@@ -187,6 +187,19 @@ def mood_clause(mood: str | None) -> str:
     return ""
 
 
+# Final restyle pass — applied as its OWN step to an already-cleaned, extended
+# 9:16 panel, so the content/composition is locked and only the art style
+# changes. Pairs with style_frame_clause (the target style ref + descriptor).
+RESTYLE_PROMPT = (
+    "Re-render this finished comic / anime panel in a different ART STYLE while keeping the image's "
+    "content completely unchanged. Keep EXACTLY the same: every character and their identity, pose, "
+    "expression, and position; the camera angle, framing, and composition; the background, props, "
+    "and the whole scene; the lighting direction; the 9:16 frame. Do NOT add, remove, move, or "
+    "redraw any character or object, and do NOT change what is happening. Change ONLY the rendering "
+    "style."
+)
+
+
 def style_frame_clause(descriptor: str | None = None, *, has_ref: bool = False) -> str:
     """Clause that pins a project-wide STYLE FRAME onto a panel render — a
     uniform target art style applied across every panel of the chapter.

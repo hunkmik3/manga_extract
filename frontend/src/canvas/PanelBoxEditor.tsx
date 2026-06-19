@@ -197,7 +197,7 @@ export function PanelBoxEditor({
                   onPointerDown={(e) => e.stopPropagation()}
                   onClick={(e) => { e.stopPropagation(); deleteBox(b.id); }}
                   title="Delete box"
-                  style={{ position: "absolute", top: -10, right: -10, width: 18, height: 18, borderRadius: 9, border: "none", background: "#ef4444", color: "#fff", fontSize: 11, lineHeight: "18px", cursor: "pointer", padding: 0 }}
+                  style={{ position: "absolute", top: -24, right: -10, width: 18, height: 18, borderRadius: 9, border: "none", background: "#ef4444", color: "#fff", fontSize: 11, lineHeight: "18px", cursor: "pointer", padding: 0, zIndex: 5 }}
                 >×</button>
                 {RESIZE_HANDLES.map((H) => (
                   <div

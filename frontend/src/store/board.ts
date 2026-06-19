@@ -302,7 +302,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   async loadInitialBoard() {
     set({ loading: true, error: null });
     try {
-      let boards = await listBoards();
+      let boards = await listBoards("manga");
       // Prefer the user's last-active board if it still exists; fall back
       // to the first board in the list. Without this, refresh always
       // snapped back to boards[0] regardless of what was selected before.
@@ -311,7 +311,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         (persistedId !== null && boards.find((b) => b.id === persistedId)) ||
         boards[0];
       if (!board) {
-        board = await createBoard("Untitled");
+        board = await createBoard("Untitled", "manga");
         boards = [board];
       }
       const detail = await getBoard(board.id);
@@ -337,7 +337,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   async refreshBoardList() {
     try {
-      const boards = await listBoards();
+      const boards = await listBoards("manga");
       set({ boards });
     } catch {
       // non-fatal
@@ -367,7 +367,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   async createNewBoard(name) {
     try {
-      const board = await createBoard(name || "Untitled");
+      const board = await createBoard(name || "Untitled", "manga");
       // Add to list (front of list so the newly-created project shows up
       // at the top of the sidebar) and switch to it.
       set((s) => ({ boards: [board, ...s.boards] }));
@@ -395,7 +395,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         await get().switchBoard(remaining[0].id);
       } else {
         try {
-          const board = await createBoard("Untitled");
+          const board = await createBoard("Untitled", "manga");
           set({ boards: [board] });
           await get().switchBoard(board.id);
         } catch (err) {

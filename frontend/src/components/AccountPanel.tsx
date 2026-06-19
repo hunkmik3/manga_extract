@@ -3,7 +3,6 @@ import {
   getAuthMe,
   getFlowConnections,
   logoutExtension,
-  scanExtension,
   setActiveFlowConnection,
   type AuthMe,
   type FlowConnection,
@@ -38,7 +37,6 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
   // while the extension is still doing its first round-trip.
   const [pollsWithoutTier, setPollsWithoutTier] = useState(0);
   // Scan / logout transient state for button affordances.
-  const [scanState, setScanState] = useState<"idle" | "scanning" | "no-extension">("idle");
   const [logoutPending, setLogoutPending] = useState(false);
   // Bumped by handleScan / handleLogout to kick the poll effect into
   // re-running immediately instead of waiting for the next 5s tick.
@@ -138,30 +136,6 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
     }
   }
 
-  // Scan: probe the extension state and, if a connection is open but
-  // userinfo is missing, ask the extension to re-fetch from Google.
-  // The poll loop above picks up the new state on the next /me hit.
-  async function handleScan() {
-    if (scanState === "scanning") return;
-    setScanState("scanning");
-    try {
-      const res = await scanExtension();
-      if (!res.extension_connected) {
-        setScanState("no-extension");
-        // Auto-clear the warning after 8s so the button doesn't get
-        // stuck — gives the user time to read it but recovers on its own.
-        setTimeout(() => setScanState("idle"), 8000);
-        return;
-      }
-      // Extension is alive — kick the poll loop so the chip refreshes
-      // as soon as userinfo lands. The 5s default would feel sluggish
-      // right after a deliberate user action.
-      setPollNonce((n) => n + 1);
-      setScanState("idle");
-    } catch {
-      setScanState("idle");
-    }
-  }
 
   // Surface "new version available" right under the account chip so
   // users notice without having to open Settings. GitHub's release
@@ -298,55 +272,18 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
             )}
           </div>
         )}
-        {!collapsed && !email && (
-          // Disconnected — skip the placeholder "Flow account" / "Connected
-          // via extension" copy entirely. When the scan probe says no
-          // extension is reachable, swap the bare button for a short
-          // recovery hint so the user knows the concrete next steps
-          // (refresh the Flow tab, reload the extension) instead of
-          // bouncing off a generic "not found" warning.
-          <div className="account-panel__meta account-panel__meta--disconnected">
-            {scanState === "no-extension" ? (
-              <div className="account-panel__scan-hint" role="alert">
-                <span className="account-panel__scan-hint-title">
-                  ⚠ Extension not detected
-                </span>
-                <span className="account-panel__scan-hint-text">
-                  Refresh the Flow tab, then reload the Flowboard extension.
-                </span>
-                <button
-                  type="button"
-                  className="account-panel__scan-btn"
-                  onClick={handleScan}
-                  title="Scan again for an extension connection"
-                >
-                  Try again
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                className="account-panel__scan-btn"
-                onClick={handleScan}
-                disabled={scanState === "scanning"}
-                title="Scan for an extension connection and re-fetch user info"
-              >
-                {scanState === "scanning" ? "Scanning…" : "🔍 Scan extension"}
-              </button>
-            )}
-          </div>
-        )}
-        {email && (
-          <button
-            type="button"
-            className="account-panel__cog"
-            onClick={() => setOpen((v) => !v)}
-            aria-label="Open settings"
-            title="Settings"
-          >
-            ⚙
-          </button>
-        )}
+        {/* Extension / Flow-account UI is hidden — this build generates
+            server-side via the image API, so there's no extension to scan
+            or connect. The settings cog stays always-available below. */}
+        <button
+          type="button"
+          className="account-panel__cog"
+          onClick={() => setOpen((v) => !v)}
+          aria-label="Open settings"
+          title="Settings"
+        >
+          ⚙
+        </button>
       </div>
       {!collapsed && (
         <div className="account-panel__version-row">

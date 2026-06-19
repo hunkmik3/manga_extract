@@ -103,6 +103,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
   const isBusy = status === "queued" || status === "running";
   const errorMsg = typeof data.error === "string" ? data.error : undefined;
   const characterRefs = findCharacterDb();
+  const styleFrameSet = findStyleFrame() !== null;   // a project style frame is configured
   const useCharacterRefs = Boolean(data.useCharacterRefs);
   // Engine + model in one pick. `gemini-*` = direct Gemini API via the key in
   // .env (default — no extension/Flow tab needed, runs on API credits);
@@ -210,12 +211,38 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     setCellAssign(i, { charId: value || undefined });
   }
 
-  // Merge the project-wide style frame (ref image + descriptor) into a request's
-  // params. Read live from the board so the freshest style applies.
-  function applyStyleFrame(params: Record<string, unknown>) {
+  // 🎨 FINAL STYLE PASS — separate from clean+extend. Restyles already-finished
+  // cells to the project style frame, so content is locked and only the art
+  // style changes. Pass indexes to style specific cells, or omit for all.
+  const [styling, setStyling] = useState(false);
+  async function styleCells(indexes?: number[]) {
+    if (isBusy || styling || regenning.length > 0) return;
     const sf = findStyleFrame();
-    if (sf?.styleRefMediaId) params.style_ref_media_id = sf.styleRefMediaId;
-    if (sf?.styleDescriptor && sf.styleDescriptor.trim()) params.style_descriptor = sf.styleDescriptor.trim();
+    if (!sf || (!sf.styleRefMediaId && !sf.styleDescriptor?.trim())) {
+      patchComicNode(rfId, { status: "error", error: "Set a 🎨 style frame in the Character DB node first" });
+      return;
+    }
+    const targets = (indexes ?? cells.map((c, i) => (typeof c === "string" && c ? i : -1)).filter((i) => i >= 0));
+    if (!targets.length) return;
+    const projectId = await project();
+    if (!projectId) return;
+    setStyling(true);
+    try {
+      const params: Record<string, unknown> = { project_id: projectId, cells, indexes: targets, image_model: imageModel };
+      if (sf.styleRefMediaId) params.style_ref_media_id = sf.styleRefMediaId;
+      if (sf.styleDescriptor?.trim()) params.style_descriptor = sf.styleDescriptor.trim();
+      const result = await runRequestToResult(createRequest({ type: "style_cells", node_id: parseInt(rfId, 10), params }));
+      const newCells = (result.cells as (string | null)[]) ?? cells;
+      patchComicNode(rfId, {
+        mediaId: (result.mediaId as string) ?? mediaId,
+        cells: newCells, width: result.width, height: result.height, status: "done", error: undefined,
+      });
+      targets.forEach((i) => { const c = newCells[i]; if (typeof c === "string" && c) pushHistory(i, [c]); });
+    } catch (err) {
+      patchComicNode(rfId, { status: "error", error: `style: ${String(err)}` });
+    } finally {
+      setStyling(false);
+    }
   }
 
   async function project(opts?: { needsFlow?: boolean }): Promise<string | null> {
@@ -246,7 +273,6 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     if (characterRefs?.length) params.characters = characterRefs;
     params.auto_match = useCharacterRefs;
     params.image_model = imageModel;
-    applyStyleFrame(params);
     runComicRequest(
       rfId,
       () => createRequest({ type: "combine_panels", node_id: parseInt(rfId, 10), params }),
@@ -308,7 +334,6 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       if (L.characterRefs?.length) params.characters = L.characterRefs;
       params.auto_match = L.useCharacterRefs;
       params.image_model = L.imageModel;
-      applyStyleFrame(params);
       if (L.regenPrompt.trim()) params.prompt = L.regenPrompt.trim();
       if (L.regenVariants > 1) params.variant_count = L.regenVariants;
       try {
@@ -495,7 +520,7 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       <label style={{ fontSize: 11, opacity: 0.75 }}>Combine 2×2 · {panels.length} panels</label>
       <label
         style={{ fontSize: 10, opacity: 0.75, display: "flex", alignItems: "center", gap: 5 }}
-        title="Engine + model. API = direct Gemini API via your key in .env (no extension/Flow tab, separate quota/billing). Flow = the extension bridge on your Flow subscription; Flow quota is PER MODEL per day, so NB2 still works after Pro's quota is exhausted."
+        title="Image model. Nano Banana Pro = highest quality; flash = faster/cheaper. When Pro is overloaded (503), switch to flash or retry."
       >
         Model
         <select
@@ -504,14 +529,8 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
           onChange={(e) => patchComicNode(rfId, { imageModel: e.target.value })}
           style={{ flex: 1, minWidth: 0, fontSize: 10, padding: "1px 4px" }}
         >
-          <optgroup label="Gemini API (key — no extension)">
-            <option value="gemini-3-pro-image">API · Nano Banana Pro</option>
-            <option value="gemini-2.5-flash-image">API · Nano Banana (flash)</option>
-          </optgroup>
-          <optgroup label="Flow (extension bridge)">
-            <option value="NANO_BANANA_PRO">Flow · Nano Banana Pro</option>
-            <option value="NANO_BANANA_2">Flow · Nano Banana 2</option>
-          </optgroup>
+          <option value="gemini-3-pro-image">Nano Banana Pro</option>
+          <option value="gemini-2.5-flash-image">Nano Banana (flash)</option>
         </select>
       </label>
       {characterRefs?.length ? (
@@ -693,6 +712,13 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
                         title={assign.charId ? "⭐ Bless this cell as a frozen reference for the chosen character (newest first)" : "Pick a character first"}
                         style={{ flexShrink: 0, padding: "1px 4px", fontSize: 10 }}
                       >{promoted === i ? "✓" : "⭐"}</button>
+                      <button
+                        className="comic-btn comic-btn--sm"
+                        onClick={() => void styleCells([i])}
+                        disabled={!styleFrameSet || !cells[i] || styling}
+                        title={styleFrameSet ? "🎨 Restyle this cell to the project style frame (final style pass — content kept, only the art style changes)" : "Set a style frame in Character DB first"}
+                        style={{ flexShrink: 0, padding: "1px 4px", fontSize: 10 }}
+                      >🎨</button>
                     </div>
                   ) : null}
                   {cells[i] && camTag ? (
@@ -714,6 +740,17 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
             })}
           </div>
         </>
+      )}
+
+      {cells.some((c) => typeof c === "string" && c) && (
+        <button
+          className="comic-btn"
+          onClick={() => void styleCells()}
+          disabled={!styleFrameSet || styling || isBusy || regenning.length > 0}
+          title={styleFrameSet ? "🎨 Final style pass: restyle all cells to the project style frame (content locked, only the art style changes). A separate step after clean+extend." : "Set a 🎨 style frame in the Character DB node first"}
+        >
+          {styling ? "Styling…" : "🎨 Apply style (all cells)"}
+        </button>
       )}
 
       {(mediaId || cells.some((c) => typeof c === "string" && c)) && (

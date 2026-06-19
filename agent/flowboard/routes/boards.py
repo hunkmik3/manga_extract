@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlmodel import delete as sql_delete, select
@@ -21,6 +23,7 @@ router = APIRouter(prefix="/api/boards", tags=["boards"])
 
 class BoardCreate(BaseModel):
     name: str
+    kind: str = "manga"
 
 
 class BoardUpdate(BaseModel):
@@ -28,15 +31,20 @@ class BoardUpdate(BaseModel):
 
 
 @router.get("")
-def list_boards():
+def list_boards(kind: Optional[str] = None):
+    """List boards. ``kind`` scopes to one surface — "manga" (node board) or
+    "flow" (Flow Studio) — so the two keep separate project lists."""
     with get_session() as s:
-        return s.exec(select(Board)).all()
+        stmt = select(Board)
+        if kind is not None:
+            stmt = stmt.where(Board.kind == kind)
+        return s.exec(stmt).all()
 
 
 @router.post("")
 def create_board(body: BoardCreate):
     with get_session() as s:
-        board = Board(name=body.name)
+        board = Board(name=body.name, kind=body.kind or "manga")
         s.add(board)
         s.commit()
         s.refresh(board)

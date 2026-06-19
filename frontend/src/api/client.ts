@@ -116,6 +116,7 @@ export type NodeStatus = "idle" | "queued" | "running" | "done" | "error";
 export interface Board {
   id: number;
   name: string;
+  kind?: string; // "manga" | "flow" — which surface owns this project
   created_at: string;
 }
 
@@ -154,14 +155,14 @@ export interface BoardDetail {
 
 // ── API methods ──────────────────────────────────────────────────────────────
 
-export function listBoards(): Promise<Board[]> {
-  return api<Board[]>("/api/boards");
+export function listBoards(kind?: string): Promise<Board[]> {
+  return api<Board[]>(`/api/boards${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`);
 }
 
-export function createBoard(name: string): Promise<Board> {
+export function createBoard(name: string, kind?: string): Promise<Board> {
   return api<Board>("/api/boards", {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(kind ? { name, kind } : { name }),
   });
 }
 
@@ -550,6 +551,13 @@ export function mediaUrl(mediaId: string): string {
   return `/media/${encodeURIComponent(clean)}`;
 }
 
+/** Downscaled JPEG for grids/pickers (cached). Use mediaUrl for full-res
+ *  detail views / downloads. */
+export function thumbUrl(mediaId: string, w = 256): string {
+  const clean = mediaId.replace(/^media\//, "");
+  return `/api/media/${encodeURIComponent(clean)}/thumb?w=${w}`;
+}
+
 // ── Upload ───────────────────────────────────────────────────────────────────
 
 export interface UploadResponse {
@@ -919,6 +927,7 @@ export async function listReferences(params?: {
   q?: string;
   pinned_first?: boolean;
   limit?: number;
+  source_board_id?: number;
 }): Promise<ReferenceItem[]> {
   const search = new URLSearchParams();
   if (params?.q) search.set("q", params.q);
@@ -926,6 +935,9 @@ export async function listReferences(params?: {
     search.set("pinned_first", String(params.pinned_first));
   }
   if (params?.limit !== undefined) search.set("limit", String(params.limit));
+  if (params?.source_board_id !== undefined) {
+    search.set("source_board_id", String(params.source_board_id));
+  }
   const qs = search.toString();
   const rows = await api<ReferenceRowWire[]>(
     `/api/references${qs ? `?${qs}` : ""}`,

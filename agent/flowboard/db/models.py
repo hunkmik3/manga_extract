@@ -12,6 +12,9 @@ def _utcnow() -> datetime:
 class Board(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
+    # Which app a board/project belongs to: "manga" (the node board) or "flow"
+    # (Flow Studio). Lets the two surfaces keep fully separate project lists.
+    kind: str = Field(default="manga", index=True)
     created_at: datetime = Field(default_factory=_utcnow)
 
 

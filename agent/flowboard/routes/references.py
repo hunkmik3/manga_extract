@@ -120,15 +120,20 @@ def list_references(
     q: Optional[str] = None,
     pinned_first: bool = True,
     limit: int = 200,
+    source_board_id: Optional[int] = None,
 ):
     """List references, sorted (pinned DESC, position ASC, created_at DESC).
 
     ``q``: case-insensitive substring match against label OR ai_brief.
     ``pinned_first``: when False, drop pinned from the ORDER BY so
     raw insertion order surfaces (debug / testing convenience).
+    ``source_board_id``: scope to one project/board — Flow Studio uses this so
+    each project shows only its own assets.
     """
     with get_session() as s:
         stmt = select(Reference)
+        if source_board_id is not None:
+            stmt = stmt.where(Reference.source_board_id == source_board_id)
         if q:
             needle = f"%{q.lower()}%"
             # SQLite's LIKE is case-insensitive for ASCII by default but

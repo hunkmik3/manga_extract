@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useBoardStore } from "../store/board";
+import { useAppModeStore } from "../store/appMode";
 import { AccountPanel } from "./AccountPanel";
 import {
   getFlowSyncStatus,
@@ -18,6 +19,7 @@ export function ProjectSidebar() {
   const activeId = useBoardStore((s) => s.boardId);
   const switchBoard = useBoardStore((s) => s.switchBoard);
   const createNewBoard = useBoardStore((s) => s.createNewBoard);
+  const setAppMode = useAppModeStore((s) => s.setMode);
   const deleteBoardById = useBoardStore((s) => s.deleteBoardById);
   const renameBoard = useBoardStore((s) => s.renameBoard);
 
@@ -214,6 +216,14 @@ export function ProjectSidebar() {
       </div>
       {!collapsed && (
         <>
+          <button
+            type="button"
+            className="project-sidebar__flow-cta"
+            onClick={() => setAppMode("flow")}
+            title="Mở Flow Studio — tạo ảnh kiểu Google Flow bằng API"
+          >
+            ✦ Flow Studio
+          </button>
           <div className="project-sidebar__row">
             <button
               type="button"

@@ -8,3 +8,4 @@ httpx>=0.27
 # Comic pipeline — Node 1 panel extraction (pure OpenCV XY-cut, no model).
 opencv-python-headless>=4.9
 numpy>=1.26
+boto3>=1.40

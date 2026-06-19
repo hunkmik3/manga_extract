@@ -50,6 +50,16 @@ def init_db() -> None:
                 )
                 conn.commit()
 
+        # Board.kind — separates Manga boards from Flow Studio projects. Existing
+        # rows default to "manga" (they predate Flow Studio). Idempotent ALTER.
+        if insp.has_table("board"):
+            board_cols = {c["name"] for c in insp.get_columns("board")}
+            if "kind" not in board_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE board ADD COLUMN kind VARCHAR DEFAULT 'manga'"
+                )
+                conn.commit()
+
     SQLModel.metadata.create_all(engine)
 
 

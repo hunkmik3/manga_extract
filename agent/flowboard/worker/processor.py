@@ -1374,10 +1374,6 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     # CCIP appearance-match is the opt-in fallback; an explicit per-cell char_id
     # always wins regardless of this flag.
     auto_match = bool(params.get("auto_match", True))
-    # Project-wide STYLE FRAME: a uniform target art style applied to every panel
-    # (ref image and/or text descriptor). Loaded once for the whole combine.
-    style_bytes = await asyncio.to_thread(_style_ref_bytes, params.get("style_ref_media_id"))
-    style_desc = params.get("style_descriptor")
     pid = project_id.strip()
 
     raws = await asyncio.to_thread(
@@ -1396,12 +1392,9 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
         if raw is None:
             return None, None
         sp = spec if isinstance(spec, dict) else {}
-        char_refs = await asyncio.to_thread(
+        refs = await asyncio.to_thread(
             lambda: _panel_reference_bytes(raw, sp, chars, include_page=False, auto_match=auto_match)
         )
-        # Char identity/view refs first, then the project style frame LAST; cap
-        # at the bridge ref budget so the style ref never crowds out identity.
-        refs = (char_refs + [style_bytes])[:5] if style_bytes else char_refs
         # Pre-pad the panel onto a 9:16 canvas with edge-replicated seed bands
         # (same trick as the standalone clean node): the model then OUTPAINTS
         # the full frame instead of letterboxing. Without this, an extreme-wide
@@ -1422,13 +1415,12 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
                 outfit=sp.get("outfit"),
                 override_axes=sp.get("override_axes"),
             )
-            if char_refs
+            if refs
             else ""
         )
         if sp.get("bg_type") not in prompts.NO_ENV_BG_TYPES:
             clause += prompts.environment_clause(sp.get("env_descriptor"))
         clause += prompts.mood_clause(sp.get("mood"))
-        clause += prompts.style_frame_clause(style_desc, has_ref=bool(style_bytes))
         prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16 + clause
         async with sem:
             try:
@@ -1516,16 +1508,13 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     image_model = image_model if isinstance(image_model, str) and image_model else None
     chars = params.get("characters")
     auto_match = bool(params.get("auto_match", True))
-    style_bytes = await asyncio.to_thread(_style_ref_bytes, params.get("style_ref_media_id"))
-    style_desc = params.get("style_descriptor")
 
     raw = await asyncio.to_thread(_source_image_bytes, panel)
     if raw is None:
         return {}, "no_source_image"
-    char_refs = await asyncio.to_thread(
+    refs = await asyncio.to_thread(
         lambda: _panel_reference_bytes(raw, panel, chars, include_page=False, auto_match=auto_match)
     )
-    refs = (char_refs + [style_bytes])[:5] if style_bytes else char_refs
     # Optional custom prompt — lets the user steer a single re-gen (e.g. "make
     # the lighting warmer") instead of the default clean+extend. Blank → default.
     custom = params.get("prompt")
@@ -1538,13 +1527,12 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
             outfit=panel.get("outfit"),
             override_axes=panel.get("override_axes"),
         )
-        if char_refs
+        if refs
         else ""
     )
     if panel.get("bg_type") not in prompts.NO_ENV_BG_TYPES:
         clause += prompts.environment_clause(panel.get("env_descriptor"))
     clause += prompts.mood_clause(panel.get("mood"))
-    clause += prompts.style_frame_clause(style_desc, has_ref=bool(style_bytes))
     prompt = base + clause
 
     # Same 9:16 pre-pad as the combine path: give the model a full-frame canvas
@@ -2112,6 +2100,76 @@ async def _handle_restitch_cells(params: dict) -> tuple[dict, Optional[str]]:
     return {"mediaId": mid, "cells": cells[:4], "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
+async def _handle_style_cells(params: dict) -> tuple[dict, Optional[str]]:
+    """FINAL STYLE PASS — restyle already-cleaned/extended 9:16 cells to the
+    project style frame, as a separate step from clean+extend so content is
+    locked and only the art style changes. Restyles the given cell indexes (or
+    all), pushing the styled results back + a fresh 2×2 composite."""
+    from flowboard.services.comic import bridge, prompts
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    cells = params.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return {}, "missing_cells"
+    image_model = params.get("image_model")
+    image_model = image_model if isinstance(image_model, str) and image_model else None
+    style_bytes = await asyncio.to_thread(_style_ref_bytes, params.get("style_ref_media_id"))
+    style_desc = params.get("style_descriptor")
+    style_desc = style_desc.strip() if isinstance(style_desc, str) else ""
+    if not style_bytes and not style_desc:
+        return {}, "missing_style"
+
+    raw_idxs = params.get("indexes")
+    if isinstance(raw_idxs, list) and raw_idxs:
+        targets = [i for i in raw_idxs if isinstance(i, int) and 0 <= i < len(cells)
+                   and isinstance(cells[i], str) and cells[i]]
+    else:
+        targets = [i for i, c in enumerate(cells) if isinstance(c, str) and c]
+    if not targets:
+        return {}, "no_cells"
+
+    prompt = prompts.RESTYLE_PROMPT + prompts.style_frame_clause(style_desc or None, has_ref=bool(style_bytes))
+    refs = [style_bytes] if style_bytes else None
+    pid = project_id.strip()
+    sem = asyncio.Semaphore(COMBINE_CONCURRENCY)
+
+    async def _style_one(i: int):
+        path = media_service.cached_path(cells[i])
+        if path is None:
+            return i, None
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return i, None
+        async with sem:
+            try:
+                out = await bridge.edit_image(
+                    raw, prompt, reference_images=refs, project_id=pid,
+                    aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                )
+            except bridge.BridgeEditError as exc:
+                return i, ("err", exc.reason)
+        return i, out
+
+    results = await asyncio.gather(*[_style_one(i) for i in targets])
+    err = next((r[1] for _i, r in results if isinstance(r, tuple) and r[0] == "err"), None)
+    if err:
+        return {}, f"bridge_failed: {err}"[:200]
+
+    def _commit() -> tuple[list, str, int, int]:
+        new_cells = list(cells)
+        for i, out in results:
+            if isinstance(out, (bytes, bytearray)):
+                new_cells[i] = _ingest_png(out)
+        composite, w, h = _stitch_cells(new_cells)
+        return new_cells, _ingest_png(composite), w, h
+
+    new_cells, mid, w, h = await asyncio.to_thread(_commit)
+    return {"mediaId": mid, "cells": new_cells, "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
 async def _handle_upsample_image(params: dict) -> tuple[dict, Optional[str]]:
     """Upscale a cached image to 2K/4K via Flow (its Download → "Upscaled").
     ``media_id`` is the local cache id of the image to upscale (any combine
@@ -2151,10 +2209,229 @@ async def _handle_upsample_image(params: dict) -> tuple[dict, Optional[str]]:
     return {"mediaId": new_id, "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
+async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
+    """Flow-clone studio: text→image / edit (1-4 variants), fully API-only (no
+    Flow bridge, no paygate tier, no node binding). Two interchangeable engines,
+    chosen by ``provider`` (default env ``FLOW_IMAGE_PROVIDER`` else "gemini"):
+
+      - "gemini"  → direct Gemini API, reference/source images sent inline
+                    (works fully locally).
+      - "atrium"  → Atrium passthrough; input images must be PUBLIC urls
+                    (``PUBLIC_MEDIA_BASE_URL`` / tunnel), so refs+edit need that
+                    set. Plain text→image works without it.
+
+    Each result is cached as a local media id, returned in ``media_ids``."""
+    from flowboard.services.comic.bridge import BridgeEditError
+
+    prompt = params.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return {}, "missing_prompt"
+    prompt = prompt.strip()
+
+    image_model = params.get("image_model")
+    if not (isinstance(image_model, str) and image_model.startswith("gemini-")):
+        image_model = "gemini-2.5-flash-image"
+    aspect = params.get("aspect_ratio")
+    aspect = aspect if isinstance(aspect, str) and aspect else "1:1"
+    image_size = params.get("image_size")
+    image_size = image_size if isinstance(image_size, str) and image_size else None
+    try:
+        variant_count = int(params.get("variant_count") or 1)
+    except (TypeError, ValueError):
+        variant_count = 1
+
+    provider = params.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        provider = os.getenv("FLOW_IMAGE_PROVIDER", "gemini")
+    provider = provider.strip().lower() or "gemini"
+
+    ref_ids = [r for r in (params.get("ref_media_ids") or []) if isinstance(r, str) and r]
+    source_id = params.get("source_media_id")
+    source_id = source_id if isinstance(source_id, str) and source_id else None
+    if source_id and media_service.cached_path(source_id) is None:
+        return {}, "source_not_found"
+
+    # Live progress: write {done, total} onto the running Request row after each
+    # variant lands, so the frontend can poll it and show an exact "k/N · pct%".
+    rid = params.get("__request_id")
+
+    def _progress(done: int, total: int) -> None:
+        if rid is None:
+            return
+        try:
+            with get_session() as s:
+                req = s.get(Request, rid)
+                if req is not None and req.status == "running":
+                    req.result = {"progress": {"done": int(done), "total": int(total)}}
+                    s.add(req)
+                    s.commit()
+        except Exception:  # noqa: BLE001 — best-effort; never break a gen
+            pass
+
+    provider_used = provider
+    try:
+        if provider == "atrium":
+            from flowboard.services.comic import atrium_api, gemini_api, r2
+
+            needs_input = bool(source_id) or bool(ref_ids)
+            # Atrium can only ingest input images by PUBLIC url — either R2
+            # (agent uploads, recommended) or a tunnel to /media. When NEITHER
+            # is configured, reference/edit requests have no public url, so we
+            # transparently fall back to the Gemini engine (inline bytes) for
+            # THAT request; pure text→image stays on Atrium.
+            has_public = r2.is_configured() or atrium_api.public_media_base() is not None
+            if needs_input and not has_public and gemini_api.api_key():
+                provider_used = "gemini"
+                outs = await _flow_gen_gemini(
+                    prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                    on_progress=_progress,
+                )
+            else:
+                outs = await _flow_gen_atrium(
+                    prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                    on_progress=_progress,
+                )
+        else:
+            outs = await _flow_gen_gemini(
+                prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                on_progress=_progress,
+            )
+    except BridgeEditError as exc:
+        return {}, f"gen_failed: {exc.reason}"[:200]
+    except _FlowGenError as exc:
+        return {}, str(exc)[:200]
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"gen_failed: {type(exc).__name__}: {exc}"[:200]
+
+    if not outs:
+        return {}, "no_image_generated"
+    media_ids = [_ingest_png(o) for o in outs]
+    return {
+        "media_ids": media_ids,
+        "provider_used": provider_used,
+        "node_id": params.get("__node_id"),
+    }, None
+
+
+class _FlowGenError(RuntimeError):
+    """Caller-facing flow-gen failure carrying an already-formatted reason."""
+
+
+async def _flow_gen_gemini(
+    prompt: str, image_model: str, aspect: str, image_size: Optional[str],
+    variant_count: int, ref_ids: list, source_id: Optional[str],
+    on_progress=None,
+) -> list[bytes]:
+    """Direct Gemini engine — reference/source images sent inline (bytes)."""
+    from flowboard.services.comic import gemini_api
+
+    def _load(mid: str) -> Optional[bytes]:
+        p = media_service.cached_path(mid)
+        if p is None:
+            return None
+        try:
+            return p.read_bytes()
+        except OSError:
+            return None
+
+    def _load_all() -> tuple[Optional[bytes], list[bytes]]:
+        src = _load(source_id) if source_id else None
+        refs = [b for b in (_load(r) for r in ref_ids) if b]
+        return src, refs
+
+    source_bytes, ref_bytes = await asyncio.to_thread(_load_all)
+    if source_id and source_bytes is None:
+        raise _FlowGenError("source_not_found")
+
+    if source_bytes is not None:
+        # Edit/refine: re-render the source, preserving its frame (empty aspect).
+        return await gemini_api.edit_image_variants(
+            source_bytes, prompt, ref_bytes or None,
+            image_model=image_model, aspect_ratio="", variant_count=variant_count,
+            on_progress=on_progress,
+        )
+    return await gemini_api.generate_image_variants(
+        prompt, ref_bytes or None,
+        image_model=image_model, aspect_ratio=aspect,
+        variant_count=variant_count, image_size=image_size,
+        on_progress=on_progress,
+    )
+
+
+def _atrium_input_url(media_id: str) -> Optional[str]:
+    """Public URL for an Atrium input image — prefer R2 (upload the file and use
+    its r2.dev url), else a tunnel (PUBLIC_MEDIA_BASE_URL → /media). Sync (boto3
+    + disk); call via ``asyncio.to_thread``."""
+    from flowboard.services.comic import r2, atrium_api
+
+    if r2.is_configured():
+        return r2.upload_media(media_id)
+    return atrium_api.media_public_url(media_id)
+
+
+async def _flow_gen_atrium(
+    prompt: str, image_model: str, aspect: str, image_size: Optional[str],
+    variant_count: int, ref_ids: list, source_id: Optional[str],
+    on_progress=None,
+) -> list[bytes]:
+    """Atrium engine — input images must be PUBLIC urls (fileData.fileUri),
+    served from R2 (preferred) or a tunnel."""
+    from flowboard.services.comic import atrium_api, r2
+
+    if not atrium_api.is_configured():
+        raise _FlowGenError("atrium_not_configured: set ATRIUM_CLIENT_ID/ATRIUM_CLIENT_SECRET in .env")
+
+    needs_input = bool(source_id) or bool(ref_ids)
+    if needs_input and not (r2.is_configured() or atrium_api.public_media_base() is not None):
+        raise _FlowGenError(
+            "atrium_needs_public_url: references/edit on Atrium need R2 (R2_* in .env) or a "
+            "tunnel (PUBLIC_MEDIA_BASE_URL). Plain text→image works without either."
+        )
+
+    # Build the public input URLs (R2 uploads happen here, off the event loop).
+    def _build_urls() -> list[str]:
+        urls: list[str] = []
+        for mid in ([source_id] if source_id else []) + list(ref_ids):
+            try:
+                u = _atrium_input_url(mid)
+            except Exception as exc:  # noqa: BLE001 — upload/network failure
+                raise _FlowGenError(f"r2_upload_failed: {type(exc).__name__}: {exc}"[:180])
+            if u:
+                urls.append(u)
+        return urls
+
+    image_urls = await asyncio.to_thread(_build_urls)
+    if needs_input and not image_urls:
+        raise _FlowGenError("atrium_input_unavailable: could not resolve a public URL for the input image")
+
+    input_ids = ([source_id] if source_id else []) + list(ref_ids)
+    try:
+        # On edit (source present) preserve the frame by not forcing an aspect.
+        return await atrium_api.generate_image_variants(
+            prompt, image_urls or None,
+            image_model=image_model,
+            aspect_ratio="" if source_id else aspect,
+            variant_count=variant_count,
+            image_size=image_size,
+            on_progress=on_progress,
+        )
+    finally:
+        # Atrium has fetched the inputs by now — drop them from R2 so the bucket
+        # never accumulates (each input only lives there for one generation).
+        # The worker is single-consumer (sequential), so no concurrent gen can
+        # still be reading these objects. Local cache (storage/media) is kept.
+        if r2.is_configured() and input_ids:
+            def _cleanup() -> None:
+                for mid in input_ids:
+                    r2.delete_media(mid)
+            await asyncio.to_thread(_cleanup)
+
+
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
     "create_project": _handle_create_project,
     "gen_image": _handle_gen_image,
+    "flow_gen_image": _handle_flow_gen_image,
     "gen_video": _handle_gen_video,
     "gen_video_omni": _handle_gen_video_omni,
     "edit_image": _handle_edit_image,
@@ -2168,6 +2445,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "combine_panels": _handle_combine_panels,
     "regen_cell": _handle_regen_cell,
     "restitch_cells": _handle_restitch_cells,
+    "style_cells": _handle_style_cells,
     "export_all_panels": _handle_export_all_panels,
     "segment_character_sheet": _handle_segment_character_sheet,
     "tag_panels": _handle_tag_panels,

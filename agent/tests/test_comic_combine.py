@@ -13,6 +13,7 @@ from flowboard.worker.processor import (
     _handle_combine_panels,
     _handle_regen_cell,
     _handle_restitch_cells,
+    _handle_style_cells,
     _handle_export_all_panels,
 )
 
@@ -537,60 +538,54 @@ async def test_magi_assign_panels_errors():
 
 
 @pytest.mark.asyncio
-async def test_combine_attaches_style_frame_ref_and_clause():
-    """A project STYLE FRAME (ref image + descriptor) attaches its image as the
-    LAST reference and weaves the style clause into the prompt."""
+async def test_combine_does_not_apply_style_frame():
+    """Style is now a SEPARATE final pass — combine must NOT attach the style ref
+    or weave the style clause into the clean+extend gen."""
     page = _ingest(_png(900, 1200))
     style = _ingest(_png(64, 64, 30))
     specs = [{"page_media_id": page, "box": {"x": 10, "y": 10, "w": 400, "h": 180}}]
-
     edit = AsyncMock(return_value=_png(400, 711))
     with patch("flowboard.services.comic.bridge.edit_image", edit):
         _, err = await _handle_combine_panels({
             "project_id": "p", "panels": specs,
-            "style_ref_media_id": style, "style_descriptor": "flat cel-shaded webtoon, pastel palette",
+            "style_ref_media_id": style, "style_descriptor": "flat cel-shaded webtoon",
         })
     assert err is None
-    refs = edit.await_args.kwargs["reference_images"]
-    assert refs == [media_service.cached_path(style).read_bytes()]   # style ref attached
-    prompt = edit.await_args.args[1]
-    assert "STYLE-REFERENCE image" in prompt
-    assert "flat cel-shaded webtoon, pastel palette" in prompt
+    assert edit.await_args.kwargs["reference_images"] is None
+    assert "STYLE-REFERENCE image" not in edit.await_args.args[1]
+    assert "flat cel-shaded webtoon" not in edit.await_args.args[1]
 
 
 @pytest.mark.asyncio
-async def test_combine_style_descriptor_only_no_extra_ref():
-    page = _ingest(_png(900, 1200))
-    specs = [{"page_media_id": page, "box": {"x": 10, "y": 10, "w": 400, "h": 180}}]
-    edit = AsyncMock(return_value=_png(400, 711))
-    with patch("flowboard.services.comic.bridge.edit_image", edit):
-        _, err = await _handle_combine_panels({
-            "project_id": "p", "panels": specs, "style_descriptor": "1990s anime film cel",
-        })
-    assert err is None
-    assert edit.await_args.kwargs["reference_images"] is None        # no ref, text only
-    prompt = edit.await_args.args[1]
-    assert "1990s anime film cel" in prompt and "STYLE-REFERENCE image" not in prompt
-
-
-@pytest.mark.asyncio
-async def test_combine_style_ref_appends_after_character_refs():
-    """Style ref must come AFTER the character refs (identity primacy), still
-    within the ref budget."""
-    page = _ingest(_png(900, 1200))
-    cref = _ingest(_png(80, 120, 200))
+async def test_style_cells_restyles_targeted_cells_only():
+    """The final style pass restyles the chosen cells in place (each cell as the
+    source, style frame as the reference), keeps the rest, and re-stitches."""
+    cells = [_ingest(_png(400, 711, v)) for v in (10, 60, 110, 160)]
     style = _ingest(_png(64, 64, 30))
-    specs = [{"page_media_id": page, "box": {"x": 0, "y": 0, "w": 400, "h": 180}, "char_id": "char_0"}]
-    chars = [{"id": "char_0", "name": "Zero", "sampleMediaId": cref, "refMediaIds": [cref]}]
-    edit = AsyncMock(return_value=_png(400, 711))
+    edit = AsyncMock(return_value=_png(400, 711, 200))
     with patch("flowboard.services.comic.bridge.edit_image", edit):
-        _, err = await _handle_combine_panels({
-            "project_id": "p", "panels": specs, "characters": chars, "style_ref_media_id": style,
+        result, err = await _handle_style_cells({
+            "project_id": "p", "cells": cells, "indexes": [1, 3],
+            "style_ref_media_id": style, "style_descriptor": "noir ink",
         })
     assert err is None
-    refs = edit.await_args.kwargs["reference_images"]
-    assert refs == [media_service.cached_path(cref).read_bytes(),
-                    media_service.cached_path(style).read_bytes()]   # char first, style last
+    assert edit.await_count == 2                              # only the 2 targeted cells
+    src_imgs = {c.args[0] for c in edit.await_args_list}
+    assert media_service.cached_path(cells[1]).read_bytes() in src_imgs   # cell is the source
+    assert all(c.kwargs["reference_images"] == [media_service.cached_path(style).read_bytes()]
+               for c in edit.await_args_list)                # style frame is the ref
+    assert "Re-render" in edit.await_args.args[1] and "STYLE-REFERENCE image" in edit.await_args.args[1]
+    out = result["cells"]
+    assert out[0] == cells[0] and out[2] == cells[2]         # untouched
+    assert out[1] != cells[1] and out[3] != cells[3]         # restyled
+    assert media_service.status(result["mediaId"]).get("available") is True
+
+
+@pytest.mark.asyncio
+async def test_style_cells_errors():
+    assert (await _handle_style_cells({"cells": [_ingest()]}))[1] == "missing_project_id"
+    assert (await _handle_style_cells({"project_id": "p"}))[1] == "missing_cells"
+    assert (await _handle_style_cells({"project_id": "p", "cells": [_ingest()]}))[1] == "missing_style"
 
 
 @pytest.mark.asyncio

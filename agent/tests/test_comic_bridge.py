@@ -325,17 +325,19 @@ async def test_gemini_model_routes_to_api_engine(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gemini_api_quota_fails_fast_and_503_retries(monkeypatch):
+async def test_gemini_api_429_retries_and_503_retries(monkeypatch):
     from flowboard.services.comic import gemini_api
     monkeypatch.setenv("GEMINI_API_KEY", "AIzaTest")
-    # 429 → fatal, one call only
-    client = _fake_httpx_client([_resp(429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "quota"}})])
+    # 429 (intermittent Nano Banana error, per Atrium) → retried, then succeeds.
+    client = _fake_httpx_client([
+        _resp(429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "quota"}}),
+        _resp(200, _gemini_ok_response(b"OK1")),
+    ])
     with patch("flowboard.services.comic.gemini_api.httpx.AsyncClient", return_value=client), \
          patch("flowboard.services.comic.gemini_api.asyncio.sleep", new=AsyncMock()):
-        with pytest.raises(BridgeEditError) as ei:
-            await gemini_api.edit_image_variants(b"s", "p", image_model="gemini-3-pro-image")
-    assert "RESOURCE_EXHAUSTED" in ei.value.reason
-    assert client.post.await_count == 1
+        out = await gemini_api.edit_image_variants(b"s", "p", image_model="gemini-3-pro-image")
+    assert out == [b"OK1"]
+    assert client.post.await_count == 2
     # 503 → retried, then succeeds
     client2 = _fake_httpx_client([
         _resp(503, {"error": {"status": "UNAVAILABLE", "message": "high demand"}}),

@@ -5837,3 +5837,1148 @@ button:disabled {
 .references-panel__toggle-tab:hover {
   animation: none;
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Flow Studio — faithful Google-Flow image workspace. Left rail (fn) + center
+   (fc-*) with bottom composer (fc / fc__*) + asset-detail overlay (fv__*).
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Manga-side entry points into the Flow branch. */
+.mode-switch {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 13px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  background: linear-gradient(135deg, rgba(124, 92, 255, 0.22), rgba(124, 92, 255, 0.08));
+  border: 1px solid rgba(124, 92, 255, 0.5);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 80ms ease;
+}
+.mode-switch:hover {
+  background: linear-gradient(135deg, rgba(124, 92, 255, 0.35), rgba(124, 92, 255, 0.15));
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+.project-sidebar__flow-cta {
+  margin: 0 12px 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(135deg, rgba(124, 92, 255, 0.85), rgba(124, 92, 255, 0.45));
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  cursor: pointer;
+  text-align: center;
+  transition: filter 120ms ease, transform 80ms ease;
+}
+.project-sidebar__flow-cta:hover {
+  filter: brightness(1.12);
+  transform: translateY(-1px);
+}
+
+/* ── shell ─────────────────────────────────────────────────────────────── */
+.flow-app {
+  display: grid;
+  grid-template-columns: 212px minmax(0, 1fr);
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+.flow-app--rail-collapsed {
+  grid-template-columns: 56px minmax(0, 1fr);
+}
+
+/* ── left rail (fn) ────────────────────────────────────────────────────── */
+.fn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 14px 10px;
+  min-width: 0;
+}
+.fn__brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 8px 16px;
+}
+.fn__logo {
+  color: var(--accent);
+  font-size: 18px;
+}
+.fn__title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+/* project list (rail) */
+.fn__newproj {
+  margin: 0 2px 8px;
+  padding: 9px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(135deg, rgba(124, 92, 255, 0.85), rgba(124, 92, 255, 0.45));
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  cursor: pointer;
+  text-align: center;
+}
+.fn__newproj:hover {
+  filter: brightness(1.12);
+}
+.fn__projects {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  max-height: 46vh;
+}
+.fn__prow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--muted);
+  transition: background 100ms ease, color 100ms ease;
+}
+.fn__prow:hover {
+  background: var(--panel-high);
+  color: var(--text);
+}
+.fn__prow.is-on {
+  background: var(--panel-higher);
+  color: var(--text);
+}
+.fn__prow-name {
+  flex: 1;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fn__prow-actions {
+  display: none;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.fn__prow:hover .fn__prow-actions {
+  display: flex;
+}
+.fn__prow-act {
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.fn__prow-act:hover {
+  background: var(--panel);
+  color: var(--text);
+}
+
+.fn__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fn__item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 10px;
+  font-size: 13px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  transition: background 100ms ease, color 100ms ease;
+}
+.fn__item:hover {
+  background: var(--panel-high);
+  color: var(--text);
+}
+.fn__item.is-active {
+  background: var(--panel-higher);
+  color: var(--text);
+}
+.fn__icon {
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.flow-app--rail-collapsed .fn__item,
+.flow-app--rail-collapsed .fn__brand {
+  justify-content: center;
+}
+.fn__spacer {
+  flex: 1;
+}
+.fn__ghost {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  transition: color 100ms ease, border-color 100ms ease;
+}
+.fn__ghost:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* ── center column ─────────────────────────────────────────────────────── */
+.fc-center {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+.fc-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 22px 10px;
+}
+.fc-search {
+  flex: 1;
+  max-width: 380px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  outline: none;
+}
+.fc-search:focus {
+  border-color: var(--accent);
+}
+.fc-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+.fc-banner {
+  margin: 0 22px 6px;
+  padding: 9px 12px;
+  font-size: 12.5px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.fc-banner--err {
+  color: #ffd9d9;
+  background: rgba(239, 68, 68, 0.14);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+.fc-banner--info {
+  color: #cfe0ff;
+  background: rgba(124, 92, 255, 0.14);
+  border: 1px solid rgba(124, 92, 255, 0.4);
+}
+.fc-banner__x {
+  opacity: 0.6;
+}
+.fc-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 22px 156px;
+}
+.fc-empty {
+  min-height: 320px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+.fc-empty__icon {
+  font-size: 40px;
+  opacity: 0.5;
+}
+.fc-empty__text {
+  font-size: 14px;
+  max-width: 440px;
+  line-height: 1.5;
+}
+.fc-groupbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.fc-groupbar__name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* ── asset grid ────────────────────────────────────────────────────────── */
+.fc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.fc-card {
+  position: relative;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--panel-high);
+  cursor: pointer;
+  transition: border-color 100ms ease, transform 80ms ease;
+}
+.fc-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+}
+.fc-card.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.fc-card img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.fc-badge {
+  position: absolute;
+  top: 7px;
+  left: 7px;
+  font-size: 12px;
+  padding: 2px 5px;
+  border-radius: 6px;
+  background: rgba(11, 12, 16, 0.7);
+  backdrop-filter: blur(3px);
+}
+.fc-badge--scene {
+  left: auto;
+  right: 7px;
+}
+.fc-badge--pin {
+  top: auto;
+  bottom: 7px;
+  left: 7px;
+}
+.fc-card__caption {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(to top, rgba(11, 12, 16, 0.85), transparent);
+  text-align: left;
+}
+/* hover actions on an asset card */
+.fc-card__bar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 5px;
+  opacity: 0;
+  transition: opacity 100ms ease;
+  z-index: 2;
+}
+.fc-card:hover .fc-card__bar,
+.fc-card:focus-within .fc-card__bar {
+  opacity: 1;
+}
+.fc-card__act {
+  width: 28px;
+  height: 28px;
+  font-size: 14px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(11, 12, 16, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(3px);
+  transition: background 100ms ease, border-color 100ms ease;
+}
+.fc-card__act:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.fc-card__act.is-on {
+  background: rgba(124, 92, 255, 0.55);
+  border-color: var(--accent);
+}
+/* prompt caption — only on hover, doesn't cover the image otherwise */
+.fc-card__cap {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px 10px 8px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: #fff;
+  background: linear-gradient(to top, rgba(11, 12, 16, 0.9), transparent);
+  text-align: left;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 100ms ease;
+  pointer-events: none;
+}
+.fc-card:hover .fc-card__cap,
+.fc-card:focus-within .fc-card__cap {
+  opacity: 1;
+}
+.fc-card--group {
+  aspect-ratio: 3 / 4;
+}
+.fc-card--group img {
+  height: 100%;
+  object-fit: cover;
+}
+/* loading tile */
+.fc-card--loading {
+  cursor: default;
+  background: linear-gradient(155deg, #2b303b 0%, #191c23 55%, #111319 100%);
+}
+.fc-card--loading:hover {
+  transform: none;
+  border-color: var(--border);
+}
+.fc-card--loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 35%, rgba(255, 255, 255, 0.06) 50%, transparent 65%);
+  transform: translateX(-100%);
+  animation: flow-shimmer 1.6s ease-in-out infinite;
+}
+@keyframes flow-shimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+.fc-load__icon {
+  position: absolute;
+  top: 9px;
+  left: 11px;
+  font-size: 15px;
+  opacity: 0.5;
+}
+.fc-load__pct {
+  position: absolute;
+  top: 9px;
+  right: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* drag-drop overlay */
+.fc-drop {
+  position: absolute;
+  inset: 8px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--accent);
+  border-radius: 16px;
+  background: rgba(124, 92, 255, 0.12);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+.fc-drop__inner {
+  font-size: 16px;
+  font-weight: 600;
+  color: #fff;
+  padding: 14px 22px;
+  border-radius: 12px;
+  background: rgba(11, 12, 16, 0.7);
+}
+
+/* ── composer (fc / fc__*) ─────────────────────────────────────────────── */
+.fc {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  width: min(720px, calc(100% - 48px));
+  z-index: 15;
+}
+.fc__refs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 0 6px 8px;
+}
+
+/* @ mention picker — opens above the composer when you type "@". */
+.fc__mention {
+  margin-bottom: 8px;
+  max-height: 340px;
+  overflow-y: auto;
+  background: var(--panel-higher);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 6px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+}
+.fc__mention-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+  padding: 6px 8px;
+}
+.fc__mention-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+  text-align: left;
+}
+.fc__mention-row:hover {
+  background: var(--panel-high);
+}
+.fc__mention-row img {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 7px;
+  flex-shrink: 0;
+}
+.fc__mention-name {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fc__mention-kind {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.fc__refchip {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  /* overflow visible so the ✕ button at the corner isn't clipped */
+  border: 1px solid var(--border);
+}
+.fc__refchip img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 10px;
+}
+.fc__refchip button {
+  position: absolute;
+  top: -7px;
+  left: -7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: 11px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(11, 12, 16, 0.85);
+  border: 1.5px solid rgba(255, 255, 255, 0.7);
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  transition: background 100ms ease, transform 80ms ease;
+}
+.fc__refchip button:hover {
+  background: var(--error);
+  transform: scale(1.1);
+}
+.fc__bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  background: var(--panel-higher);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 8px 10px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5);
+}
+.fc__icon {
+  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  font-size: 19px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  cursor: pointer;
+}
+.fc__icon:hover {
+  border-color: var(--accent);
+}
+/* Highlighted prompt field: a transparent textarea (real text + caret) with a
+   styled mirror layer on top showing @token pills. Both layers MUST share the
+   exact text metrics so the visible (mirror) text lines up with the caret. */
+.fc__field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+.fc__input,
+.fc__mirror {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 9px 8px;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  letter-spacing: 0;
+}
+.fc__input {
+  display: block;
+  resize: none;
+  min-height: 38px;
+  max-height: 140px;
+  color: transparent;
+  caret-color: var(--text);
+  background: transparent;
+  border: none;
+  outline: none;
+  overflow-y: auto;
+  position: relative;
+  z-index: 1;
+}
+.fc__input::placeholder {
+  color: var(--muted);
+}
+.fc__mirror {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  color: var(--text);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.fc__token {
+  pointer-events: auto;
+  cursor: pointer;
+  background: rgba(124, 92, 255, 0.3);
+  color: #d6c9ff;
+  border-radius: 4px;
+  /* Horizontal padding for the pill look, cancelled by an equal negative
+     margin so the token's text advance is IDENTICAL to the transparent
+     textarea below — otherwise the caret drifts after every pill. */
+  padding: 0 2px;
+  margin: 0 -2px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  transition: background 100ms ease, color 100ms ease;
+}
+.fc__token:hover {
+  background: rgba(124, 92, 255, 0.55);
+  color: #fff;
+}
+.fc__settings {
+  position: relative;
+  flex-shrink: 0;
+}
+.fc__model {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 5px 11px;
+  height: 38px;
+  justify-content: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  cursor: pointer;
+}
+.fc__model:hover {
+  border-color: var(--accent);
+}
+.fc__model-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.fc__model-meta {
+  font-size: 10.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.fc__caret {
+  display: none;
+}
+.fc__pop {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  right: 0;
+  width: 300px;
+  /* Above the prompt mirror layer (z-index:2) so the prompt text doesn't bleed
+     through the popover. */
+  z-index: 30;
+  background: var(--panel-higher);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.fc__pop-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fc__pop-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+}
+.fc__muted {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10.5px;
+}
+.fc__seg {
+  display: flex;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.fc__seg-btn {
+  flex: 1;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.fc__seg-btn.is-on {
+  color: #fff;
+  background: rgba(124, 92, 255, 0.22);
+}
+.fc__select {
+  padding: 7px 9px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  outline: none;
+}
+.fc__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.fc__chip {
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 100ms ease, border-color 100ms ease;
+}
+.fc__chip:hover:not(:disabled) {
+  color: var(--text);
+}
+.fc__chip.is-on {
+  color: #fff;
+  background: rgba(124, 92, 255, 0.22);
+  border-color: var(--accent);
+}
+.fc__chip:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.fc__send {
+  flex-shrink: 0;
+  width: 40px;
+  height: 38px;
+  font-size: 18px;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 11px;
+  cursor: pointer;
+  transition: opacity 100ms ease;
+}
+.fc__send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── detail overlay (fv__*) ────────────────────────────────────────────── */
+.fv {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: #07080b;
+  overflow: hidden;
+}
+
+/* Infinity-zoom stage fills the whole overlay. */
+.fv__stage {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  touch-action: none;
+  overflow: hidden;
+}
+.fv__stage.is-grabbing {
+  cursor: grabbing;
+}
+.fv__stage img {
+  max-width: 88vw;
+  max-height: 84vh;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* Close (top-right). */
+.fv__close {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  z-index: 6;
+  width: 34px;
+  height: 34px;
+  font-size: 15px;
+  color: var(--text);
+  background: rgba(20, 22, 28, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+}
+.fv__close:hover {
+  border-color: var(--accent);
+}
+
+/* Slim floating toolbar (top-center) — icon-only secondary actions. */
+.fv__tools {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  gap: 4px;
+  padding: 5px;
+  background: rgba(20, 22, 28, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(6px);
+}
+.fv__tool {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  text-decoration: none;
+}
+.fv__tool:hover:not(:disabled) {
+  background: var(--panel-high);
+  border-color: var(--border);
+}
+.fv__tool:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.fv__tool.is-on {
+  border-color: var(--accent);
+  background: rgba(124, 92, 255, 0.2);
+}
+.fv__tool--danger:hover {
+  border-color: var(--error);
+}
+
+/* Zoom controls (bottom-left). */
+.fv__zoom {
+  position: absolute;
+  left: 18px;
+  bottom: 24px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  background: rgba(20, 22, 28, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  backdrop-filter: blur(6px);
+}
+.fv__zbtn {
+  width: 30px;
+  height: 30px;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.fv__zbtn:hover {
+  background: var(--panel-high);
+}
+.fv__zlevel {
+  min-width: 52px;
+  height: 30px;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.fv__zlevel:hover {
+  background: var(--panel-high);
+  color: var(--text);
+}
+
+/* Bottom edit composer (Flow-style pill). */
+.fv__bar {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  z-index: 6;
+  transform: translateX(-50%);
+  width: min(680px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fv__bar-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 4px;
+}
+.fv__bar-ref {
+  position: relative;
+  width: 44px;
+  height: 44px;
+}
+.fv__bar-ref img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.fv__bar-refx {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(11, 12, 16, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.fv__bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  background: rgba(24, 26, 33, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+}
+.fv__bar-add {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--text);
+  background: var(--panel-high);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.fv__bar-add:hover {
+  border-color: var(--accent);
+}
+.fv__bar-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  outline: none;
+}
+.fv__bar-input::placeholder {
+  color: var(--muted);
+}
+.fv__bar-model-wrap {
+  position: relative;
+  flex: none;
+}
+.fv__bar-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px;
+  font-size: 12.5px;
+  white-space: nowrap;
+  color: var(--text);
+  background: var(--panel-high);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+}
+.fv__bar-model:hover {
+  border-color: var(--accent);
+}
+.fv__model-pop {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 200px;
+  padding: 5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.fv__model-opt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.fv__model-opt:hover {
+  background: var(--panel-high);
+}
+.fv__model-opt.is-on {
+  border-color: var(--accent);
+  background: rgba(124, 92, 255, 0.16);
+}
+.fv__model-max {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+}
+.fv__bar-send {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  font-size: 17px;
+  line-height: 1;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.fv__bar-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+@media (max-width: 600px) {
+  .fv__tools {
+    gap: 2px;
+    padding: 4px;
+  }
+  .fv__tool {
+    width: 30px;
+    height: 30px;
+    font-size: 14px;
+  }
+}
