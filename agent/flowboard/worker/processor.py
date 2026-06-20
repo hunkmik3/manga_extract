@@ -860,6 +860,22 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     return result, None
 
 
+def _clean_quad(raw):
+    """Validate a panel quad from a box dict → list of 4 [int,int] corners, or
+    None. Accepts [[x,y],[x,y],[x,y],[x,y]] of numbers; anything else → None."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    out = []
+    for p in raw:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            return None
+        try:
+            out.append([int(round(float(p[0]))), int(round(float(p[1])))])
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
 async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
     """Node 3 — crop each (possibly hand-edited) box into a panel image."""
     import uuid
@@ -893,15 +909,19 @@ async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
                 y2 = min(H, y + max(1, h))
                 if x2 <= x or y2 <= y:
                     continue
-                crop = bgr[y:y2, x:x2]
+                quad = _clean_quad(b.get("quad"))  # diagonal panel → deskew via perspective warp
+                crop = panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), quad)
                 cid = str(uuid.uuid4())
                 if not media_service.ingest_inline_bytes(
                     cid, panel_svc.encode_png(crop), kind="image", mime="image/png"
                 ):
                     continue
+                box_out = {"x": x, "y": y, "w": x2 - x, "h": y2 - y}
+                if quad:
+                    box_out["quad"] = quad
                 panels_out.append({
                     "idx": gidx, "pageIndex": pg.get("idx"), "pageName": pg.get("name"),
-                    "panelIndex": j, "box": {"x": x, "y": y, "w": x2 - x, "h": y2 - y},
+                    "panelIndex": j, "box": box_out,
                     "mediaId": cid, "status": "extracted",
                 })
                 gidx += 1
@@ -951,7 +971,8 @@ def _source_image_bytes(params: dict) -> Optional[bytes]:
         x2 = min(W, x + int(box.get("w", 0)))
         y2 = min(H, y + int(box.get("h", 0)))
         if x2 > x and y2 > y:
-            return panel_svc.encode_png(bgr[y:y2, x:x2])
+            quad = _clean_quad(box.get("quad"))
+            return panel_svc.encode_png(panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), quad))
     return None
 
 

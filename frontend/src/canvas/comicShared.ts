@@ -37,20 +37,47 @@ export interface PageItem {
   boxes?: BoxItem[];
   error?: string | null;
 }
+/** A panel corner [x, y] in source-page pixels. */
+export type QuadPoint = [number, number];
+/** 4 corners (TL, TR, BR, BL) of a diagonal/rotated panel. */
+export type Quad = [QuadPoint, QuadPoint, QuadPoint, QuadPoint];
+
 export interface BoxItem {
   id: string;
+  // x/y/w/h is ALWAYS the axis-aligned bounding box. `quad`, when present, is
+  // the true (possibly diagonal) panel shape and x/y/w/h must equal its bbox.
   x: number;
   y: number;
   w: number;
   h: number;
+  quad?: Quad;
 }
 export interface PanelItem {
   idx: number;
   pageIndex?: number;
   pageName?: string;
   panelIndex?: number;
-  box?: { x: number; y: number; w: number; h: number };
+  box?: { x: number; y: number; w: number; h: number; quad?: Quad };
   mediaId: string;
+}
+
+/** 4 corners (TL, TR, BR, BL) of an axis-aligned box. */
+export function rectToQuad(b: { x: number; y: number; w: number; h: number }): Quad {
+  return [
+    [b.x, b.y],
+    [b.x + b.w, b.y],
+    [b.x + b.w, b.y + b.h],
+    [b.x, b.y + b.h],
+  ];
+}
+
+/** Axis-aligned bounding box of a quad — keeps x/y/w/h in sync with the corners. */
+export function quadToAabb(q: Quad): { x: number; y: number; w: number; h: number } {
+  const xs = q.map((p) => p[0]);
+  const ys = q.map((p) => p[1]);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, w: Math.max(1, Math.max(...xs) - x), h: Math.max(1, Math.max(...ys) - y) };
 }
 
 /** Data of the single upstream comic node feeding `rfId` (via one edge), or null. */

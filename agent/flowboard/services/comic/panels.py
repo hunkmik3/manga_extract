@@ -28,7 +28,77 @@ logger = logging.getLogger(__name__)
 # Read order matters → keep filename-sorted. Matches the brief's allowed set.
 PAGE_EXTS = (".webp", ".png", ".jpg", ".jpeg", ".bmp")
 
-Box = tuple[int, int, int, int]  # (x, y, w, h) in source-page pixels
+Box = tuple[int, int, int, int]  # (x, y, w, h) AABB in source-page pixels
+# A quad is 4 corner points for a diagonal / rotated / trapezoidal panel.
+# Stored alongside the AABB (x,y,w,h MUST equal the quad's bounding box) so all
+# rectangle-only code keeps working; quad-aware code (crop, overlay) uses it.
+Quad = tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]
+
+
+def rect_to_quad(box: Box) -> Quad:
+    """The 4 corners (TL, TR, BR, BL) of an axis-aligned box."""
+    x, y, w, h = box
+    return ((x, y), (x + w, y), (x + w, y + h), (x, y + h))
+
+
+def quad_to_aabb(quad) -> Box:
+    """Axis-aligned bounding box (x, y, w, h) of any 4+ point quad/polygon."""
+    xs = [int(round(p[0])) for p in quad]
+    ys = [int(round(p[1])) for p in quad]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def order_quad(pts) -> Quad:
+    """Canonicalize 4 points to (TL, TR, BR, BL) — required before a perspective
+    warp, else the deskewed crop mirrors/flips. Robust for any convex quad."""
+    p = np.asarray(pts, dtype="float32").reshape(-1, 2)
+    s = p.sum(axis=1)
+    d = (p[:, 1] - p[:, 0])  # y - x
+    tl = p[int(np.argmin(s))]
+    br = p[int(np.argmax(s))]
+    tr = p[int(np.argmin(d))]
+    bl = p[int(np.argmax(d))]
+    return tuple((int(round(q[0])), int(round(q[1]))) for q in (tl, tr, br, bl))  # type: ignore[return-value]
+
+
+def _aabb_slice(bgr: np.ndarray, box: Box) -> np.ndarray:
+    H, W = bgr.shape[:2]
+    x, y, w, h = box
+    x0, y0 = max(0, int(x)), max(0, int(y))
+    x1, y1 = min(W, int(x) + int(w)), min(H, int(y) + int(h))
+    if x1 <= x0 or y1 <= y0:
+        return bgr[0:1, 0:1].copy()
+    return bgr[y0:y1, x0:x1]
+
+
+def crop_box(bgr: np.ndarray, box: Box, quad=None) -> np.ndarray:
+    """Crop a panel.
+
+    No quad → fast axis-aligned numpy slice (legacy manga/manhwa, unchanged).
+
+    Quad (diagonal panel) → crop the quad's bounding box but KEEP THE SLANT:
+    everything outside the 4-corner polygon is made transparent (RGBA), so the
+    panel stays at its original angle and neighbouring panels don't bleed into
+    the corners. Returns a 4-channel BGRA image (PNG-encodable with alpha)."""
+    H, W = bgr.shape[:2]
+    if not quad or len(quad) != 4:
+        return _aabb_slice(bgr, box)
+    xs = [float(p[0]) for p in quad]
+    ys = [float(p[1]) for p in quad]
+    x0 = max(0, int(np.floor(min(xs))))
+    y0 = max(0, int(np.floor(min(ys))))
+    x1 = min(W, int(np.ceil(max(xs))))
+    y1 = min(H, int(np.ceil(max(ys))))
+    if x1 <= x0 or y1 <= y0:
+        return _aabb_slice(bgr, box)
+    roi = bgr[y0:y1, x0:x1]
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    poly = np.array([[int(round(px)) - x0, int(round(py)) - y0] for px, py in quad], dtype=np.int32)
+    cv2.fillConvexPoly(mask, poly, 255, lineType=cv2.LINE_AA)
+    bgra = cv2.cvtColor(roi, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = mask  # transparent outside the panel polygon
+    return bgra
 
 
 # ── XY-cut core (verbatim algorithm from the brief) ──────────────────────────
@@ -400,11 +470,17 @@ def encode_png(bgr: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
-def draw_overview(bgr: np.ndarray, boxes: list[Box]) -> np.ndarray:
-    """Copy of the page with numbered panel boxes drawn — the QA debug flag."""
+def draw_overview(bgr: np.ndarray, boxes: list[Box], quads=None) -> np.ndarray:
+    """Copy of the page with numbered panel boxes drawn — the QA debug flag.
+    If a matching quad is given for a box, draw the polygon outline instead."""
     out = bgr.copy()
     for i, (x, y, w, h) in enumerate(boxes):
-        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 3)
+        q = quads[i] if quads and i < len(quads) and quads[i] else None
+        if q:
+            pts = np.array(q, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [pts], True, (0, 0, 255), 3)
+        else:
+            cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 3)
         cv2.putText(out, str(i + 1), (x + 6, y + 28), cv2.FONT_HERSHEY_SIMPLEX,
                     0.9, (0, 0, 255), 2, cv2.LINE_AA)
     return out
@@ -493,7 +569,7 @@ def extract_page(
     boxes = detect_boxes(bgr, detector)
     crops: list[PanelCrop] = []
     for j, (x, y, w, h) in enumerate(boxes):
-        crop = bgr[y:y + h, x:x + w]
+        crop = crop_box(bgr, (x, y, w, h))  # detection emits plain boxes; quad crops happen on edited panels
         crops.append(PanelCrop(page_index, name, j, (x, y, w, h), encode_png(crop)))
     overview = draw_overview(bgr, boxes) if debug else None
     return PageResult(

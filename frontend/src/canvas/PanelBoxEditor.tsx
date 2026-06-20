@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { mediaUrl } from "../api/client";
-import { type BoxItem, type PageItem } from "./comicShared";
+import { quadToAabb, rectToQuad, type BoxItem, type PageItem, type Quad } from "./comicShared";
 
 const MIN_SIZE = 12; // min box size in page pixels
 const DEFAULT_BOX = 220; // default new-box size (page px)
@@ -25,14 +25,21 @@ const RESIZE_HANDLES: { h: ResizeHandle; cursor: string; style: CSSProperties }[
 type Drag =
   | { mode: "draw"; x0: number; y0: number }
   | { mode: "move"; id: string; dx: number; dy: number }
-  | { mode: "resize"; id: string; handle: ResizeHandle };
+  | { mode: "resize"; id: string; handle: ResizeHandle }
+  | { mode: "quadCorner"; id: string; corner: number }
+  | { mode: "quadMove"; id: string; ox: number; oy: number; quad: Quad };
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 /**
  * Interactive panel-box editor for ONE page. Add a box by dragging an empty
- * area OR right-click → "Add box". Drag a box to move, drag any corner or edge
+ * area OR right-click → "Add box". Drag a box to move, drag any corner/edge
  * handle to resize, click to select, ✕ / Delete / right-click → "Delete box" to remove.
+ *
+ * DIAGONAL panels: right-click a box → "Chuyển sang chéo (quad)" turns it into a
+ * 4-corner quad; drag the corners to match a slanted panel. The crop is then
+ * perspective-warped (deskewed) on the backend. "Về chữ nhật" reverts.
+ *
  * `onChange` gets the full box list after each edit. Coordinates are zoom-aware
  * (overlay scaled by image clientWidth; pointer mapping via live rect).
  */
@@ -75,6 +82,7 @@ export function PanelBoxEditor({
   }, [menu]);
 
   const scale = cssW > 0 ? cssW / pageW : 0;
+  const cssH = pageH * scale;
 
   const toPage = (clientX: number, clientY: number) => {
     const el = imgRef.current;
@@ -99,6 +107,22 @@ export function PanelBoxEditor({
     if (selected === id) setSelected(null);
   }
 
+  // Convert a rectangle box ⇄ quad (diagonal). Keeps x/y/w/h as the bbox.
+  function toQuad(id: string) {
+    onChange(boxes.map((b) => (b.id === id && !b.quad ? { ...b, quad: rectToQuad(b) } : b)));
+    setSelected(id);
+  }
+  function toRect(id: string) {
+    onChange(
+      boxes.map((b) => {
+        if (b.id !== id || !b.quad) return b;
+        const { quad: _drop, ...rect } = b;
+        return rect;
+      }),
+    );
+    setSelected(id);
+  }
+
   useEffect(() => {
     function onMove(ev: PointerEvent) {
       const d = dragRef.current;
@@ -119,6 +143,19 @@ export function PanelBoxEditor({
         if (d.handle.includes("n")) top = clamp(p.y, 0, bottom - MIN_SIZE);
         if (d.handle.includes("s")) bottom = clamp(p.y, top + MIN_SIZE, pageH);
         setDraft({ ...b, x: left, y: top, w: right - left, h: bottom - top });
+      } else if (d.mode === "quadCorner") {
+        const b = boxes.find((bb) => bb.id === d.id);
+        if (!b?.quad) return;
+        const q = b.quad.map((c, i) => (i === d.corner ? [Math.round(p.x), Math.round(p.y)] : c)) as Quad;
+        setDraft({ ...b, quad: q, ...quadToAabb(q) });
+      } else if (d.mode === "quadMove") {
+        let dx = p.x - d.ox, dy = p.y - d.oy;
+        const xs = d.quad.map((c) => c[0]), ys = d.quad.map((c) => c[1]);
+        dx = clamp(dx, -Math.min(...xs), pageW - Math.max(...xs));
+        dy = clamp(dy, -Math.min(...ys), pageH - Math.max(...ys));
+        const q = d.quad.map((c) => [Math.round(c[0] + dx), Math.round(c[1] + dy)]) as Quad;
+        const b = boxes.find((bb) => bb.id === d.id);
+        if (b) setDraft({ ...b, quad: q, ...quadToAabb(q) });
       }
     }
     function onUp() {
@@ -128,15 +165,16 @@ export function PanelBoxEditor({
       const dr = draft;
       setDraft(null);
       if (!dr) return;
-      const box = { id: dr.id, x: Math.round(dr.x), y: Math.round(dr.y), w: Math.round(dr.w), h: Math.round(dr.h) };
       if (d.mode === "draw") {
+        const box = { id: dr.id, x: Math.round(dr.x), y: Math.round(dr.y), w: Math.round(dr.w), h: Math.round(dr.h) };
         if (box.w >= MIN_SIZE && box.h >= MIN_SIZE) {
           const id = newId();
           onChange([...boxes, { ...box, id }]);
           setSelected(id);
         }
       } else {
-        onChange(boxes.map((b) => (b.id === d.id ? { ...b, x: box.x, y: box.y, w: box.w, h: box.h } : b)));
+        // Move / resize / quad edits: persist the full drafted box (incl. quad).
+        onChange(boxes.map((b) => (b.id === d.id ? { ...dr, id: b.id } : b)));
       }
     }
     window.addEventListener("pointermove", onMove);
@@ -158,6 +196,8 @@ export function PanelBoxEditor({
 
   const render = draft && draft.id !== "__draft__" ? boxes.map((b) => (b.id === draft.id ? draft : b)) : boxes;
   const showDraft = draft && draft.id === "__draft__" ? draft : null;
+  const rectBoxes = render.filter((b) => !b.quad);
+  const quadBoxes = render.filter((b) => b.quad);
 
   return (
     <div
@@ -170,7 +210,8 @@ export function PanelBoxEditor({
     >
       <img ref={imgRef} src={mediaUrl(page.mediaId)} alt={page.name} draggable={false} onLoad={() => setCssW(imgRef.current?.clientWidth ?? 0)} style={{ width: "100%", display: "block", borderRadius: 4 }} />
 
-      {scale > 0 && render.map((b) => {
+      {/* Rectangle boxes — AABB div + 8 resize handles (legacy path). */}
+      {scale > 0 && rectBoxes.map((b) => {
         const sel = b.id === selected;
         return (
           <div
@@ -212,6 +253,49 @@ export function PanelBoxEditor({
         );
       })}
 
+      {/* Quad (diagonal) boxes — SVG polygon + 4 draggable corner handles. */}
+      {scale > 0 && quadBoxes.length > 0 && (
+        <svg width={cssW} height={cssH} style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }}>
+          {quadBoxes.map((b) => {
+            const q = b.quad as Quad;
+            const sel = b.id === selected;
+            const pts = q.map(([x, y]) => `${x * scale},${y * scale}`).join(" ");
+            return (
+              <g key={b.id}>
+                <polygon
+                  points={pts}
+                  fill={sel ? "rgba(245,179,1,0.12)" : "rgba(0,0,0,0.001)"}
+                  stroke={sel ? "#f5b301" : "#ef4444"}
+                  strokeWidth={2}
+                  style={{ pointerEvents: "auto", cursor: "move" }}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) { setSelected(b.id); return; }
+                    e.stopPropagation();
+                    setSelected(b.id);
+                    const p = toPage(e.clientX, e.clientY);
+                    dragRef.current = { mode: "quadMove", id: b.id, ox: p.x, oy: p.y, quad: q };
+                  }}
+                  onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setSelected(b.id); const p = toPage(e.clientX, e.clientY); setMenu({ px: p.x, py: p.y, boxId: b.id }); }}
+                />
+                {sel && q.map(([x, y], i) => (
+                  <circle
+                    key={i}
+                    cx={x * scale}
+                    cy={y * scale}
+                    r={7}
+                    fill="#f5b301"
+                    stroke="#fff"
+                    strokeWidth={1.5}
+                    style={{ pointerEvents: "auto", cursor: "grab" }}
+                    onPointerDown={(e) => { if (e.button !== 0) return; e.stopPropagation(); setSelected(b.id); dragRef.current = { mode: "quadCorner", id: b.id, corner: i }; }}
+                  />
+                ))}
+              </g>
+            );
+          })}
+        </svg>
+      )}
+
       {showDraft && scale > 0 && (
         <div style={{ position: "absolute", left: showDraft.x * scale, top: showDraft.y * scale, width: showDraft.w * scale, height: showDraft.h * scale, border: "2px dashed #f5b301", boxSizing: "border-box", pointerEvents: "none" }} />
       )}
@@ -221,9 +305,9 @@ export function PanelBoxEditor({
           onPointerDown={(e) => e.stopPropagation()}
           onContextMenu={(e) => e.preventDefault()}
           style={{
-            position: "absolute", left: clamp(menu.px * scale, 0, cssW - 120), top: menu.py * scale, zIndex: 20,
+            position: "absolute", left: clamp(menu.px * scale, 0, cssW - 150), top: menu.py * scale, zIndex: 20,
             background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 6, padding: 4,
-            display: "flex", flexDirection: "column", gap: 2, minWidth: 116, lineHeight: "normal",
+            display: "flex", flexDirection: "column", gap: 2, minWidth: 150, lineHeight: "normal",
             boxShadow: "0 6px 18px rgba(0,0,0,0.45)",
           }}
         >
@@ -232,6 +316,20 @@ export function PanelBoxEditor({
             style={{ width: "100%", justifyContent: "flex-start" }}
             onPointerDown={(e) => { e.stopPropagation(); addBoxAt(menu.px, menu.py); setMenu(null); }}
           >＋ Add box</button>
+          {menu.boxId && !boxes.find((b) => b.id === menu.boxId)?.quad && (
+            <button
+              className="comic-btn comic-btn--sm"
+              style={{ width: "100%", justifyContent: "flex-start" }}
+              onPointerDown={(e) => { e.stopPropagation(); toQuad(menu.boxId!); setMenu(null); }}
+            >◇ Make diagonal</button>
+          )}
+          {menu.boxId && boxes.find((b) => b.id === menu.boxId)?.quad && (
+            <button
+              className="comic-btn comic-btn--sm"
+              style={{ width: "100%", justifyContent: "flex-start" }}
+              onPointerDown={(e) => { e.stopPropagation(); toRect(menu.boxId!); setMenu(null); }}
+            >▭ Back to rectangle</button>
+          )}
           {menu.boxId && (
             <button
               className="comic-btn comic-btn--sm"
