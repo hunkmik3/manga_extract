@@ -291,7 +291,7 @@ async function dispatchFlow(
 // local media without a tunnel, so refs/edit run on Gemini instead).
 function fallbackNotice(requested: string, used: string | null): string | null {
   if (used && used !== requested) {
-    return "Tham chiếu/tinh chỉnh đã chạy bằng Gemini (Atrium cần tunnel PUBLIC_MEDIA_BASE_URL để đọc ảnh local).";
+    return "References/refine ran on Gemini (Atrium needs a PUBLIC_MEDIA_BASE_URL tunnel to read local images).";
   }
   return null;
 }
@@ -355,7 +355,7 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
   reusePrompt(prompt, refMediaIds) {
     const assets = get().assets;
     const nameOf = (a: FlowAsset) =>
-      groupName(a.tags, CHAR_PREFIX) || groupName(a.tags, SCENE_PREFIX) || a.label || "ảnh";
+      groupName(a.tags, CHAR_PREFIX) || groupName(a.tags, SCENE_PREFIX) || a.label || "image";
     const ids = new Set<string>();
     // 1. Exact: the refs stored with the image when it was generated.
     for (const id of refMediaIds) if (assets.some((a) => a.mediaId === id)) ids.add(id);
@@ -363,7 +363,7 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     //    the @tokens in the text against the names/labels of existing images.
     for (const a of assets) {
       const n = nameOf(a);
-      if (n && n !== "ảnh" && prompt.includes(`@${n}`)) ids.add(a.mediaId);
+      if (n && n !== "image" && prompt.includes(`@${n}`)) ids.add(a.mediaId);
     }
     // Rebuild the @token pills, grouping refs under their derived token (a
     // character/scene → all its views; otherwise the image's own label) so the

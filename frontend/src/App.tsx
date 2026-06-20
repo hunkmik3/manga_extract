@@ -56,7 +56,7 @@ export function App() {
             type="button"
             className="mode-switch"
             onClick={() => setMode("flow")}
-            title="Mở Flow Studio — tạo ảnh kiểu Google Flow bằng API"
+            title="Open Flow Studio — generate Google Flow-style images via API"
           >
             ✦ Flow Studio
           </button>

@@ -173,7 +173,7 @@ export function FlowComposer() {
     const images = assets.map((a) => ({
       key: `i:${a.refId}`,
       kind: "image" as const,
-      name: a.label || "Ảnh",
+      name: a.label || "Image",
       cover: a.mediaId,
       mediaIds: [a.mediaId],
     }));
@@ -225,7 +225,7 @@ export function FlowComposer() {
           {composerRefs.map((m) => (
             <span key={m} className="fc__refchip">
               <img src={thumbUrl(m, 96)} alt="" loading="lazy" decoding="async" onClick={() => select(m)} />
-              <button type="button" onClick={() => removeRef(m)} aria-label="Bỏ tham chiếu">
+              <button type="button" onClick={() => removeRef(m)} aria-label="Remove reference">
                 ✕
               </button>
             </span>
@@ -235,7 +235,7 @@ export function FlowComposer() {
 
       {mention && filtered.length > 0 && (
         <div className="fc__mention" role="listbox">
-          <div className="fc__mention-head">Chèn tham chiếu — @{mention.query || "…"}</div>
+          <div className="fc__mention-head">Insert reference — @{mention.query || "…"}</div>
           {filtered.map((e) => (
             <button
               key={e.key}
@@ -250,10 +250,10 @@ export function FlowComposer() {
               <span className="fc__mention-name">{e.name}</span>
               <span className="fc__mention-kind">
                 {e.kind === "char"
-                  ? `👤 Nhân vật · ${e.mediaIds.length}`
+                  ? `👤 Character · ${e.mediaIds.length}`
                   : e.kind === "scene"
-                    ? `🎬 Cảnh · ${e.mediaIds.length}`
-                    : "Ảnh"}
+                    ? `🎬 Scene · ${e.mediaIds.length}`
+                    : "Image"}
               </span>
             </button>
           ))}
@@ -265,7 +265,7 @@ export function FlowComposer() {
           type="button"
           className="fc__icon"
           onClick={() => fileInput.current?.click()}
-          title="Tải ảnh / thêm tham chiếu"
+          title="Upload image / add reference"
         >
           ＋
         </button>
@@ -289,7 +289,7 @@ export function FlowComposer() {
           <textarea
             ref={taRef}
             className="fc__input"
-            placeholder="Bạn muốn tạo gì?  (gõ @ để chèn nhân vật / cảnh / ảnh)"
+            placeholder="What do you want to create?  (type @ to insert a character / scene / image)"
             value={prompt}
             onChange={onChange}
             onScroll={() => {
@@ -347,7 +347,7 @@ export function FlowComposer() {
         </div>
 
         <div className="fc__settings" ref={popRef}>
-          <button type="button" className="fc__model" onClick={() => setOpenSet((v) => !v)} title="Cài đặt tạo ảnh">
+          <button type="button" className="fc__model" onClick={() => setOpenSet((v) => !v)} title="Image generation settings">
             <span className="fc__model-name">{modelLabel}</span>
             <span className="fc__model-meta">{settings.aspect} · {settings.count}x</span>
           </button>
@@ -363,7 +363,7 @@ export function FlowComposer() {
                 </select>
               </div>
               <div className="fc__pop-section">
-                <label className="fc__pop-label">Tỉ lệ</label>
+                <label className="fc__pop-label">Aspect ratio</label>
                 <div className="fc__chips">
                   {FLOW_ASPECTS.map((a) => (
                     <button key={a} type="button" className={`fc__chip${settings.aspect === a ? " is-on" : ""}`} onClick={() => setSettings({ aspect: a })}>
@@ -373,7 +373,7 @@ export function FlowComposer() {
                 </div>
               </div>
               <div className="fc__pop-section">
-                <label className="fc__pop-label">Số lượng</label>
+                <label className="fc__pop-label">Count</label>
                 <div className="fc__chips">
                   {[1, 2, 3, 4].map((n) => (
                     <button key={n} type="button" className={`fc__chip${settings.count === n ? " is-on" : ""}`} onClick={() => setSettings({ count: n })}>
@@ -384,7 +384,7 @@ export function FlowComposer() {
               </div>
               <div className="fc__pop-section">
                 <label className="fc__pop-label">
-                  Độ phân giải {cap !== "4K" && <span className="fc__muted">(4K: chỉ Pro)</span>}
+                  Resolution {cap !== "4K" && <span className="fc__muted">(4K: Pro only)</span>}
                 </label>
                 <div className="fc__chips">
                   {FLOW_SIZES.map((sz) => (
@@ -404,7 +404,7 @@ export function FlowComposer() {
           )}
         </div>
 
-        <button type="button" className="fc__send" onClick={submit} disabled={!prompt.trim()} title="Tạo (Enter)">
+        <button type="button" className="fc__send" onClick={submit} disabled={!prompt.trim()} title="Generate (Enter)">
           →
         </button>
       </div>

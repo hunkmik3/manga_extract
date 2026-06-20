@@ -220,7 +220,7 @@ export function ProjectSidebar() {
             type="button"
             className="project-sidebar__flow-cta"
             onClick={() => setAppMode("flow")}
-            title="Mở Flow Studio — tạo ảnh kiểu Google Flow bằng API"
+            title="Open Flow Studio — generate Google Flow-style images via API"
           >
             ✦ Flow Studio
           </button>
@@ -290,7 +290,7 @@ export function ProjectSidebar() {
                         onClick={() => switchBoard(b.id)}
                         title={
                           isOrphan
-                            ? `${b.name} — Flow project ${status?.flow_project_id ?? ""} không tồn tại trên Google Flow. Click ⋯ → Rebind to re-link.`
+                            ? `${b.name} — Flow project ${status?.flow_project_id ?? ""} does not exist on Google Flow. Click ⋯ → Rebind to re-link.`
                             : b.name
                         }
                       >
@@ -367,9 +367,9 @@ export function ProjectSidebar() {
               Delete project?
             </h2>
             <p className="project-modal__hint">
-              <strong>"{deleteTarget.name}"</strong> sẽ bị xoá vĩnh viễn cùng
-              với tất cả nodes, edges, generations, và assets bên trong. Không
-              thể khôi phục.
+              <strong>"{deleteTarget.name}"</strong> will be permanently deleted
+              along with all its nodes, edges, generations, and assets. This
+              cannot be undone.
             </p>
             <div className="project-modal__actions">
               <button
@@ -412,7 +412,7 @@ export function ProjectSidebar() {
               New project
             </h2>
             <p className="project-modal__hint">
-              Tên project hiển thị trong sidebar. Có thể đổi sau.
+              The project name shown in the sidebar. You can change it later.
             </p>
             <input
               ref={newDialogInputRef}

@@ -423,13 +423,13 @@ export function FlowViewer() {
 
       {/* Action toolbar — top-left, in the dark margin (off the image). */}
       <div className="fv__tools">
-        <button type="button" className="fv__tool" title="Dùng làm tham chiếu" onClick={() => addRef(mediaId)}>
+        <button type="button" className="fv__tool" title="Use as reference" onClick={() => addRef(mediaId)}>
           ➕
         </button>
         <button
           type="button"
           className={`fv__tool${drawMode ? " is-on" : ""}`}
-          title="Khoanh vùng / vẽ lên ảnh để chỉ định vùng sửa"
+          title="Annotate (draw on the image to mark the region to edit)"
           onClick={() => setDrawMode((d) => !d)}
         >
           ✏️
@@ -438,7 +438,7 @@ export function FlowViewer() {
           <button
             type="button"
             className="fv__tool"
-            title="Tạo lại"
+            title="Regenerate"
             onClick={() => regenerate(mediaId)}
           >
             ♻
@@ -448,22 +448,22 @@ export function FlowViewer() {
           <button
             type="button"
             className={`fv__tool${asset.pinned ? " is-on" : ""}`}
-            title={asset.pinned ? "Bỏ ghim" : "Ghim"}
+            title={asset.pinned ? "Unpin" : "Pin"}
             onClick={() => togglePin(asset.refId)}
           >
             📌
           </button>
         )}
-        <a className="fv__tool" title="Tải" href={mediaUrl(mediaId)} download={`${mediaId}.png`}>
+        <a className="fv__tool" title="Download" href={mediaUrl(mediaId)} download={`${mediaId}.png`}>
           ⬇
         </a>
         {asset && (
           <button
             type="button"
             className="fv__tool fv__tool--danger"
-            title="Xoá"
+            title="Delete"
             onClick={() => {
-              if (window.confirm("Xoá ảnh này khỏi thư viện?")) {
+              if (window.confirm("Delete this image from the library?")) {
                 remove(asset.refId);
                 close(null);
               }
@@ -503,7 +503,7 @@ export function FlowViewer() {
             <button
               type="button"
               className="fv__draw-btn"
-              title="Hoàn tác nét vẽ"
+              title="Undo stroke"
               disabled={strokes.length === 0}
               onClick={() => setStrokes((s) => s.slice(0, -1))}
             >
@@ -512,7 +512,7 @@ export function FlowViewer() {
             <button
               type="button"
               className="fv__draw-btn"
-              title="Xoá hết nét vẽ"
+              title="Clear all strokes"
               disabled={strokes.length === 0}
               onClick={() => setStrokes([])}
             >
@@ -522,7 +522,7 @@ export function FlowViewer() {
         </div>
       )}
 
-      <button type="button" className="fv__close" onClick={() => close(null)} aria-label="Đóng">
+      <button type="button" className="fv__close" onClick={() => close(null)} aria-label="Close">
         ✕
       </button>
 
@@ -531,7 +531,7 @@ export function FlowViewer() {
         <button
           type="button"
           className="fv__nav fv__nav--prev"
-          title="Ảnh trước (←)"
+          title="Previous image (←)"
           onClick={() => close(prevId)}
         >
           ‹
@@ -541,7 +541,7 @@ export function FlowViewer() {
         <button
           type="button"
           className="fv__nav fv__nav--next"
-          title="Ảnh sau (→)"
+          title="Next image (→)"
           onClick={() => close(nextId)}
         >
           ›
@@ -592,7 +592,7 @@ export function FlowViewer() {
         <button
           type="button"
           className="fv__zbtn"
-          title="Thu nhỏ"
+          title="Zoom out"
           onClick={() => {
             const el = stageRef.current;
             if (el) {
@@ -603,13 +603,13 @@ export function FlowViewer() {
         >
           −
         </button>
-        <button type="button" className="fv__zlevel" title="Đặt lại" onClick={() => setView(RESET)}>
+        <button type="button" className="fv__zlevel" title="Reset" onClick={() => setView(RESET)}>
           {Math.round(view.scale * 100)}%
         </button>
         <button
           type="button"
           className="fv__zbtn"
-          title="Phóng to"
+          title="Zoom in"
           onClick={() => {
             const el = stageRef.current;
             if (el) {
@@ -632,7 +632,7 @@ export function FlowViewer() {
                 <button
                   type="button"
                   className="fv__bar-refx"
-                  title="Bỏ"
+                  title="Remove"
                   onClick={() => setEditRefs((r) => r.filter((x) => x !== id))}
                 >
                   ✕
@@ -656,14 +656,14 @@ export function FlowViewer() {
           <button
             type="button"
             className="fv__bar-add"
-            title="Thêm ảnh tham chiếu"
+            title="Add reference image"
             onClick={() => fileRef.current?.click()}
           >
             +
           </button>
           <input
             className="fv__bar-input"
-            placeholder="Bạn muốn thay đổi điều gì?"
+            placeholder="What do you want to change?"
             value={edit}
             onChange={(e) => setEdit(e.target.value)}
             onKeyDown={(e) => {
@@ -678,7 +678,7 @@ export function FlowViewer() {
               type="button"
               className="fv__bar-model"
               onClick={() => setModelOpen((o) => !o)}
-              title="Chọn model"
+              title="Choose model"
             >
               🍌 {modelLabel}
             </button>
@@ -695,7 +695,7 @@ export function FlowViewer() {
                     }}
                   >
                     🍌 {m.label}
-                    <span className="fv__model-max">tối đa {m.max}</span>
+                    <span className="fv__model-max">max {m.max}</span>
                   </button>
                 ))}
               </div>
@@ -704,7 +704,7 @@ export function FlowViewer() {
           <button
             type="button"
             className="fv__bar-send"
-            title="Sửa bằng AI"
+            title="Edit with AI"
             disabled={!edit.trim()}
             onClick={submitEdit}
           >

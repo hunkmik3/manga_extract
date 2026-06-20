@@ -30,19 +30,19 @@ export function FlowPromptBar() {
             className={`flow-seg__btn${kind === "image" ? " is-active" : ""}`}
             onClick={() => setKind("image")}
           >
-            🖼 Hình ảnh
+            🖼 Image
           </button>
           <button
             type="button"
             className={`flow-seg__btn${kind === "video" ? " is-active" : ""}`}
             onClick={() => setKind("video")}
-            title="Sắp có — bản này tập trung tạo ảnh"
+            title="Coming soon — this build focuses on image generation"
           >
             ▶ Video
           </button>
         </div>
 
-        <div className="flow-chips" role="group" aria-label="Tỉ lệ">
+        <div className="flow-chips" role="group" aria-label="Aspect ratio">
           {FLOW_ASPECTS.map((a) => (
             <button
               key={a}
@@ -55,7 +55,7 @@ export function FlowPromptBar() {
           ))}
         </div>
 
-        <div className="flow-chips" role="group" aria-label="Số lượng">
+        <div className="flow-chips" role="group" aria-label="Count">
           {[1, 2, 3, 4].map((n) => (
             <button
               key={n}
@@ -72,7 +72,7 @@ export function FlowPromptBar() {
           className="flow-model"
           value={settings.model}
           onChange={(e) => setSettings({ model: e.target.value })}
-          title="Model tạo ảnh"
+          title="Image model"
         >
           {FLOW_MODELS.map((m) => (
             <option key={m.id} value={m.id}>
@@ -84,14 +84,14 @@ export function FlowPromptBar() {
 
       {kind === "video" && (
         <div className="flow-promptbar__note">
-          Bản này tập trung tạo ảnh — video (Veo) sẽ thêm sau.
+          This build focuses on image generation — video (Veo) is coming later.
         </div>
       )}
 
       <div className="flow-promptbar__row">
         <textarea
           className="flow-promptbar__input"
-          placeholder="Bạn muốn tạo gì?  (gõ @TênNhânVật để giữ nhân vật đồng nhất)"
+          placeholder="What do you want to create?  (type @CharacterName to keep characters consistent)"
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => {
@@ -107,7 +107,7 @@ export function FlowPromptBar() {
           className="flow-promptbar__send"
           onClick={submit}
           disabled={generating || kind === "video" || !prompt.trim()}
-          title={generating ? "Đang tạo…" : "Tạo (⌘/Ctrl + Enter)"}
+          title={generating ? "Generating…" : "Generate (⌘/Ctrl + Enter)"}
         >
           {generating ? "…" : "→"}
         </button>

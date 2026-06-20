@@ -829,10 +829,10 @@ export function GenerationDialog() {
               }}
               placeholder={
                 isVideo
-                  ? "Bỏ trống để tự sinh motion prompt từ source image ✨"
+                  ? "Leave blank to auto-generate a motion prompt from the source image ✨"
                   : isPrompt
-                  ? "Nhập prompt mồi để feed cho downstream image / video…"
-                  : "Bỏ trống để tự generate prompt từ upstream nodes ✨"
+                  ? "Enter a seed prompt to feed downstream image / video…"
+                  : "Leave blank to auto-generate a prompt from upstream nodes ✨"
               }
               disabled={isWorking}
               readOnly={hasStoryboardUpstream}
@@ -854,8 +854,8 @@ export function GenerationDialog() {
             {isWorking && (
               <p className="gen-dialog__hint">
                 {node?.data.aiBriefStatus === "pending"
-                  ? "✨ Đang phân tích image…"
-                  : "✨ Đang dựng prompt từ upstream context…"}
+                  ? "✨ Analyzing image…"
+                  : "✨ Building prompt from upstream context…"}
               </p>
             )}
           </div>
@@ -881,7 +881,7 @@ export function GenerationDialog() {
             </div>
 
             <div className="gen-dialog__field">
-              <span className="gen-dialog__label">Quốc gia</span>
+              <span className="gen-dialog__label">Country</span>
               <div className="aspect-chip-row">
                 {CHARACTER_COUNTRIES.map((c) => (
                   <button
@@ -915,8 +915,8 @@ export function GenerationDialog() {
             <div className="gen-dialog__field">
               <div className="gen-dialog__label-row">
                 <label className="gen-dialog__label" htmlFor="gen-char-extras">
-                  Mô tả thêm (tuỳ chọn)
-                  <InfoTip tip="Prompt được auto-build: portrait headshot · vibe styling · photorealistic — tối ưu cho character reference." />
+                  More details (optional)
+                  <InfoTip tip="The prompt is auto-built: portrait headshot · vibe styling · photorealistic — optimized for a character reference." />
                 </label>
                 <span className="gen-dialog__char-count">{charExtras.length}/200</span>
               </div>
@@ -928,7 +928,7 @@ export function GenerationDialog() {
                 maxLength={200}
                 value={charExtras}
                 onChange={(e) => setCharExtras(e.target.value)}
-                placeholder="Tuổi, kiểu tóc, trang phục, biểu cảm…"
+                placeholder="Age, hairstyle, outfit, expression…"
               />
             </div>
           </>
@@ -1005,15 +1005,15 @@ export function GenerationDialog() {
                 <p className="gen-dialog__hint">
                   {selectedSourceIdx.size === 0 ? (
                     <span style={{ color: "#ef4444" }}>
-                      Chọn ít nhất 1 variant để gen video.
+                      Select at least 1 variant to generate video.
                     </span>
                   ) : (
                     <>
-                      Sẽ gen <strong>{selectedSourceIdx.size} video</strong>
+                      Will generate <strong>{selectedSourceIdx.size} video</strong>
                       {selectedSourceIdx.size === sourceMediaIds.length
-                        ? " (tất cả variants)"
+                        ? " (all variants)"
                         : ` (${selectedSourceIdx.size}/${sourceMediaIds.length} variants)`}
-                      — cùng prompt + camera setting.
+                      — same prompt + camera setting.
                     </>
                   )}
                 </p>
@@ -1200,7 +1200,7 @@ export function GenerationDialog() {
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
               Model
-              <InfoTip tip="Sticky — selection được lưu cho các lần dispatch sau (đồng bộ với Settings). Veo dùng i2v (1 source image); Omni Flash dùng reference ingredients (đa ảnh) với duration 4/6/8/10s chọn ở dưới." />
+              <InfoTip tip="Sticky — the selection is saved for later dispatches (synced with Settings). Veo uses i2v (1 source image); Omni Flash uses reference ingredients (multiple images) with a 4/6/8/10s duration chosen below." />
             </span>
             <select
               className="gen-dialog__select"
@@ -1250,7 +1250,7 @@ export function GenerationDialog() {
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
               Camera
-              <InfoTip tip="Static = locked-off, không zoom/pan — phù hợp e-commerce product shot. Dynamic = để auto-prompt tự quyết camera move (dolly / micro-shift / …)." />
+              <InfoTip tip="Static = locked-off, no zoom/pan — ideal for e-commerce product shots. Dynamic = let auto-prompt decide the camera move (dolly / micro-shift / …)." />
             </span>
             <div className="aspect-chip-row">
               {CAMERA_MOVEMENTS.map((c) => (
@@ -1306,7 +1306,7 @@ export function GenerationDialog() {
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
               Grid
-              <InfoTip tip="Storyboard renders as a SINGLE composite image — Flow draws the whole grid as one picture. The topic field above is your story (e.g. Rùa và Thỏ); the locked template wraps it for you. For 2×3 / 2×4 the rows × cols flip with the aspect ratio so panels stay readable on both landscape and portrait composites." />
+              <InfoTip tip="Storyboard renders as a SINGLE composite image — Flow draws the whole grid as one picture. The topic field above is your story (e.g. The Tortoise and the Hare); the locked template wraps it for you. For 2×3 / 2×4 the rows × cols flip with the aspect ratio so panels stay readable on both landscape and portrait composites." />
             </span>
             <div className="aspect-chip-row">
               {STORYBOARD_GRIDS.map((g) => {

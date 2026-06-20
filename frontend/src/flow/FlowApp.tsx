@@ -82,7 +82,7 @@ export function FlowApp() {
   };
 
   const newProject = () => {
-    const name = window.prompt("Tên project mới:", `Project ${projects.length + 1}`);
+    const name = window.prompt("New project name:", `Project ${projects.length + 1}`);
     if (name === null) return;
     createProject(name.trim() || "Untitled");
   };
@@ -92,13 +92,13 @@ export function FlowApp() {
       {/* ── left rail = project list ── */}
       <aside className="fn">
         <div className="fn__brand">
-          <span className="fn__logo">✦</span>
-          {!collapsed && <span className="fn__title">Flow Studio</span>}
+          <img className="fn__symbol" src="/symbol.png" alt="SGS Flow Studio" />
+          {!collapsed && <span className="fn__title">SGS Flow Studio</span>}
         </div>
 
         {!collapsed && (
           <button type="button" className="fn__newproj" onClick={newProject}>
-            ＋ Project mới
+            ＋ New project
           </button>
         )}
 
@@ -116,10 +116,10 @@ export function FlowApp() {
                   <button
                     type="button"
                     className="fn__prow-act"
-                    title="Đổi tên"
+                    title="Rename"
                     onClick={(e) => {
                       e.stopPropagation();
-                      const n = window.prompt("Đổi tên project:", p.name);
+                      const n = window.prompt("Rename project:", p.name);
                       if (n && n.trim() && p.id !== undefined) renameProject(p.id, n.trim());
                     }}
                   >
@@ -129,10 +129,10 @@ export function FlowApp() {
                     <button
                       type="button"
                       className="fn__prow-act"
-                      title="Xoá project"
+                      title="Delete project"
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (p.id !== undefined && window.confirm(`Xoá project "${p.name}"?`)) removeProject(p.id);
+                        if (p.id !== undefined && window.confirm(`Delete project "${p.name}"?`)) removeProject(p.id);
                       }}
                     >
                       🗑
@@ -150,12 +150,12 @@ export function FlowApp() {
           type="button"
           className="fn__ghost"
           onClick={() => setCollapsed((c) => !c)}
-          title={collapsed ? "Mở rộng" : "Thu gọn"}
+          title={collapsed ? "Expand" : "Collapse"}
         >
-          {collapsed ? "»" : "« Thu gọn"}
+          {collapsed ? "»" : "« Collapse"}
         </button>
         {!FLOW_ONLY && (
-          <button type="button" className="fn__ghost" onClick={() => setMode("manga")} title="Sang Manga Extract">
+          <button type="button" className="fn__ghost" onClick={() => setMode("manga")} title="To Manga Extract">
             {collapsed ? "↤" : "↤ Manga Extract"}
           </button>
         )}
@@ -171,18 +171,18 @@ export function FlowApp() {
       >
         {dragOver && (
           <div className="fc-drop">
-            <div className="fc-drop__inner">⬇ Thả ảnh vào đây để tải lên</div>
+            <div className="fc-drop__inner">⬇ Drop images here to upload</div>
           </div>
         )}
 
         <div className="fc-top">
           <input
             className="fc-search"
-            placeholder="Tìm theo prompt…"
+            placeholder="Search by prompt…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
-          <span className="fc-count">{gridAssets.length} mục</span>
+          <span className="fc-count">{gridAssets.length} items</span>
         </div>
 
         {error && (
@@ -200,14 +200,14 @@ export function FlowApp() {
 
         <div className="fc-scroll">
           {loading ? (
-            <div className="fc-empty">Đang tải…</div>
+            <div className="fc-empty">Loading…</div>
           ) : gridAssets.length === 0 && !generating ? (
             <div className="fc-empty">
               <div className="fc-empty__icon">❀</div>
               <div className="fc-empty__text">
                 {query.trim()
-                  ? "Không tìm thấy ảnh khớp."
-                  : "Bắt đầu tạo: gõ prompt ở dưới, hoặc kéo-thả ảnh vào đây."}
+                  ? "No matching images found."
+                  : "Start creating: type a prompt below, or drag and drop images here."}
               </div>
             </div>
           ) : (
@@ -236,12 +236,12 @@ export function FlowApp() {
                     <button
                       type="button"
                       className="fc-card__act"
-                      title="Thêm ảnh vào câu lệnh"
+                      title="Add image to prompt"
                       onClick={(e) => {
                         e.stopPropagation();
                         const cn = groupName(a.tags, CHAR_PREFIX);
                         const sn = groupName(a.tags, SCENE_PREFIX);
-                        tagToPrompt(cn || sn || a.label || "ảnh", a.mediaId, [a.mediaId]);
+                        tagToPrompt(cn || sn || a.label || "image", a.mediaId, [a.mediaId]);
                       }}
                     >
                       @
@@ -250,7 +250,7 @@ export function FlowApp() {
                       <button
                         type="button"
                         className="fc-card__act"
-                        title="Sử dụng lại câu lệnh"
+                        title="Reuse prompt"
                         onClick={(e) => {
                           e.stopPropagation();
                           const refIds = a.tags
@@ -265,7 +265,7 @@ export function FlowApp() {
                     <button
                       type="button"
                       className={`fc-card__act${a.pinned ? " is-on" : ""}`}
-                      title={a.pinned ? "Bỏ ghim" : "Ghim"}
+                      title={a.pinned ? "Unpin" : "Pin"}
                       onClick={(e) => {
                         e.stopPropagation();
                         togglePin(a.refId);
@@ -355,15 +355,15 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
   const pct = Math.min(100, Math.round((usage.today / Math.max(1, usage.daily_quota)) * 100));
   if (collapsed) {
     return (
-      <div className="fn__usage fn__usage--mini" title={`Hôm nay: ${usage.today}/${usage.daily_quota} ảnh`}>
+      <div className="fn__usage fn__usage--mini" title={`Today: ${usage.today}/${usage.daily_quota} images`}>
         {usage.today}
       </div>
     );
   }
   return (
-    <div className="fn__usage" title={`Tổng đã tạo: ${usage.total} ảnh`}>
+    <div className="fn__usage" title={`Total generated: ${usage.total} images`}>
       <div className="fn__usage-row">
-        <span>Hôm nay</span>
+        <span>Today</span>
         <span>
           {usage.today}/{usage.daily_quota}
         </span>
@@ -371,7 +371,7 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
       <div className="fn__usage-bar">
         <div className="fn__usage-fill" style={{ width: `${pct}%` }} />
       </div>
-      <div className="fn__usage-sub">~{usage.remaining_est} ảnh còn lại hôm nay (ước tính)</div>
+      <div className="fn__usage-sub">~{usage.remaining_est} images remaining today (est.)</div>
     </div>
   );
 }
