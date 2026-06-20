@@ -38,11 +38,11 @@ const COLOR_NAMES: Record<string, string> = {
 
 const MIN_SCALE = 0.2;
 const DEFAULT_MAX_SCALE = 8;
-// GPU hard limit on a single raster surface is ~16384px; on a Retina display
-// CSS px are doubled in device px, so a scaled image whose device-pixel size
-// crosses that limit renders BLACK. Stay well under it (target ~12000 device
-// px) — the per-image cap below is derived from this.
-const SAFE_DEVICE_PX = 12000;
+// GPU max single-surface size is ~16384px on most GPUs but only ~8192 on some
+// (older Intel / integrated); a scaled image whose device-pixel size crosses
+// the limit renders BLACK. Target well under the lower bound so zoom+pan is
+// safe everywhere — the per-image cap below is derived from this.
+const SAFE_DEVICE_PX = 8000;
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** Largest zoom that keeps the scaled image's device-pixel size safe for the
@@ -96,8 +96,7 @@ export function FlowViewer() {
   const [view, setView] = useState<View>(RESET);
   const [grabbing, setGrabbing] = useState(false);
   const [fullReady, setFullReady] = useState(false);
-  // Browse on a light ~2048 "view" image (fast over a tunnel); upgrade to the
-  // full original only once the user zooms in to inspect detail.
+  // Browse on the light ~2048 view; load the full original on deep zoom for 4K detail.
   const [hiRes, setHiRes] = useState(false);
   // Freehand annotation ("khoanh vùng"): draw marks on the image to guide the
   // edit; on submit the marks are flattened onto the image and sent as source.
@@ -122,6 +121,11 @@ export function FlowViewer() {
     setDrawMode(false);
     setStrokes([]);
   }, [mediaId]);
+
+  // Deep zoom → swap the 2048 view for the full original (crisp 4K detail).
+  useEffect(() => {
+    if (view.scale > 1.8) setHiRes(true);
+  }, [view.scale]);
 
   // Drawing forces the image to fit (scale 1, no pan) so canvas coords line up.
   useEffect(() => {
@@ -165,12 +169,6 @@ export function FlowViewer() {
     window.addEventListener("resize", update);
     return () => window.removeEventListener("resize", update);
   }, []);
-
-  // Once zoomed in past ~1.8×, swap the light view image for the full original
-  // so deep zoom stays crisp.
-  useEffect(() => {
-    if (view.scale > 1.8) setHiRes(true);
-  }, [view.scale]);
 
   // Keep the active filmstrip thumbnail scrolled into view.
   useEffect(() => {
@@ -295,18 +293,16 @@ export function FlowViewer() {
     setGrabbing(true);
   };
   const onPointerMove = (e: React.PointerEvent) => {
-    if (!drag.current) return;
+    // Capture the drag start + pointer coords NOW — the setView updater runs
+    // later, by which time drag.current may be null (pointerup) → reading
+    // drag.current!.tx would crash the component (black screen).
+    const d = drag.current;
+    if (!d) return;
+    const cx = e.clientX;
+    const cy = e.clientY;
     const rect = stageRef.current?.getBoundingClientRect() ?? null;
     setView((v) =>
-      clampView(
-        {
-          ...v,
-          tx: drag.current!.tx + (e.clientX - drag.current!.x),
-          ty: drag.current!.ty + (e.clientY - drag.current!.y),
-        },
-        rect,
-        maxScaleRef.current,
-      ),
+      clampView({ ...v, tx: d.tx + (cx - d.x), ty: d.ty + (cy - d.y) }, rect, maxScaleRef.current),
     );
   };
   const onPointerUp = () => {
@@ -562,8 +558,17 @@ export function FlowViewer() {
           className="fv__canvas"
           style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})` }}
         >
-          {/* Sharp-but-light thumbnail — shows instantly while the full loads. */}
-          <img className="fv__ph" src={thumbUrl(mediaId, 1536)} alt="" draggable={false} aria-hidden="true" />
+          {/* Light placeholder — shows instantly while the view image loads,
+              then hidden so only ONE bounded image layer composites on zoom. */}
+          <img
+            className="fv__ph"
+            src={thumbUrl(mediaId, 1536)}
+            alt=""
+            draggable={false}
+            aria-hidden="true"
+            style={{ opacity: fullReady ? 0 : 1 }}
+          />
+          {/* ~2048 view while browsing; full original once zoomed in (4K detail). */}
           <img
             className="fv__full"
             src={hiRes ? mediaUrl(mediaId) : thumbUrl(mediaId, 2048)}

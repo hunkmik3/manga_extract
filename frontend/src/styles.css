@@ -6774,11 +6774,10 @@ button:disabled {
   height: 34px;
   font-size: 15px;
   color: var(--text);
-  background: rgba(20, 22, 28, 0.72);
+  background: rgba(22, 24, 30, 0.94);
   border: 1px solid var(--border);
   border-radius: 10px;
   cursor: pointer;
-  backdrop-filter: blur(6px);
 }
 .fv__close:hover {
   border-color: var(--accent);
@@ -6798,10 +6797,9 @@ button:disabled {
   padding: 6px;
   overflow-x: auto;
   overflow-y: hidden;
-  background: rgba(20, 22, 28, 0.72);
+  background: rgba(22, 24, 30, 0.94);
   border: 1px solid var(--border);
   border-radius: 12px;
-  backdrop-filter: blur(6px);
   scrollbar-width: thin;
 }
 .fv__strip::-webkit-scrollbar {
@@ -6845,10 +6843,9 @@ button:disabled {
   display: flex;
   gap: 4px;
   padding: 5px;
-  background: rgba(20, 22, 28, 0.72);
+  background: rgba(22, 24, 30, 0.94);
   border: 1px solid var(--border);
   border-radius: 12px;
-  backdrop-filter: blur(6px);
 }
 
 /* Annotation drawing layer + toolbar. */
@@ -6874,10 +6871,9 @@ button:disabled {
   gap: 10px;
   width: 168px;
   padding: 10px;
-  background: rgba(20, 22, 28, 0.82);
+  background: rgba(22, 24, 30, 0.95);
   border: 1px solid var(--border);
   border-radius: 12px;
-  backdrop-filter: blur(8px);
 }
 .fv__swatches {
   display: grid;
@@ -6939,11 +6935,10 @@ button:disabled {
   font-size: 26px;
   line-height: 1;
   color: var(--text);
-  background: rgba(20, 22, 28, 0.72);
+  background: rgba(22, 24, 30, 0.94);
   border: 1px solid var(--border);
   border-radius: 50%;
   cursor: pointer;
-  backdrop-filter: blur(6px);
 }
 .fv__nav:hover {
   border-color: var(--accent);
@@ -6994,10 +6989,9 @@ button:disabled {
   align-items: center;
   gap: 2px;
   padding: 4px;
-  background: rgba(20, 22, 28, 0.72);
+  background: rgba(22, 24, 30, 0.94);
   border: 1px solid var(--border);
   border-radius: 10px;
-  backdrop-filter: blur(6px);
 }
 .fv__zbtn {
   width: 30px;
@@ -7080,7 +7074,6 @@ button:disabled {
   background: rgba(24, 26, 33, 0.92);
   border: 1px solid var(--border);
   border-radius: 16px;
-  backdrop-filter: blur(10px);
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
 }
 .fv__bar-add {
