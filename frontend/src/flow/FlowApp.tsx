@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { thumbUrl } from "../api/client";
+import { getFlowUsage, thumbUrl, type FlowUsage } from "../api/client";
 import { FLOW_ONLY, useAppModeStore } from "../store/appMode";
 import { useFlowProjectsStore } from "../store/flowProjects";
 import { CHAR_PREFIX, REF_PREFIX, SCENE_PREFIX, groupName, useFlowStudioStore } from "../store/flowStudio";
@@ -145,6 +145,7 @@ export function FlowApp() {
         </div>
 
         <div className="fn__spacer" />
+        <FlowUsageBadge collapsed={collapsed} />
         <button
           type="button"
           className="fn__ghost"
@@ -332,6 +333,47 @@ function useTilePcts(
     return () => clearInterval(id);
   }, [generating, total, expS]);
   return pcts;
+}
+
+/** Daily usage badge in the rail. Counts images this tool generated today
+ *  (≈ Atrium usage, since this key is tool-only) and an estimated remaining
+ *  quota. Refetches whenever a generation lands (assets count changes). */
+function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
+  const assetCount = useFlowStudioStore((s) => s.assets.length);
+  const generating = useFlowStudioStore((s) => s.generating);
+  const [usage, setUsage] = useState<FlowUsage | null>(null);
+  useEffect(() => {
+    let live = true;
+    getFlowUsage()
+      .then((u) => live && setUsage(u))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [assetCount, generating]);
+  if (!usage) return null;
+  const pct = Math.min(100, Math.round((usage.today / Math.max(1, usage.daily_quota)) * 100));
+  if (collapsed) {
+    return (
+      <div className="fn__usage fn__usage--mini" title={`Hôm nay: ${usage.today}/${usage.daily_quota} ảnh`}>
+        {usage.today}
+      </div>
+    );
+  }
+  return (
+    <div className="fn__usage" title={`Tổng đã tạo: ${usage.total} ảnh`}>
+      <div className="fn__usage-row">
+        <span>Hôm nay</span>
+        <span>
+          {usage.today}/{usage.daily_quota}
+        </span>
+      </div>
+      <div className="fn__usage-bar">
+        <div className="fn__usage-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="fn__usage-sub">~{usage.remaining_est} ảnh còn lại hôm nay (ước tính)</div>
+    </div>
+  );
 }
 
 /** Flow-style loading tiles — gradient frame in the chosen aspect ratio, image

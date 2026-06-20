@@ -6036,6 +6036,49 @@ button:disabled {
 .fn__spacer {
   flex: 1;
 }
+.fn__usage {
+  margin: 0 6px 8px;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--panel-high);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.fn__usage-row {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.fn__usage-bar {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.fn__usage-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.fn__usage-sub {
+  margin-top: 5px;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.fn__usage--mini {
+  margin: 0 auto 8px;
+  padding: 5px 0;
+  width: 36px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-high);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
 .fn__ghost {
   padding: 8px 10px;
   font-size: 12px;

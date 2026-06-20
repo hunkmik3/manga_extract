@@ -558,6 +558,16 @@ export function thumbUrl(mediaId: string, w = 256): string {
   return `/api/media/${encodeURIComponent(clean)}/thumb?w=${w}`;
 }
 
+export interface FlowUsage {
+  today: number;
+  total: number;
+  daily_quota: number;
+  remaining_est: number;
+}
+export function getFlowUsage() {
+  return api<FlowUsage>("/api/flow/usage");
+}
+
 // ── Upload ───────────────────────────────────────────────────────────────────
 
 export interface UploadResponse {
