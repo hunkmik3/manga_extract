@@ -16,6 +16,17 @@ engine = create_engine(
 def _enable_sqlite_fk(dbapi_conn, _connection_record) -> None:
     cur = dbapi_conn.cursor()
     cur.execute("PRAGMA foreign_keys=ON")
+    # Concurrency: the single agent process serves HTTP + runs the async worker
+    # (several gens at once) against this one SQLite file. In the default
+    # rollback-journal mode a writer takes a whole-DB exclusive lock, so under
+    # concurrent gens + polls + status writes everything serializes and stalls.
+    #   - WAL: readers and the writer run concurrently (no reader/writer block).
+    #   - busy_timeout: wait up to 5s for a lock instead of erroring "database
+    #     is locked" immediately.
+    #   - synchronous=NORMAL: safe under WAL, far fewer fsyncs (faster writes).
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=5000")
+    cur.execute("PRAGMA synchronous=NORMAL")
     cur.close()
 
 

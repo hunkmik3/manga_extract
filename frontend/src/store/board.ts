@@ -187,11 +187,12 @@ function nodeFromDto(n: {
 // ── Persisted active-board id ─────────────────────────────────────────────
 // Survives page reloads so refreshing on project #4 doesn't kick the user
 // back to project #1. localStorage is fine here — single-user, single-host.
-const ACTIVE_BOARD_KEY = "flowboard.activeBoardId";
+// Per-kind key so the Manga and Bubble workspaces remember their own active board.
+const activeBoardKey = (kind: string) => `flowboard.activeBoardId.${kind}`;
 
-function loadPersistedBoardId(): number | null {
+function loadPersistedBoardId(kind: string): number | null {
   try {
-    const raw = localStorage.getItem(ACTIVE_BOARD_KEY);
+    const raw = localStorage.getItem(activeBoardKey(kind));
     if (raw === null) return null;
     const n = parseInt(raw, 10);
     return Number.isFinite(n) && n > 0 ? n : null;
@@ -200,10 +201,10 @@ function loadPersistedBoardId(): number | null {
   }
 }
 
-function persistBoardId(id: number | null): void {
+function persistBoardId(id: number | null, kind: string): void {
   try {
-    if (id === null) localStorage.removeItem(ACTIVE_BOARD_KEY);
-    else localStorage.setItem(ACTIVE_BOARD_KEY, String(id));
+    if (id === null) localStorage.removeItem(activeBoardKey(kind));
+    else localStorage.setItem(activeBoardKey(kind), String(id));
   } catch {
     // Storage disabled / quota exceeded — non-fatal, just lose persistence.
   }
@@ -213,6 +214,9 @@ function persistBoardId(id: number | null): void {
 interface BoardState {
   boardId: number | null;
   boardName: string;
+  // Which workspace these boards belong to: "manga" (panel extraction) or
+  // "bubble" (speech-bubble extraction). Drives listBoards/createBoard kind.
+  boardKind: string;
   // Lightweight summary list rendered by the ProjectSidebar — full node /
   // edge content lives only on the active board to keep memory bounded.
   boards: Board[];
@@ -224,7 +228,7 @@ interface BoardState {
   // entry can recreate what was removed. Not persisted — session-only.
   undoStack: DeleteUndoEntry[];
 
-  loadInitialBoard(): Promise<void>;
+  loadInitialBoard(kind?: string): Promise<void>;
   refreshBoardState(): Promise<void>;
   refreshBoardList(): Promise<void>;
   renameBoard(name: string): Promise<void>;
@@ -292,6 +296,7 @@ interface BoardState {
 export const useBoardStore = create<BoardState>((set, get) => ({
   boardId: null,
   boardName: "",
+  boardKind: "manga",
   boards: [],
   nodes: [],
   edges: [],
@@ -299,19 +304,21 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   error: null,
   undoStack: [],
 
-  async loadInitialBoard() {
-    set({ loading: true, error: null });
+  async loadInitialBoard(kind = "manga") {
+    // Switching workspace (manga ⇄ bubble) reloads this kind's boards. Clear the
+    // current board immediately so the old workspace doesn't flash through.
+    set({ loading: true, error: null, boardKind: kind, boardId: null, nodes: [], edges: [] });
     try {
-      let boards = await listBoards("manga");
+      let boards = await listBoards(kind);
       // Prefer the user's last-active board if it still exists; fall back
       // to the first board in the list. Without this, refresh always
       // snapped back to boards[0] regardless of what was selected before.
-      const persistedId = loadPersistedBoardId();
+      const persistedId = loadPersistedBoardId(kind);
       let board =
         (persistedId !== null && boards.find((b) => b.id === persistedId)) ||
         boards[0];
       if (!board) {
-        board = await createBoard("Untitled", "manga");
+        board = await createBoard("Untitled", kind);
         boards = [board];
       }
       const detail = await getBoard(board.id);
@@ -329,7 +336,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         loading: false,
         undoStack: [], // undo history is per-board
       });
-      persistBoardId(detail.board.id);
+      persistBoardId(detail.board.id, kind);
     } catch (err) {
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -337,7 +344,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   async refreshBoardList() {
     try {
-      const boards = await listBoards("manga");
+      const boards = await listBoards(get().boardKind);
       set({ boards });
     } catch {
       // non-fatal
@@ -359,7 +366,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         loading: false,
         undoStack: [], // undo history is per-board
       });
-      persistBoardId(detail.board.id);
+      persistBoardId(detail.board.id, get().boardKind);
     } catch (err) {
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -367,7 +374,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   async createNewBoard(name) {
     try {
-      const board = await createBoard(name || "Untitled", "manga");
+      const board = await createBoard(name || "Untitled", get().boardKind);
       // Add to list (front of list so the newly-created project shows up
       // at the top of the sidebar) and switch to it.
       set((s) => ({ boards: [board, ...s.boards] }));
@@ -395,7 +402,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         await get().switchBoard(remaining[0].id);
       } else {
         try {
-          const board = await createBoard("Untitled", "manga");
+          const board = await createBoard("Untitled", get().boardKind);
           set({ boards: [board] });
           await get().switchBoard(board.id);
         } catch (err) {

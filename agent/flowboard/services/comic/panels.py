@@ -72,20 +72,21 @@ def _aabb_slice(bgr: np.ndarray, box: Box) -> np.ndarray:
     return bgr[y0:y1, x0:x1]
 
 
-def crop_box(bgr: np.ndarray, box: Box, quad=None) -> np.ndarray:
-    """Crop a panel.
+def crop_box(bgr: np.ndarray, box: Box, poly=None) -> np.ndarray:
+    """Crop a panel/bubble.
 
-    No quad → fast axis-aligned numpy slice (legacy manga/manhwa, unchanged).
+    No poly → fast axis-aligned numpy slice (legacy manga/manhwa, unchanged).
 
-    Quad (diagonal panel) → crop the quad's bounding box but KEEP THE SLANT:
-    everything outside the 4-corner polygon is made transparent (RGBA), so the
-    panel stays at its original angle and neighbouring panels don't bleed into
-    the corners. Returns a 4-channel BGRA image (PNG-encodable with alpha)."""
+    Poly (a diagonal panel quad OR a speech-bubble mask, any ≥3 points) → crop
+    the poly's bounding box and make everything OUTSIDE the polygon transparent
+    (RGBA), so the shape is kept exactly (diagonal panel stays slanted; a bubble
+    is cut to its outline) with no neighbouring content bleeding in. Returns a
+    4-channel BGRA image (PNG-encodable with alpha)."""
     H, W = bgr.shape[:2]
-    if not quad or len(quad) != 4:
+    if not poly or len(poly) < 3:
         return _aabb_slice(bgr, box)
-    xs = [float(p[0]) for p in quad]
-    ys = [float(p[1]) for p in quad]
+    xs = [float(p[0]) for p in poly]
+    ys = [float(p[1]) for p in poly]
     x0 = max(0, int(np.floor(min(xs))))
     y0 = max(0, int(np.floor(min(ys))))
     x1 = min(W, int(np.ceil(max(xs))))
@@ -94,10 +95,10 @@ def crop_box(bgr: np.ndarray, box: Box, quad=None) -> np.ndarray:
         return _aabb_slice(bgr, box)
     roi = bgr[y0:y1, x0:x1]
     mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
-    poly = np.array([[int(round(px)) - x0, int(round(py)) - y0] for px, py in quad], dtype=np.int32)
-    cv2.fillConvexPoly(mask, poly, 255, lineType=cv2.LINE_AA)
+    pts = np.array([[int(round(px)) - x0, int(round(py)) - y0] for px, py in poly], dtype=np.int32)
+    cv2.fillPoly(mask, [pts], 255, lineType=cv2.LINE_AA)
     bgra = cv2.cvtColor(roi, cv2.COLOR_BGR2BGRA)
-    bgra[:, :, 3] = mask  # transparent outside the panel polygon
+    bgra[:, :, 3] = mask  # transparent outside the polygon
     return bgra
 
 
@@ -468,6 +469,56 @@ def encode_png(bgr: np.ndarray) -> bytes:
     if not ok:
         raise ValueError("PNG encode failed")
     return buf.tobytes()
+
+
+def key_out_green(bgr: np.ndarray, *, feather: int = 1) -> np.ndarray:
+    """Chroma-key the SOLID green background (as produced by the Grok bubble
+    cleanup, hue ≈ 60 in OpenCV, high saturation) to transparency.
+
+    The bubble fill is white and the outline/text are black — both near-zero
+    saturation — so a saturated-green mask keeps them and drops only the
+    backdrop. Keeps the largest blob (the bubble), fills its interior, feathers
+    the alpha a touch, and despills the green fringe on anti-aliased edges so no
+    green halo survives. Returns a 4-channel BGRA image (PNG-encodable)."""
+    if bgr.ndim == 2:
+        bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+    elif bgr.shape[2] == 4:
+        bgr = cv2.cvtColor(bgr, cv2.COLOR_BGRA2BGR)
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, (40, 60, 40), (90, 255, 255))  # background
+
+    fg = cv2.bitwise_not(green)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+    # Keep only the largest connected component (the bubble) so isolated keying
+    # speckles in the backdrop don't survive as stray dots.
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    if n > 1:
+        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        fg = np.where(labels == biggest, 255, 0).astype(np.uint8)
+        # Fill the bubble interior: flood the backdrop from a corner, invert.
+        flood = fg.copy()
+        ffmask = np.zeros((fg.shape[0] + 2, fg.shape[1] + 2), np.uint8)
+        cv2.floodFill(flood, ffmask, (0, 0), 255)
+        fg = fg | cv2.bitwise_not(flood)
+
+    alpha = fg
+    if feather > 0:
+        k = feather * 2 + 1
+        alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+
+    # Despill: clamp the green channel to the R/B average wherever it exceeds it,
+    # neutralising any residual green tint on the soft edge. White/black pixels
+    # (R≈G≈B) are untouched.
+    out = bgr.copy()
+    rb = ((out[:, :, 0].astype(np.uint16) + out[:, :, 2]) // 2).astype(np.uint8)
+    spill = out[:, :, 1] > rb
+    out[:, :, 1][spill] = rb[spill]
+
+    bgra = cv2.cvtColor(out, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = alpha
+    return bgra
 
 
 def draw_overview(bgr: np.ndarray, boxes: list[Box], quads=None) -> np.ndarray:

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { type FlowboardNodeData } from "../store/board";
+import { useAppModeStore } from "../store/appMode";
 import {
   createRequest,
   getUpstreamComicData,
@@ -17,8 +18,10 @@ import { PanelBoxEditor } from "./PanelBoxEditor";
  * boxes) is the output consumed by the Panels node.
  */
 export function ComicDetectBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const bubble = useAppModeStore((s) => s.mode) === "bubble";
+  const noun = bubble ? "bubble" : "panel";
   const pages = (Array.isArray(data.pages) ? data.pages : []) as PageItem[];
-  const detector = typeof data.detector === "string" ? data.detector : "auto";
+  const detector = typeof data.detector === "string" ? data.detector : bubble ? "bubble" : "auto";
   const status = typeof data.status === "string" ? data.status : "idle";
   const isBusy = status === "queued" || status === "running";
   const errorMsg = typeof data.error === "string" ? data.error : undefined;
@@ -52,7 +55,7 @@ export function ComicDetectBody({ rfId, data }: { rfId: string; data: FlowboardN
 
   return (
     <div className="node-body node-body--comic-detect" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      <label style={{ fontSize: 11, opacity: 0.75 }}>2 · Detect panels (auto + manual fix)</label>
+      <label style={{ fontSize: 11, opacity: 0.75 }}>2 · Detect {noun}s (auto + manual fix)</label>
 
       {upstreamPages.length === 0 && pages.length === 0 && (
         <p style={{ fontSize: 11, opacity: 0.7, margin: 0 }}>
@@ -61,21 +64,27 @@ export function ComicDetectBody({ rfId, data }: { rfId: string; data: FlowboardN
       )}
 
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <label style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4 }} title="Panel detector">
+        <label style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4 }} title={`${bubble ? "Bubble" : "Panel"} detector`}>
           Detector
           <select value={detector} onChange={(e) => setDetector(e.target.value)} style={{ fontSize: 11, padding: "2px 4px" }}>
-            <option value="heuristic">Heuristic</option>
-            <option value="ml">YOLO (ML)</option>
-            <option value="webtoon">Webtoon</option>
-            <option value="hybrid">Hybrid (ML+webtoon)</option>
-            <option value="auto">Auto (best)</option>
+            {bubble ? (
+              <option value="bubble">Speech bubbles (ML)</option>
+            ) : (
+              <>
+                <option value="heuristic">Heuristic</option>
+                <option value="ml">YOLO (ML)</option>
+                <option value="webtoon">Webtoon</option>
+                <option value="hybrid">Hybrid (ML+webtoon)</option>
+                <option value="auto">Auto (best)</option>
+              </>
+            )}
           </select>
         </label>
         <button
           className="comic-btn"
           onClick={detect}
           disabled={isBusy || upstreamPages.length === 0}
-          title="Auto-detect panel boxes on every page"
+          title={`Auto-detect ${noun}s on every page`}
           style={{ fontSize: 12, padding: "4px 10px" }}
         >
           {isBusy ? "Detecting…" : pages.length ? "Re-detect" : `Detect ${upstreamPages.length || ""}`}
@@ -91,13 +100,13 @@ export function ComicDetectBody({ rfId, data }: { rfId: string; data: FlowboardN
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 11 }}>
             <button className="comic-btn comic-btn--sm" onClick={() => setCur(Math.max(0, idx - 1))} disabled={idx === 0} style={{ padding: "2px 8px" }}>◀</button>
             <span title={page.name}>
-              {page.name} · {idx + 1}/{pages.length} · {(page.boxes?.length ?? 0)} box
+              {page.name} · {idx + 1}/{pages.length} · {(page.boxes?.length ?? 0)} {noun}
             </span>
             <button className="comic-btn comic-btn--sm" onClick={() => setCur(Math.min(pages.length - 1, idx + 1))} disabled={idx === pages.length - 1} style={{ padding: "2px 8px" }}>▶</button>
           </div>
           <p style={{ fontSize: 10, opacity: 0.6, margin: 0 }}>Drag empty area = new box · drag box = move · corner = resize · × = delete</p>
           <PanelBoxEditor page={page} onChange={(boxes) => onBoxes(idx, boxes)} />
-          <p style={{ fontSize: 11, opacity: 0.8, margin: 0 }}>{totalBoxes} boxes total → connect a <b>Panels</b> node</p>
+          <p style={{ fontSize: 11, opacity: 0.8, margin: 0 }}>{totalBoxes} {noun}s total → connect a <b>Crop</b> node</p>
         </>
       )}
     </div>

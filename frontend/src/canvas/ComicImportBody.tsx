@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useReactFlow } from "@xyflow/react";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
+import { useAppModeStore } from "../store/appMode";
 import { createNodesBulk, mediaUrl, uploadComicPages, type BulkNodeInput } from "../api/client";
 import {
   createRequest,
@@ -34,15 +35,17 @@ const cleanPath = (v: string) => v.trim().replace(/^['"]+/, "").replace(/['"]+$/
  *      (uses the possibly hand-edited boxes).
  */
 export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const bubble = useAppModeStore((s) => s.mode) === "bubble";
   const folder = typeof data.folder === "string" ? data.folder : "";
   const pages = (Array.isArray(data.pages) ? data.pages : []) as PageItem[];
   const pageCount = typeof data.pageCount === "number" ? data.pageCount : pages.length;
-  const detector = typeof data.detector === "string" ? data.detector : "auto";
+  const detector = typeof data.detector === "string" ? data.detector : bubble ? "bubble" : "auto";
   const status = typeof data.status === "string" ? data.status : "idle";
   const isImporting = status === "queued" || status === "running";
 
   const [draftFolder, setDraftFolder] = useState(folder);
-  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download" | "assign" | "scenes">(null);
+  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download" | "assign" | "scenes" | "cleanbubbles">(null);
+  const cleanEngine = typeof data.cleanEngine === "string" ? data.cleanEngine : "atrium";
   const [spawnErr, setSpawnErr] = useState<string | undefined>();
   const [assignInfo, setAssignInfo] = useState<string | undefined>();
   const dirInputRef = useRef<HTMLInputElement | null>(null);
@@ -184,6 +187,47 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       document.body.appendChild(a);
       a.click();
       a.remove();
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // ✨ Bubble Extract — one click: crop every bubble box across all pages, clean
+  // each through the chosen engine (Gemini/Grok), chroma-key the green out in
+  // code, and download all the transparent PNGs as ONE .zip.
+  async function cleanAllBubbles() {
+    if (busy) return;
+    const pageNodes = downstreamPageNodes(rfId);
+    if (pageNodes.length === 0) { setSpawnErr("Create page nodes first"); return; }
+    setSpawnErr(undefined);
+    setBusy("cleanbubbles");
+    try {
+      const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
+      const panels: Array<{ page_media_id: string; box: { x: number; y: number; w: number; h: number } }> = [];
+      for (const pn of sorted) {
+        const mediaId = pn.data.pageMediaId;
+        if (typeof mediaId !== "string" || !mediaId) continue;
+        const boxes = ((pn.data.boxes as BoxItem[]) ?? [])
+          .slice()
+          .sort((a, b) => (a.y - b.y) || (a.x - b.x)); // reading order
+        for (const b of boxes) panels.push({ page_media_id: mediaId, box: { x: b.x, y: b.y, w: b.w, h: b.h } });
+      }
+      if (panels.length === 0) { setSpawnErr("No bubbles — detect boxes first"); setBusy(null); return; }
+      const result = await runRequestToResult(
+        createRequest({ type: "clean_all_bubbles", node_id: parseInt(rfId, 10), params: { panels, engine: cleanEngine } }),
+      );
+      const mid = result.mediaId as string | undefined;
+      if (!mid) { setSpawnErr("Clean failed"); return; }
+      const a = document.createElement("a");
+      a.href = mediaUrl(mid);
+      a.download = `bubbles-clean-${data.shortId ?? rfId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      const fails = (result.fail_count as number) ?? 0;
+      setSpawnErr(fails > 0 ? `Done — ${result.count} cleaned, ${fails} failed` : undefined);
     } catch (e) {
       setSpawnErr(String(e));
     } finally {
@@ -411,11 +455,17 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
             <label style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 3 }}>
               Detector
               <select value={detector} onChange={(e) => patchComicNode(rfId, { detector: e.target.value })} style={{ fontSize: 11, padding: "2px 4px" }}>
-                <option value="heuristic">Heuristic</option>
-                <option value="ml">YOLO</option>
-                <option value="webtoon">Webtoon</option>
-                <option value="hybrid">Hybrid (ML+webtoon)</option>
-                <option value="auto">Auto</option>
+                {bubble ? (
+                  <option value="bubble">Speech bubbles</option>
+                ) : (
+                  <>
+                    <option value="heuristic">Heuristic</option>
+                    <option value="ml">YOLO</option>
+                    <option value="webtoon">Webtoon</option>
+                    <option value="hybrid">Hybrid (ML+webtoon)</option>
+                    <option value="auto">Auto</option>
+                  </>
+                )}
               </select>
             </label>
           </div>
@@ -428,9 +478,33 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
           <button className="comic-btn" onClick={spawnCombine} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Group panels in reading order into 2×2 storyboard images (4 per group)">
             {busy === "combine" ? "Creating combine…" : "③ Combine 2×2 (groups of 4)"}
           </button>
-          <button className="comic-btn" onClick={downloadAllPanels} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Crop every panel (detected + hand-adjusted) into separate files, bundled into ONE .zip">
-            {busy === "download" ? "Exporting…" : "⬇ Download all panels (.zip)"}
+          <button className="comic-btn" onClick={downloadAllPanels} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title={`Crop every ${bubble ? "bubble" : "panel"} (detected + hand-adjusted) into separate files, bundled into ONE .zip`}>
+            {busy === "download" ? "Exporting…" : `⬇ Download all ${bubble ? "bubbles" : "panels"} (.zip)`}
           </button>
+          {bubble && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <select
+                value={cleanEngine}
+                onChange={(e) => patchComicNode(rfId, { cleanEngine: e.target.value })}
+                disabled={busy !== null}
+                title="Image-edit engine for the clean step. Background removal is always done in code (chroma-key)."
+                style={{ fontSize: 11, padding: "2px 4px" }}
+              >
+                <option value="atrium">Atrium (Gemini 3 Pro)</option>
+                <option value="gemini">Gemini 3 Pro (direct key)</option>
+                <option value="grok">Grok (quality)</option>
+              </select>
+              <button
+                className="comic-btn"
+                onClick={cleanAllBubbles}
+                disabled={busy !== null}
+                style={{ fontSize: 12, padding: "4px 10px" }}
+                title="Crop every bubble, clean it (keep text, close bubble, sharpen), remove the background in code, and download all transparent PNGs as ONE .zip"
+              >
+                {busy === "cleanbubbles" ? "Cleaning… (may take a while)" : "✨ Clean all bubbles → .zip"}
+              </button>
+            </div>
+          )}
           <button
             className="comic-btn"
             onClick={magiAssignChapter}

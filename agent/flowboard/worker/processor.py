@@ -816,7 +816,7 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     if not isinstance(pages_in, list) or not pages_in:
         return {}, "missing_pages"
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto", "bubble"):
         return {}, f"invalid_detector:{detector}"
 
     def _run():
@@ -831,6 +831,14 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
             err = None
             if bgr is None:
                 err = "page_unreadable"
+            elif detector == "bubble":
+                # Speech-bubble seg model → bbox + mask polygon per bubble.
+                from flowboard.services.comic import panel_ml
+                for (x, y, w, h), poly in panel_ml.detect_bubbles_ml(bgr):
+                    b = {"id": str(uuid.uuid4()), "x": x, "y": y, "w": w, "h": h}
+                    if poly:
+                        b["poly"] = poly
+                    boxes.append(b)
             else:
                 for (x, y, w, h) in panel_svc.detect_boxes(bgr, detector):
                     boxes.append({"id": str(uuid.uuid4()), "x": x, "y": y, "w": w, "h": h})
@@ -860,10 +868,10 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     return result, None
 
 
-def _clean_quad(raw):
-    """Validate a panel quad from a box dict → list of 4 [int,int] corners, or
-    None. Accepts [[x,y],[x,y],[x,y],[x,y]] of numbers; anything else → None."""
-    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+def _clean_poly(raw, min_pts=3):
+    """Validate a crop polygon from a box dict → list of [int,int] points (≥
+    min_pts), or None. Used for both 4-corner quads and N-point bubble masks."""
+    if not isinstance(raw, (list, tuple)) or len(raw) < min_pts:
         return None
     out = []
     for p in raw:
@@ -874,6 +882,17 @@ def _clean_quad(raw):
         except (TypeError, ValueError):
             return None
     return out
+
+
+def _clean_quad(raw):
+    """A 4-point quad (diagonal panel)."""
+    return _clean_poly(raw, min_pts=4) if isinstance(raw, (list, tuple)) and len(raw) == 4 else None
+
+
+def _box_crop_poly(b: dict):
+    """The crop polygon for a box dict: a bubble `poly` (N pts) or a panel
+    `quad` (4 pts), else None (→ plain rectangle slice)."""
+    return _clean_poly(b.get("poly")) or _clean_quad(b.get("quad"))
 
 
 async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
@@ -909,16 +928,18 @@ async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
                 y2 = min(H, y + max(1, h))
                 if x2 <= x or y2 <= y:
                     continue
-                quad = _clean_quad(b.get("quad"))  # diagonal panel → deskew via perspective warp
-                crop = panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), quad)
+                poly = _box_crop_poly(b)  # bubble mask or diagonal quad → masked crop
+                crop = panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), poly)
                 cid = str(uuid.uuid4())
                 if not media_service.ingest_inline_bytes(
                     cid, panel_svc.encode_png(crop), kind="image", mime="image/png"
                 ):
                     continue
                 box_out = {"x": x, "y": y, "w": x2 - x, "h": y2 - y}
-                if quad:
-                    box_out["quad"] = quad
+                if isinstance(b.get("poly"), list):
+                    box_out["poly"] = b["poly"]
+                elif isinstance(b.get("quad"), list):
+                    box_out["quad"] = b["quad"]
                 panels_out.append({
                     "idx": gidx, "pageIndex": pg.get("idx"), "pageName": pg.get("name"),
                     "panelIndex": j, "box": box_out,
@@ -935,6 +956,319 @@ async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
 
     result = {"panels": panels_out, "panel_count": len(panels_out), "node_id": params.get("__node_id")}
     logger.info("crop_panels: %d panel(s)", len(panels_out))
+    return result, None
+
+
+# ── Bubble-clean shared config (used by both the per-crop and batch handlers) ─
+def _bubble_clean_config(params: dict) -> tuple[dict, Optional[str]]:
+    """Resolve engine + prompt + model + transparency from request params.
+
+    Engine ``grok`` (xAI ``/v1/images/edits``), ``gemini`` (Gemini API direct),
+    or ``atrium`` (Atrium partner API → same gemini-3-pro-image, separate
+    billing). gemini/atrium share the white-fill prompt; grok uses its own.
+    Returns (config, error)."""
+    from flowboard.services.comic import atrium_api, gemini_api, r2, xai
+
+    engine = params.get("engine")
+    engine = engine.strip().lower() if isinstance(engine, str) and engine.strip() else "gemini"
+    if engine not in ("grok", "gemini", "atrium"):
+        engine = "gemini"
+    if engine == "grok" and not xai.is_available():
+        return {}, "xai_key_missing: add XAI_API_KEY to .env"
+    if engine == "gemini" and not gemini_api.api_key():
+        return {}, "gemini_key_missing: add GEMINI_API_KEY to .env"
+    if engine == "atrium":
+        if not atrium_api.is_configured():
+            return {}, "atrium_keys_missing: add ATRIUM_CLIENT_ID/SECRET to .env"
+        # Atrium fetches the source image from a public URL — R2 (preferred) or a tunnel.
+        if not (r2.is_configured() or atrium_api.public_media_base()):
+            return {}, "atrium_needs_public_url: configure R2_* in .env (or PUBLIC_MEDIA_BASE_URL tunnel)"
+
+    raw_prompt = params.get("prompt")
+    # gemini + atrium both hit gemini-3-pro-image → need the white-fill prompt.
+    default_prompt = xai.DEFAULT_PROMPT if engine == "grok" else xai.GEMINI_PROMPT
+    prompt = raw_prompt.strip() if isinstance(raw_prompt, str) and raw_prompt.strip() else default_prompt
+    model = params.get("image_model")
+    model = model if isinstance(model, str) and model.strip() else None
+    transparent = params.get("transparent")
+    transparent = True if transparent is None else bool(transparent)
+    return {
+        "engine": engine,
+        "prompt": prompt,
+        "model": model,
+        "gemini_model": model or "gemini-3-pro-image",
+        "transparent": transparent,
+    }, None
+
+
+async def _edit_bubble(cfg: dict, src_bytes: bytes, client) -> bytes:
+    """One engine call (Grok / Gemini / Atrium) → cleaned PNG bytes (green bg)."""
+    import uuid
+
+    from flowboard.services.comic import atrium_api, gemini_api, xai
+
+    if cfg["engine"] == "gemini":
+        outs = await gemini_api.edit_image_variants(
+            src_bytes, cfg["prompt"], image_model=cfg["gemini_model"], aspect_ratio="", variant_count=1
+        )
+        return outs[0]
+    if cfg["engine"] == "atrium":
+        from flowboard.services.comic import r2
+
+        # Atrium downloads the source server-side from a public URL, so the crop
+        # must be ingested as media first, then exposed via R2 (preferred) or a
+        # tunnel. The R2 object is deleted right after Atrium has fetched it.
+        mid = str(uuid.uuid4())
+        await asyncio.to_thread(
+            media_service.ingest_inline_bytes, mid, src_bytes, kind="image", mime="image/png"
+        )
+        url = await asyncio.to_thread(_atrium_input_url, mid)
+        if not url:
+            raise RuntimeError("atrium: could not resolve a public input URL (R2/tunnel)")
+        try:
+            outs = await atrium_api.generate_image_variants(
+                cfg["prompt"], image_urls=[url], image_model=cfg["gemini_model"], aspect_ratio="", variant_count=1
+            )
+            return outs[0]
+        finally:
+            if r2.is_configured():
+                await asyncio.to_thread(r2.delete_media, mid)
+    return await xai.clean_bubble(src_bytes, cfg["prompt"], model=cfg["model"], client=client)
+
+
+def _bubble_keyed_png(png: bytes) -> bytes:
+    """Chroma-key the solid green backdrop out → transparent PNG bytes."""
+    from flowboard.services.comic import panels as panel_svc
+
+    return panel_svc.encode_png(panel_svc.key_out_green(panel_svc.decode_bgr(png)))
+
+
+# ── Resume cache: (source bubble + prompt) → cleaned media_id ─────────────────
+# The clean is deterministic per (page+box, prompt) — so a re-run after a partial
+# failure (e.g. the engine ran out of credit mid-batch) can REUSE every bubble it
+# already cleaned instead of paying for them again. Keyed by prompt, not engine,
+# because gemini/atrium share the same model+prompt → identical output.
+def _bubble_cache_path():
+    return media_service.MEDIA_CACHE_DIR.parent / "bubble_clean_cache.json"
+
+
+def _bubble_cache_load() -> dict:
+    import json
+    try:
+        return json.loads(_bubble_cache_path().read_text())
+    except Exception:  # noqa: BLE001 — missing/corrupt → empty
+        return {}
+
+
+def _bubble_cache_save(cache: dict) -> None:
+    import json
+    try:
+        _bubble_cache_path().write_text(json.dumps(cache))
+    except OSError:
+        pass
+
+
+def _bubble_cache_key(spec: dict, prompt: str) -> str:
+    import hashlib
+    box = spec.get("box") or {}
+    raw = "{}|{},{},{},{}|{}".format(
+        spec.get("page_media_id") or spec.get("mediaId") or "",
+        box.get("x"), box.get("y"), box.get("w"), box.get("h"),
+        hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12],
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+async def _handle_clean_bubbles(params: dict) -> tuple[dict, Optional[str]]:
+    """Bubble Extract — final step. Run each detected bubble crop through an
+    image-edit model (engine = ``grok`` via xAI ``/v1/images/edits`` OR
+    ``gemini`` via the Gemini API): keep the text, solid green background, close
+    the bubble, sharpen. The solid green is then chroma-keyed out to a
+    transparent PNG in code (``key_out_green``). Bubbles are processed
+    concurrently (bounded) so a page of N bubbles doesn't run serially."""
+    import uuid
+
+    import httpx
+
+    from flowboard.services.comic import xai
+
+    panels_in = params.get("panels")
+    if not isinstance(panels_in, list) or not panels_in:
+        return {}, "missing_panels"
+
+    cfg, err = _bubble_clean_config(params)
+    if err:
+        return {}, err
+    engine = cfg["engine"]
+    transparent = cfg["transparent"]
+
+    def _to_transparent(png: bytes) -> bytes:
+        return _bubble_keyed_png(png)
+
+    # Cap parallel API calls so we don't hammer the provider on a dense page.
+    sem = asyncio.Semaphore(int(os.getenv("FLOWBOARD_XAI_CONCURRENCY", "3")))
+
+    async def _edit_one(src_bytes: bytes, client: httpx.AsyncClient) -> bytes:
+        return await _edit_bubble(cfg, src_bytes, client)
+
+    async def _clean_one(idx: int, panel: dict, client: httpx.AsyncClient) -> dict:
+        out = {"idx": idx, "sourceMediaId": panel.get("mediaId")}
+        mid = panel.get("mediaId")
+        if not isinstance(mid, str) or not mid:
+            return {**out, "status": "error", "error": "no_source"}
+        path = media_service.cached_path(mid)
+        if path is None:
+            return {**out, "status": "error", "error": "source_missing"}
+        try:
+            src_bytes = await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            return {**out, "status": "error", "error": f"read_failed: {exc}"}
+        async with sem:
+            try:
+                cleaned = await _edit_one(src_bytes, client)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("clean_bubble[%s] %s failed: %s", engine, mid, exc)
+                return {**out, "status": "error", "error": str(exc)[:200]}
+        if transparent:
+            try:
+                cleaned = await asyncio.to_thread(_to_transparent, cleaned)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("chroma-key %s failed (keeping green): %s", mid, exc)
+        cid = str(uuid.uuid4())
+        ok = await asyncio.to_thread(
+            media_service.ingest_inline_bytes, cid, cleaned, kind="image", mime="image/png"
+        )
+        if not ok:
+            return {**out, "status": "error", "error": "ingest_failed"}
+        return {**out, "status": "cleaned", "mediaId": cid}
+
+    try:
+        async with httpx.AsyncClient(timeout=xai._TIMEOUT) as client:
+            results = await asyncio.gather(
+                *(_clean_one(i, p, client) for i, p in enumerate(panels_in) if isinstance(p, dict))
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("clean_bubbles failed")
+        return {}, f"clean_failed: {str(exc)[:160]}"
+
+    cleaned_n = sum(1 for r in results if r.get("status") == "cleaned")
+    result = {
+        "cleaned": results,
+        "cleaned_count": cleaned_n,
+        "fail_count": len(results) - cleaned_n,
+        "engine": engine,
+        "node_id": params.get("__node_id"),
+    }
+    logger.info("clean_bubbles[%s]: %d/%d cleaned", engine, cleaned_n, len(results))
+    return result, None
+
+
+async def _handle_clean_all_bubbles(params: dict) -> tuple[dict, Optional[str]]:
+    """Bubble Extract — one-click batch from the Comic upload node. Takes every
+    bubble box across all pages (``panels = [{page_media_id, box}]``), crops each
+    on the fly, runs it through the chosen engine (Gemini/Grok), chroma-keys the
+    green to transparency, and bundles all the transparent PNGs into ONE .zip.
+
+    This is the bulk sibling of ``export_all_panels`` — same input shape — but
+    with the Gemini/Grok clean + background-removal step applied to each crop."""
+    import io
+    import uuid
+    import zipfile
+
+    import httpx
+
+    from flowboard.services.comic import xai
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+
+    cfg, err = _bubble_clean_config(params)
+    if err:
+        return {}, err
+    transparent = cfg["transparent"]
+
+    cache = _bubble_cache_load()
+    cache_lock = asyncio.Lock()
+    reused = 0
+    sem = asyncio.Semaphore(int(os.getenv("FLOWBOARD_XAI_CONCURRENCY", "3")))
+
+    async def _process(idx: int, spec: dict, client: httpx.AsyncClient) -> Optional[tuple[int, bytes]]:
+        nonlocal reused
+        # Resume: if this exact bubble+prompt was cleaned before and the media is
+        # still on disk, reuse it — no API call, no extra cost.
+        key = _bubble_cache_key(spec, cfg["prompt"])
+        hit = cache.get(key)
+        if isinstance(hit, str):
+            p = media_service.cached_path(hit)
+            if p is not None:
+                try:
+                    reused += 1
+                    return (idx, await asyncio.to_thread(p.read_bytes))
+                except OSError:
+                    pass
+
+        src = await asyncio.to_thread(_source_image_bytes, spec)  # crop the box → PNG
+        if not src:
+            return None
+        async with sem:
+            try:
+                cleaned = await _edit_bubble(cfg, src, client)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("clean_all_bubbles[%s] #%d failed: %s", cfg["engine"], idx, exc)
+                return None
+        if transparent:
+            try:
+                cleaned = await asyncio.to_thread(_bubble_keyed_png, cleaned)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("chroma-key #%d failed (keeping green): %s", idx, exc)
+        # Persist this cleaned bubble as media + remember it, so a re-run resumes.
+        cid = str(uuid.uuid4())
+        ok = await asyncio.to_thread(
+            media_service.ingest_inline_bytes, cid, cleaned, kind="image", mime="image/png"
+        )
+        if ok:
+            async with cache_lock:
+                cache[key] = cid
+                _bubble_cache_save(cache)
+        return (idx, cleaned)
+
+    try:
+        async with httpx.AsyncClient(timeout=xai._TIMEOUT) as client:
+            results = await asyncio.gather(
+                *(_process(i, s, client) for i, s in enumerate(specs) if isinstance(s, dict))
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("clean_all_bubbles failed")
+        return {}, f"clean_failed: {str(exc)[:160]}"
+
+    items = [r for r in results if r is not None]
+    if not items:
+        return {}, "no_bubbles_cleaned"
+    items.sort(key=lambda t: t[0])  # reading order = caller order
+
+    def _zip() -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, (_, png) in enumerate(items, 1):
+                zf.writestr(f"bubble-{i:04d}.png", png)
+        return buf.getvalue()
+
+    zip_bytes = await asyncio.to_thread(_zip)
+    mid = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(mid, zip_bytes, kind="file", mime="application/zip")
+    result = {
+        "mediaId": mid,
+        "count": len(items),
+        "fail_count": len(results) - len(items),
+        "reused": reused,
+        "engine": cfg["engine"],
+        "node_id": params.get("__node_id"),
+    }
+    logger.info(
+        "clean_all_bubbles[%s]: %d/%d cleaned (%d reused from cache) -> zip",
+        cfg["engine"], len(items), len(results), reused,
+    )
     return result, None
 
 
@@ -971,8 +1305,7 @@ def _source_image_bytes(params: dict) -> Optional[bytes]:
         x2 = min(W, x + int(box.get("w", 0)))
         y2 = min(H, y + int(box.get("h", 0)))
         if x2 > x and y2 > y:
-            quad = _clean_quad(box.get("quad"))
-            return panel_svc.encode_png(panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), quad))
+            return panel_svc.encode_png(panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), _box_crop_poly(box)))
     return None
 
 
@@ -2272,13 +2605,20 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
     if source_id and media_service.cached_path(source_id) is None:
         return {}, "source_not_found"
 
-    # Live progress: write {done, total} onto the running Request row after each
-    # variant lands, so the frontend can poll it and show an exact "k/N · pct%".
+    # Live progress: write {done, total} onto the running Request row as variants
+    # land, so the frontend can poll it for a "k/N · pct%" placeholder. Throttled
+    # to ≤1 write / ~0.8s (the final done==total always writes) so a big-batch gen
+    # doesn't flood the DB with one write per variant under concurrency.
     rid = params.get("__request_id")
+    _last_progress = [0.0]
 
     def _progress(done: int, total: int) -> None:
         if rid is None:
             return
+        now = time.monotonic()
+        if done < total and (now - _last_progress[0]) < 0.8:
+            return
+        _last_progress[0] = now
         try:
             with get_session() as s:
                 req = s.get(Request, rid)
@@ -2326,7 +2666,9 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
 
     if not outs:
         return {}, "no_image_generated"
-    media_ids = [_ingest_png(o) for o in outs]
+    # Ingest (PNG decode/encode + disk write + DB commit) off the event loop so a
+    # 12-variant gen doesn't stall everyone else's polls during the writes.
+    media_ids = await asyncio.to_thread(_ingest_pngs, outs)
     return {
         "media_ids": media_ids,
         "provider_used": provider_used,
@@ -2460,6 +2802,8 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "import_pages": _handle_import_pages,
     "detect_page_panels": _handle_detect_page_panels,
     "crop_panels": _handle_crop_panels,
+    "clean_bubbles": _handle_clean_bubbles,
+    "clean_all_bubbles": _handle_clean_all_bubbles,
     "clean_panel": _handle_clean_panel,
     "enhance_panel": _handle_enhance_panel,
     "build_character_db": _handle_build_character_db,
@@ -2478,8 +2822,12 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
 
 # How many requests the worker runs concurrently. Atrium has no per-second /
 # concurrency limit (only a daily quota), and the API-key path has no reCAPTCHA,
-# so several generations can run at once; capped so the host isn't overwhelmed.
-WORKER_CONCURRENCY = max(1, int(os.getenv("FLOWBOARD_WORKER_CONCURRENCY", "3")))
+# so several generations can run at once. Image gen is I/O-bound (mostly awaiting
+# the provider HTTP), so the async loop handles many in flight cheaply — default
+# 12 lets ~3-5 users each fire a multi-image batch without queueing. Effective
+# parallel provider calls ≈ WORKER_CONCURRENCY × variant_count. Override via
+# FLOWBOARD_WORKER_CONCURRENCY.
+WORKER_CONCURRENCY = max(1, int(os.getenv("FLOWBOARD_WORKER_CONCURRENCY", "12")))
 
 
 class WorkerController:

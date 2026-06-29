@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { Board } from "./canvas/Board";
 import { AddNodePalette } from "./canvas/AddNodePalette";
@@ -10,13 +10,11 @@ import { useBoardStore } from "./store/board";
 import { useAppModeStore } from "./store/appMode";
 import { FlowApp } from "./flow/FlowApp";
 
-// Inherited flowboard surfaces (References panel, image/video Generation dialog,
-// Result viewer, AI-provider setup gate, chat) are intentionally not rendered —
-// this build is focused on the manhwa → panel extraction workflow.
-//
-// Two top-level branches share this app (see store/appMode):
-//   - "manga" → the node board below (original tool).
-//   - "flow"  → FlowApp, a Google-Flow-style image studio.
+// Three top-level branches share this app (see store/appMode):
+//   - "manga"  → node board, splits pages into PANELS.
+//   - "bubble" → same node board, splits pages into SPEECH BUBBLES (own
+//                workspace: board kind "bubble", bubble detector).
+//   - "flow"   → FlowApp, a Google-Flow-style image studio.
 
 export function App() {
   // Hooks run unconditionally (before the mode branch) so hook order stays
@@ -27,14 +25,12 @@ export function App() {
   const loadInitialBoard = useBoardStore((s) => s.loadInitialBoard);
   const loading = useBoardStore((s) => s.loading);
   const boardId = useBoardStore((s) => s.boardId);
-  const ran = useRef(false);
 
-  // Load the Manga board only when on the Manga surface — avoids creating a
-  // stray "Untitled" manga board for someone who only opens /flow.
+  // Load the board workspace for the active node-board branch. Manga and Bubble
+  // are separate workspaces (board kind "manga" / "bubble"); switching between
+  // them reloads the right one. Flow has no board (skip — avoids a stray board).
   useEffect(() => {
-    if (mode !== "manga" || ran.current) return;
-    ran.current = true;
-    loadInitialBoard();
+    if (mode === "manga" || mode === "bubble") loadInitialBoard(mode);
   }, [mode, loadInitialBoard]);
 
   // Keep mode in sync with browser back/forward.
@@ -52,14 +48,36 @@ export function App() {
       <ReactFlowProvider>
         <div className="canvas-wrap">
           <Toolbar />
-          <button
-            type="button"
-            className="mode-switch"
-            onClick={() => setMode("flow")}
-            title="Open Flow Studio — generate Google Flow-style images via API"
-          >
-            ✦ Flow Studio
-          </button>
+          <div className="mode-nav">
+            {/* Switch to the OTHER node-board branch. */}
+            {mode === "manga" ? (
+              <button
+                type="button"
+                className="mode-switch"
+                onClick={() => setMode("bubble")}
+                title="Open Bubble Extract — split pages into speech bubbles"
+              >
+                💬 Bubble Extract
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="mode-switch"
+                onClick={() => setMode("manga")}
+                title="Open Manga Extract — split pages into panels"
+              >
+                🗂 Manga Extract
+              </button>
+            )}
+            <button
+              type="button"
+              className="mode-switch"
+              onClick={() => setMode("flow")}
+              title="Open Flow Studio — generate Google Flow-style images via API"
+            >
+              ✦ Flow Studio
+            </button>
+          </div>
           {loading && boardId === null ? (
             <div className="canvas-loading">Loading board…</div>
           ) : (

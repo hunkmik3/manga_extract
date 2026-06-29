@@ -5844,6 +5844,17 @@ button:disabled {
    ══════════════════════════════════════════════════════════════════════════ */
 
 /* Manga-side entry points into the Flow branch. */
+.mode-nav {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  z-index: 6;
+  display: flex;
+  gap: 8px;
+}
+.mode-nav .mode-switch {
+  position: static;
+}
 .mode-switch {
   position: absolute;
   top: 12px;

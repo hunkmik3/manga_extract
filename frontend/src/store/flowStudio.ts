@@ -267,8 +267,10 @@ async function dispatchFlow(
 ): Promise<{ mediaIds: string[]; providerUsed: string | null }> {
   const req = await createRequest({ type: "flow_gen_image", params });
   let row = req;
-  for (let i = 0; i < 240 && (row.status === "queued" || row.status === "running"); i++) {
-    await sleep(1500);
+  // Poll fast at first (700ms) so a finished image lands in the grid almost
+  // immediately, then back off to 1500ms for the long tail. ~6min total budget.
+  for (let i = 0; i < 260 && (row.status === "queued" || row.status === "running"); i++) {
+    await sleep(i < 10 ? 700 : 1500);
     row = await getRequest(req.id);
     // While running, the backend stamps {progress:{done,total}} after each
     // variant lands — surface it for the live "k/N · pct%" placeholder.
@@ -600,23 +602,28 @@ async function persistGenerated(
   refs: string[] = [],
 ): Promise<FlowAsset[]> {
   const refTags = [...new Set(refs)].map((id) => REF_PREFIX + id);
-  const created: FlowAsset[] = [];
-  for (const mid of mediaIds) {
-    try {
-      const ref = await createReference({
-        media_id: mid,
-        kind: "image",
-        label: prompt.slice(0, 60),
-        ai_brief: prompt,
-        aspect_ratio: aspect,
-        tags: [FLOW_TAG, ...refTags],
-        source_board_id: currentBoardId() ?? undefined,
-      });
-      created.push(toAsset(ref));
-    } catch {
-      // non-fatal: the image is still generated & cached, just not persisted
-    }
-  }
+  // Persist all variants in PARALLEL (was sequential — N round-trips back-to-back
+  // delayed the grid update for multi-image gens). Order is preserved.
+  const settled = await Promise.all(
+    mediaIds.map(async (mid): Promise<FlowAsset | null> => {
+      try {
+        const ref = await createReference({
+          media_id: mid,
+          kind: "image",
+          label: prompt.slice(0, 60),
+          ai_brief: prompt,
+          aspect_ratio: aspect,
+          tags: [FLOW_TAG, ...refTags],
+          source_board_id: currentBoardId() ?? undefined,
+        });
+        return toAsset(ref);
+      } catch {
+        // non-fatal: the image is still generated & cached, just not persisted
+        return null;
+      }
+    }),
+  );
+  const created: FlowAsset[] = settled.filter((a): a is FlowAsset => a !== null);
   return created;
 }
 

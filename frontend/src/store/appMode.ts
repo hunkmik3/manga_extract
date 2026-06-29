@@ -11,7 +11,7 @@ import { create } from "zustand";
  * pushes a new path; the popstate listener in App.tsx keeps state in sync with
  * back/forward navigation.
  */
-export type AppMode = "manga" | "flow";
+export type AppMode = "manga" | "flow" | "bubble";
 
 /**
  * Flow-only deployment flag. Set `VITE_FLOW_ONLY=1` at build time (the team
@@ -24,7 +24,10 @@ export const FLOW_ONLY = import.meta.env.VITE_FLOW_ONLY === "1";
 function modeFromPath(): AppMode {
   if (FLOW_ONLY) return "flow";
   try {
-    return window.location.pathname.startsWith("/flow") ? "flow" : "manga";
+    const p = window.location.pathname;
+    if (p.startsWith("/flow")) return "flow";
+    if (p.startsWith("/bubble")) return "bubble";
+    return "manga";
   } catch {
     return "manga";
   }
@@ -33,7 +36,7 @@ function modeFromPath(): AppMode {
 function pushPath(mode: AppMode): void {
   if (FLOW_ONLY) return; // single surface — never rewrite the URL
   try {
-    const path = mode === "flow" ? "/flow" : "/";
+    const path = mode === "flow" ? "/flow" : mode === "bubble" ? "/bubble" : "/";
     if (window.location.pathname !== path) window.history.pushState({}, "", path);
   } catch {
     /* non-fatal */
