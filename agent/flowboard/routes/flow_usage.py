@@ -10,7 +10,7 @@ midnight (labelled as such in the UI); Atrium's real reset may differ slightly.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter
 from sqlmodel import select
@@ -40,7 +40,11 @@ def _aware(dt: datetime) -> datetime:
 def flow_usage() -> dict:
     # Local-midnight boundary, as an aware datetime so it compares with the
     # UTC-stored created_at.
-    start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.now().astimezone()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # The count rolls over at the server's next local midnight (that's how
+    # `today` is bucketed), so report that as the reset instant + seconds left.
+    resets_at = start + timedelta(days=1)
     today = total = 0
     with get_session() as s:
         rows = s.exec(
@@ -56,4 +60,6 @@ def flow_usage() -> dict:
         "total": total,
         "daily_quota": DAILY_QUOTA,
         "remaining_est": max(0, DAILY_QUOTA - today),
+        "resets_at": resets_at.isoformat(),
+        "seconds_until_reset": max(0, int((resets_at - now).total_seconds())),
     }

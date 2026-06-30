@@ -563,6 +563,8 @@ export interface FlowUsage {
   total: number;
   daily_quota: number;
   remaining_est: number;
+  resets_at?: string; // ISO, server's next local midnight
+  seconds_until_reset?: number;
 }
 export function getFlowUsage() {
   return api<FlowUsage>("/api/flow/usage");

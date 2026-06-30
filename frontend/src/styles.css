@@ -6082,6 +6082,20 @@ button:disabled {
   font-size: 10.5px;
   line-height: 1.35;
 }
+.fn__usage-reset {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10.5px;
+}
+.fn__usage-reset-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text);
+}
 .fn__usage--mini {
   margin: 0 auto 8px;
   padding: 5px 0;

@@ -338,10 +338,19 @@ function useTilePcts(
 /** Daily usage badge in the rail. Counts images this tool generated today
  *  (≈ Atrium usage, since this key is tool-only) and an estimated remaining
  *  quota. Refetches whenever a generation lands (assets count changes). */
+function fmtCountdown(s: number): string {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${h}:${pad(m)}:${pad(sec)}`;
+}
+
 function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
   const assetCount = useFlowStudioStore((s) => s.assets.length);
   const generating = useFlowStudioStore((s) => s.generating);
   const [usage, setUsage] = useState<FlowUsage | null>(null);
+  const [secsLeft, setSecsLeft] = useState<number | null>(null);
   useEffect(() => {
     let live = true;
     getFlowUsage()
@@ -351,8 +360,22 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
       live = false;
     };
   }, [assetCount, generating]);
+  // Tick the reset countdown down locally every second (no refetch needed).
+  useEffect(() => {
+    if (usage?.seconds_until_reset == null) {
+      setSecsLeft(null);
+      return;
+    }
+    setSecsLeft(usage.seconds_until_reset);
+    const id = setInterval(
+      () => setSecsLeft((s) => (s == null ? s : Math.max(0, s - 1))),
+      1000,
+    );
+    return () => clearInterval(id);
+  }, [usage?.seconds_until_reset]);
   if (!usage) return null;
   const pct = Math.min(100, Math.round((usage.today / Math.max(1, usage.daily_quota)) * 100));
+  const resetTitle = usage.resets_at ? `Limit resets at ${new Date(usage.resets_at).toLocaleString()}` : undefined;
   if (collapsed) {
     return (
       <div className="fn__usage fn__usage--mini" title={`Today: ${usage.today}/${usage.daily_quota} images`}>
@@ -372,6 +395,12 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
         <div className="fn__usage-fill" style={{ width: `${pct}%` }} />
       </div>
       <div className="fn__usage-sub">~{usage.remaining_est} images remaining today (est.)</div>
+      {secsLeft != null && (
+        <div className="fn__usage-reset" title={resetTitle}>
+          <span>↻ Resets in</span>
+          <span className="fn__usage-reset-time">{secsLeft > 0 ? fmtCountdown(secsLeft) : "now…"}</span>
+        </div>
+      )}
     </div>
   );
 }
