@@ -6568,7 +6568,7 @@ button:disabled {
   display: block;
   resize: none;
   min-height: 38px;
-  max-height: 140px;
+  max-height: 40vh; /* grow with the prompt (long pastes) then scroll — matches FlowComposer JS cap */
   color: transparent;
   caret-color: var(--text);
   background: transparent;

@@ -106,7 +106,10 @@ export function FlowComposer() {
     const ta = taRef.current;
     if (!ta) return;
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
+    // Grow to fit the prompt (incl. long pastes); cap at ~40% of the viewport,
+    // then scroll. Keep in sync with .fc__input max-height in styles.css.
+    const cap = Math.max(140, Math.round(window.innerHeight * 0.4));
+    ta.style.height = `${Math.min(ta.scrollHeight, cap)}px`;
   }, [prompt]);
 
   // Paste an image anywhere → upload it and attach it as a reference. (When the
