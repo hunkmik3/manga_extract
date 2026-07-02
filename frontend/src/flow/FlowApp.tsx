@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getFlowUsage, thumbUrl, type FlowUsage } from "../api/client";
 import { FLOW_ONLY, useAppModeStore } from "../store/appMode";
 import { useFlowProjectsStore } from "../store/flowProjects";
-import { CHAR_PREFIX, REF_PREFIX, SCENE_PREFIX, groupName, useFlowStudioStore } from "../store/flowStudio";
+import { CHAR_PREFIX, REF_PREFIX, SCENE_PREFIX, groupName, useFlowStudioStore, type GenJob } from "../store/flowStudio";
 import { FlowComposer } from "./FlowComposer";
 import { FlowViewer } from "./FlowViewer";
 
@@ -92,8 +92,8 @@ export function FlowApp() {
       {/* ── left rail = project list ── */}
       <aside className="fn">
         <div className="fn__brand">
-          <img className="fn__symbol" src="/symbol.png" alt="SGS Flow Studio" />
-          {!collapsed && <span className="fn__title">SGS Flow Studio</span>}
+          <img className="fn__symbol" src="/symbol.png" alt="GiantFlow" />
+          {!collapsed && <span className="fn__title">GiantFlow</span>}
         </div>
 
         {!collapsed && (
@@ -417,12 +417,32 @@ function GenPlaceholders() {
   const total = Math.max(1, jobs.reduce((n, j) => n + j.total, 0));
   const done = jobs.reduce((n, j) => n + j.done, 0);
   const pcts = useTilePcts({ done, total }, jobs.length > 0, total, expectedSecondsPerImage(model, size));
+  const reusePrompt = useFlowStudioStore((s) => s.reusePrompt);
+  // One tile per expected image, tagged with the job it belongs to so each can
+  // reuse that job's EXACT prompt + material even while it's still generating.
+  const tiles: { job: GenJob | null; i: number }[] = [];
+  let n = 0;
+  for (const job of jobs) for (let k = 0; k < job.total; k++) tiles.push({ job, i: n++ });
+  while (tiles.length < total) tiles.push({ job: null, i: n++ });
   return (
     <>
-      {Array.from({ length: total }).map((_, i) => (
+      {tiles.map(({ job, i }) => (
         <div key={`gen-${i}`} className="fc-card fc-card--loading" style={{ aspectRatio: cssAspect(aspect) }}>
           <span className="fc-load__icon" aria-hidden="true">🖼</span>
           <span className="fc-load__pct">{pcts[i] ?? 0}%</span>
+          {job?.prompt && (
+            <button
+              type="button"
+              className="fc-card__act fc-load__reuse"
+              title="Reuse this exact prompt + material"
+              onClick={(e) => {
+                e.stopPropagation();
+                reusePrompt(job.prompt, job.refs);
+              }}
+            >
+              ↩
+            </button>
+          )}
         </div>
       ))}
     </>

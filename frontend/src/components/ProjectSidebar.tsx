@@ -220,9 +220,9 @@ export function ProjectSidebar() {
             type="button"
             className="project-sidebar__flow-cta"
             onClick={() => setAppMode("flow")}
-            title="Open Flow Studio — generate Google Flow-style images via API"
+            title="Open GiantFlow — generate Google Flow-style images via API"
           >
-            ✦ Flow Studio
+            ✦ GiantFlow
           </button>
           <div className="project-sidebar__row">
             <button

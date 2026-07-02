@@ -73,9 +73,9 @@ export function App() {
               type="button"
               className="mode-switch"
               onClick={() => setMode("flow")}
-              title="Open Flow Studio — generate Google Flow-style images via API"
+              title="Open GiantFlow — generate Google Flow-style images via API"
             >
-              ✦ Flow Studio
+              ✦ GiantFlow
             </button>
           </div>
           {loading && boardId === null ? (

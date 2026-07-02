@@ -103,6 +103,8 @@ export interface GenJob {
   id: number;
   done: number;
   total: number;
+  prompt: string; // exact prompt of this in-flight gen (for "reuse while generating")
+  refs: string[]; // exact material/reference media ids used for this gen
 }
 
 interface FlowStudioState {
@@ -423,13 +425,15 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     const text = prompt.trim();
     if (!text) return; // no wait-for-finish: multiple generations can run at once
     const settings = get().settings;
+    // Capture prompt + material BEFORE creating the job so the in-flight tile can
+    // offer "reuse exact prompt + refs" even while it's still generating.
+    const refs = [...new Set([...get().composerRefs, ...get().resolveMentions(text)])];
     const jobId = ++_jobSeq;
     set((s) => ({
-      genJobs: [...s.genJobs, { id: jobId, done: 0, total: settings.count }],
+      genJobs: [...s.genJobs, { id: jobId, done: 0, total: settings.count, prompt: text, refs }],
       generating: true,
       error: null,
     }));
-    const refs = [...new Set([...get().composerRefs, ...get().resolveMentions(text)])];
     // Sent → clear the composer (prompt + attached refs) like Flow does; the
     // in-flight generation already captured `text` and `refs`.
     set({ composerPrompt: "", composerRefs: [], composerMentions: [] });
@@ -467,7 +471,8 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     const text = prompt.trim();
     if (!text) return; // concurrent allowed
     const jobId = ++_jobSeq;
-    set((s) => ({ genJobs: [...s.genJobs, { id: jobId, done: 0, total: 1 }], generating: true, error: null }));
+    const jobRefs = [mediaId, ...(refs ?? [])];
+    set((s) => ({ genJobs: [...s.genJobs, { id: jobId, done: 0, total: 1, prompt: text, refs: jobRefs }], generating: true, error: null }));
     const settings = get().settings;
     try {
       const { mediaIds, providerUsed } = await dispatchFlow(

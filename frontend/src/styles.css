@@ -6359,6 +6359,14 @@ button:disabled {
   background: linear-gradient(110deg, transparent 35%, rgba(255, 255, 255, 0.06) 50%, transparent 65%);
   transform: translateX(-100%);
   animation: flow-shimmer 1.6s ease-in-out infinite;
+  pointer-events: none; /* never swallow clicks meant for the reuse button */
+}
+/* reuse-while-generating button — bottom-right so it clears the icon + % on top */
+.fc-load__reuse {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 2;
 }
 @keyframes flow-shimmer {
   to {
