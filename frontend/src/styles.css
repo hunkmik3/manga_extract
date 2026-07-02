@@ -6569,6 +6569,8 @@ button:disabled {
   resize: none;
   min-height: 38px;
   max-height: 40vh; /* grow with the prompt (long pastes) then scroll — matches FlowComposer JS cap */
+  transition: height 260ms cubic-bezier(0.22, 1, 0.36, 1); /* smooth expand/collapse (ease-out) */
+  will-change: height;
   color: transparent;
   caret-color: var(--text);
   background: transparent;

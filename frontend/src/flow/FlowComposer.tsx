@@ -87,6 +87,11 @@ export function FlowComposer() {
 
   const [openSet, setOpenSet] = useState(false);
   const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
+  // Expand the prompt box while focused (typing) or hovered; collapse to one
+  // line when the pointer leaves AND it's not focused.
+  const [focused, setFocused] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const expanded = focused || hovered;
   const fileInput = useRef<HTMLInputElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -101,16 +106,22 @@ export function FlowComposer() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [openSet]);
 
-  // Auto-grow the textarea to fit the prompt (mirror follows via inset:0).
+  // Grow the prompt box while focused/hovered, collapse to one line when idle.
+  // (mirror follows via inset:0; CSS transition animates the height change.)
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
+    if (!expanded) {
+      // Idle (blurred + pointer outside) → collapse to a single line.
+      ta.style.height = "38px";
+      return;
+    }
+    // Focused/hovered → grow to fit the prompt (incl. long pastes); cap at ~40%
+    // of the viewport, then scroll. Keep in sync with .fc__input max-height.
     ta.style.height = "auto";
-    // Grow to fit the prompt (incl. long pastes); cap at ~40% of the viewport,
-    // then scroll. Keep in sync with .fc__input max-height in styles.css.
     const cap = Math.max(140, Math.round(window.innerHeight * 0.4));
     ta.style.height = `${Math.min(ta.scrollHeight, cap)}px`;
-  }, [prompt]);
+  }, [prompt, expanded]);
 
   // Paste an image anywhere → upload it and attach it as a reference. (When the
   // detail viewer is open it handles its own paste, so bail here.)
@@ -288,12 +299,18 @@ export function FlowComposer() {
           }}
         />
 
-        <div className="fc__field">
+        <div
+          className="fc__field"
+          onMouseEnter={() => setHovered(true)}
+          onMouseLeave={() => setHovered(false)}
+        >
           <textarea
             ref={taRef}
             className="fc__input"
             placeholder="What do you want to create?  (type @ to insert a character / scene / image)"
             value={prompt}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
             onChange={onChange}
             onScroll={() => {
               if (mirrorRef.current && taRef.current) mirrorRef.current.scrollTop = taRef.current.scrollTop;
