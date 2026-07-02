@@ -6562,6 +6562,7 @@ button:disabled {
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
   letter-spacing: 0;
 }
 .fc__input {
@@ -6577,6 +6578,8 @@ button:disabled {
   border: none;
   outline: none;
   overflow-y: auto;
+  overflow-x: hidden; /* wrap long unbroken strings vertically instead of scrolling sideways
+                         (so scrollHeight reflects the wrapped height and auto-grow works) */
   position: relative;
   z-index: 1;
 }
@@ -6747,6 +6750,95 @@ button:disabled {
   transition: opacity 100ms ease;
 }
 .fc__send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── full-screen prompt editor (fc-fs__*) ──────────────────────────────── */
+.fc-fs {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(6, 7, 10, 0.72);
+  backdrop-filter: blur(4px);
+  animation: fc-fs-in 140ms ease;
+}
+@keyframes fc-fs-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.fc-fs__panel {
+  display: flex;
+  flex-direction: column;
+  width: min(1100px, 100%);
+  height: min(88vh, 100%);
+  background: var(--panel, #14161c);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.fc-fs__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.fc-fs__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.fc-fs__ta {
+  flex: 1;
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  padding: 18px;
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  outline: none;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.fc-fs__ta::placeholder {
+  color: var(--muted);
+}
+.fc-fs__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border);
+}
+.fc-fs__hint {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.fc-fs__gen {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: opacity 100ms ease;
+}
+.fc-fs__gen:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { thumbUrl } from "../api/client";
 import {
   CHAR_PREFIX,
@@ -92,6 +93,9 @@ export function FlowComposer() {
   const [focused, setFocused] = useState(false);
   const [hovered, setHovered] = useState(false);
   const expanded = focused || hovered;
+  // Manual full-screen editor for the prompt (big distraction-free textarea).
+  const [fullscreen, setFullscreen] = useState(false);
+  const fsRef = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -112,8 +116,11 @@ export function FlowComposer() {
     const ta = taRef.current;
     if (!ta) return;
     if (!expanded) {
-      // Idle (blurred + pointer outside) → collapse to a single line.
+      // Idle (blurred + pointer outside) → collapse to a single line, showing
+      // the START of the prompt (not a scrolled-to-caret mid-position).
       ta.style.height = "38px";
+      ta.scrollTop = 0;
+      if (mirrorRef.current) mirrorRef.current.scrollTop = 0;
       return;
     }
     // Focused/hovered → grow to fit the prompt (incl. long pastes); cap at ~40%
@@ -122,6 +129,17 @@ export function FlowComposer() {
     const cap = Math.max(140, Math.round(window.innerHeight * 0.4));
     ta.style.height = `${Math.min(ta.scrollHeight, cap)}px`;
   }, [prompt, expanded]);
+
+  // Full-screen editor: focus it on open, close on Escape.
+  useEffect(() => {
+    if (!fullscreen) return;
+    fsRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFullscreen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreen]);
 
   // Paste an image anywhere → upload it and attach it as a reference. (When the
   // detail viewer is open it handles its own paste, so bail here.)
@@ -424,10 +442,67 @@ export function FlowComposer() {
           )}
         </div>
 
+        <button
+          type="button"
+          className="fc__icon fc__expand"
+          onClick={() => setFullscreen(true)}
+          title="Expand prompt to full screen"
+        >
+          ⛶
+        </button>
+
         <button type="button" className="fc__send" onClick={submit} disabled={!prompt.trim()} title="Generate (Enter)">
           →
         </button>
       </div>
+
+      {fullscreen &&
+        createPortal(
+          <div className="fc-fs" role="dialog" aria-modal="true">
+          <div className="fc-fs__panel">
+            <div className="fc-fs__head">
+              <span className="fc-fs__title">Edit prompt</span>
+              <button
+                type="button"
+                className="fc__icon"
+                onClick={() => setFullscreen(false)}
+                title="Collapse (Esc)"
+              >
+                ⤡
+              </button>
+            </div>
+            <textarea
+              ref={fsRef}
+              className="fc-fs__ta"
+              placeholder="What do you want to create?"
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                  e.preventDefault();
+                  submit();
+                  setFullscreen(false);
+                }
+              }}
+            />
+            <div className="fc-fs__foot">
+              <span className="fc-fs__hint">⌘/Ctrl + Enter to generate · Esc to close</span>
+              <button
+                type="button"
+                className="fc-fs__gen"
+                onClick={() => {
+                  submit();
+                  setFullscreen(false);
+                }}
+                disabled={!prompt.trim()}
+              >
+                Generate →
+              </button>
+            </div>
+          </div>
+        </div>,
+          document.body,
+        )}
     </div>
   );
 }
