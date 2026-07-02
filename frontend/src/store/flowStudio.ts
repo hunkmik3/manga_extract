@@ -361,11 +361,13 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
     const ids = new Set<string>();
     // 1. Exact: the refs stored with the image when it was generated.
     for (const id of refMediaIds) if (assets.some((a) => a.mediaId === id)) ids.add(id);
-    // 2. Fallback (also covers images made before refs were stored): re-resolve
-    //    the @tokens in the text against the names/labels of existing images.
-    for (const a of assets) {
-      const n = nameOf(a);
-      if (n && n !== "image" && prompt.includes(`@${n}`)) ids.add(a.mediaId);
+    // 2. Fallback ONLY when the image has no stored refs (older images): resolve
+    //    the @tokens against character/scene NAMES via resolveMentions. We must
+    //    NOT match on a.label here — many uploads share a generic label like
+    //    "image.png", and a substring `prompt.includes("@"+label)` would then
+    //    pull in EVERY such image (the "pile of wrong refs" bug).
+    if (ids.size === 0) {
+      for (const id of get().resolveMentions(prompt)) ids.add(id);
     }
     // Rebuild the @token pills, grouping refs under their derived token (a
     // character/scene → all its views; otherwise the image's own label) so the
