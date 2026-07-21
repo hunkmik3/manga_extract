@@ -2565,7 +2565,7 @@ async def _handle_upsample_image(params: dict) -> tuple[dict, Optional[str]]:
 
 async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
     """Flow-clone studio: text→image / edit (1-4 variants), fully API-only (no
-    Flow bridge, no paygate tier, no node binding). Two interchangeable engines,
+    Flow bridge, no paygate tier, no node binding). Interchangeable engines,
     chosen by ``provider`` (default env ``FLOW_IMAGE_PROVIDER`` else "gemini"):
 
       - "gemini"  → direct Gemini API, reference/source images sent inline
@@ -2573,6 +2573,8 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
       - "atrium"  → Atrium passthrough; input images must be PUBLIC urls
                     (``PUBLIC_MEDIA_BASE_URL`` / tunnel), so refs+edit need that
                     set. Plain text→image works without it.
+      - "ark"     → BytePlus Ark direct (Seedream); input images inline (base64),
+                    region ap-southeast. Needs ``ARK_API_KEY``.
 
     Each result is cached as a local media id, returned in ``media_ids``."""
     from flowboard.services.comic.bridge import BridgeEditError
@@ -2582,8 +2584,18 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "missing_prompt"
     prompt = prompt.strip()
 
+    provider = params.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        provider = os.getenv("FLOW_IMAGE_PROVIDER", "gemini")
+    provider = provider.strip().lower() or "gemini"
+
     image_model = params.get("image_model")
-    if not (isinstance(image_model, str) and image_model.startswith("gemini-")):
+    image_model = image_model.strip() if isinstance(image_model, str) and image_model.strip() else ""
+    if provider == "ark":
+        # BytePlus Ark Seedream (versioned) ids, e.g. "dola-seedream-5-0-pro-260628".
+        image_model = image_model or "dola-seedream-5-0-pro-260628"
+    elif not image_model.startswith("gemini-"):
+        # The Gemini and Atrium engines both speak Gemini model ids.
         image_model = "gemini-2.5-flash-image"
     aspect = params.get("aspect_ratio")
     aspect = aspect if isinstance(aspect, str) and aspect else "1:1"
@@ -2593,11 +2605,6 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
         variant_count = int(params.get("variant_count") or 1)
     except (TypeError, ValueError):
         variant_count = 1
-
-    provider = params.get("provider")
-    if not isinstance(provider, str) or not provider.strip():
-        provider = os.getenv("FLOW_IMAGE_PROVIDER", "gemini")
-    provider = provider.strip().lower() or "gemini"
 
     ref_ids = [r for r in (params.get("ref_media_ids") or []) if isinstance(r, str) and r]
     source_id = params.get("source_media_id")
@@ -2652,6 +2659,11 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
                     prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
                     on_progress=_progress,
                 )
+        elif provider == "ark":
+            outs = await _flow_gen_ark(
+                prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                on_progress=_progress,
+            )
         else:
             outs = await _flow_gen_gemini(
                 prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
@@ -2717,6 +2729,48 @@ async def _flow_gen_gemini(
         prompt, ref_bytes or None,
         image_model=image_model, aspect_ratio=aspect,
         variant_count=variant_count, image_size=image_size,
+        on_progress=on_progress,
+    )
+
+
+async def _flow_gen_ark(
+    prompt: str, image_model: str, aspect: str, image_size: Optional[str],
+    variant_count: int, ref_ids: list, source_id: Optional[str],
+    on_progress=None,
+) -> list[bytes]:
+    """BytePlus Ark (direct Seedream) engine — source + reference images sent
+    INLINE as base64 data URLs, so refs and edit work fully locally."""
+    from flowboard.services.comic import ark_api
+
+    if not ark_api.is_configured():
+        raise _FlowGenError("ark_not_configured: set ARK_API_KEY in .env")
+
+    def _load(mid: str) -> Optional[bytes]:
+        p = media_service.cached_path(mid)
+        if p is None:
+            return None
+        try:
+            b = p.read_bytes()
+        except OSError:
+            return None
+        return b or None
+
+    def _load_all() -> tuple[Optional[bytes], list[bytes]]:
+        src = _load(source_id) if source_id else None
+        refs = [b for b in (_load(r) for r in ref_ids) if b]
+        return src, refs
+
+    source_bytes, ref_bytes = await asyncio.to_thread(_load_all)
+    if source_id and source_bytes is None:
+        raise _FlowGenError("source_not_found")
+
+    images = ([source_bytes] if source_bytes else []) + ref_bytes
+    return await ark_api.generate_image_variants(
+        prompt, images or None,
+        image_model=image_model,
+        aspect_ratio="" if source_id else aspect,
+        variant_count=variant_count,
+        image_size=None if source_id else image_size,
         on_progress=on_progress,
     )
 

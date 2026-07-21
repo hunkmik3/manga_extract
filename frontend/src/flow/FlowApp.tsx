@@ -374,34 +374,65 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
     return () => clearInterval(id);
   }, [usage?.seconds_until_reset]);
   if (!usage) return null;
-  const pct = Math.min(100, Math.round((usage.today / Math.max(1, usage.daily_quota)) * 100));
   const resetTitle = usage.resets_at ? `Limit resets at ${new Date(usage.resets_at).toLocaleString()}` : undefined;
+  const g = usage.engines?.gemini;
+  const s = usage.engines?.seedream;
+  const usd = (n: number) => `$${n.toFixed(2)}`;
+  const gToday = g ? g.today : usage.today;
+  const gQuota = g ? g.daily_quota : usage.daily_quota;
+  const gRemaining = g ? g.remaining_est : usage.remaining_est;
+  const gPct = Math.min(100, Math.round((gToday / Math.max(1, gQuota)) * 100));
   if (collapsed) {
+    const title = [
+      `Gemini: ${gToday}/${gQuota}`,
+      s ? `Seedream: ${usd(s.cost_today)} (${s.today} imgs)` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
     return (
-      <div className="fn__usage fn__usage--mini" title={`Today: ${usage.today}/${usage.daily_quota} images`}>
+      <div className="fn__usage fn__usage--mini" title={title}>
         {usage.today}
       </div>
     );
   }
   return (
-    <div className="fn__usage" title={`Total generated: ${usage.total} images`}>
-      <div className="fn__usage-row">
-        <span>Today</span>
-        <span>
-          {usage.today}/{usage.daily_quota}
-        </span>
+    <>
+      {/* Gemini / Atrium — daily quota, in its own box */}
+      <div className="fn__usage" title={`Gemini: ~${gRemaining} images remaining today (est.)`}>
+        <div className="fn__usage-row">
+          <span>Gemini</span>
+          <span>
+            {gToday}/{gQuota}
+          </span>
+        </div>
+        <div className="fn__usage-bar">
+          <div className="fn__usage-fill" style={{ width: `${gPct}%` }} />
+        </div>
+        <div className="fn__usage-sub">~{gRemaining} images remaining today (est.)</div>
+        {secsLeft != null && (
+          <div className="fn__usage-reset" title={resetTitle}>
+            <span>↻ Resets in</span>
+            <span className="fn__usage-reset-time">{secsLeft > 0 ? fmtCountdown(secsLeft) : "now…"}</span>
+          </div>
+        )}
       </div>
-      <div className="fn__usage-bar">
-        <div className="fn__usage-fill" style={{ width: `${pct}%` }} />
-      </div>
-      <div className="fn__usage-sub">~{usage.remaining_est} images remaining today (est.)</div>
-      {secsLeft != null && (
-        <div className="fn__usage-reset" title={resetTitle}>
-          <span>↻ Resets in</span>
-          <span className="fn__usage-reset-time">{secsLeft > 0 ? fmtCountdown(secsLeft) : "now…"}</span>
+      {/* Seedream — pay-per-use, its own box showing money spent */}
+      {s && (
+        <div
+          className="fn__usage"
+          style={{ marginTop: 8 }}
+          title={`Seedream: ${s.total} images total @ ${usd(s.usd_per_image)}/image`}
+        >
+          <div className="fn__usage-row">
+            <span>Seedream</span>
+            <span>{usd(s.cost_today)}</span>
+          </div>
+          <div className="fn__usage-sub">
+            {s.today} imgs today · total {usd(s.cost_total)}
+          </div>
         </div>
       )}
-    </div>
+    </>
   );
 }
 

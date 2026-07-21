@@ -48,24 +48,33 @@ export type FlowSize = (typeof FLOW_SIZES)[number];
 // Image engine behind the studio. Atrium passthrough is the only engine; the
 // direct-Gemini option was retired. ("gemini" stays in the type only as the
 // backend's internal fallback if Atrium can't read a referenced image.)
-export type FlowProvider = "gemini" | "atrium";
+export type FlowProvider = "gemini" | "atrium" | "ark";
 export const FLOW_PROVIDERS: { id: FlowProvider; label: string }[] = [
   { id: "atrium", label: "Atrium" },
+  { id: "ark", label: "BytePlus" },
 ];
 
 export interface FlowModelOption {
   id: string;
   label: string;
   max: FlowSize; // largest resolution this model supports
+  provider: FlowProvider; // engine that runs this model (picked automatically)
 }
 export const FLOW_MODELS: FlowModelOption[] = [
-  { id: "gemini-3.1-flash-image", label: "Nano Banana 2", max: "4K" },
-  { id: "gemini-3-pro-image", label: "Nano Banana Pro", max: "4K" },
-  { id: "gemini-2.5-flash-image", label: "Nano Banana", max: "2K" },
+  { id: "gemini-3.1-flash-image", label: "Nano Banana 2", max: "4K", provider: "atrium" },
+  { id: "gemini-3-pro-image", label: "Nano Banana Pro", max: "4K", provider: "atrium" },
+  { id: "gemini-2.5-flash-image", label: "Nano Banana", max: "2K", provider: "atrium" },
+  // Seedream 5 caps at ~4.6M px (≈2K); it can't do true 4K, so max is 2K.
+  { id: "dola-seedream-5-0-pro-260628", label: "Seedream 5.0 Pro", max: "2K", provider: "ark" },
 ];
 
 export function modelMaxSize(modelId: string): FlowSize {
   return FLOW_MODELS.find((m) => m.id === modelId)?.max ?? "2K";
+}
+
+/** Engine that runs a given model id (defaults to Atrium for unknown ids). */
+export function modelProvider(modelId: string): FlowProvider {
+  return FLOW_MODELS.find((m) => m.id === modelId)?.provider ?? "atrium";
 }
 
 export type FlowTab = "all" | "characters" | "scenes";
@@ -175,7 +184,8 @@ function loadPersisted(): { settings: FlowGenSettings; recentPrompts: string[] }
         count: s.count && s.count >= 1 && s.count <= 4 ? s.count : fallback.count,
         model: FLOW_MODELS.some((m) => m.id === s.model) ? (s.model as string) : fallback.model,
         size: (FLOW_SIZES as readonly string[]).includes(s.size ?? "") ? (s.size as FlowSize) : fallback.size,
-        provider: "atrium", // Gemini engine retired — always Atrium
+        // Provider follows the chosen model (Atrium for Gemini/Nano-Banana, BytePlus for Seedream).
+        provider: modelProvider(FLOW_MODELS.some((m) => m.id === s.model) ? (s.model as string) : fallback.model),
       },
       recentPrompts: Array.isArray(p.recentPrompts) ? p.recentPrompts.slice(0, 8) : [],
     };
@@ -399,6 +409,8 @@ export const useFlowStudioStore = create<FlowStudioState>((set, get) => ({
 
   setSettings(patch) {
     const next = { ...get().settings, ...patch };
+    // The engine is decided by the model, not chosen separately.
+    next.provider = modelProvider(next.model);
     // Clamp size to the model's cap when switching to a weaker model.
     const cap = modelMaxSize(next.model);
     if (cap === "2K" && next.size === "4K") next.size = "2K";

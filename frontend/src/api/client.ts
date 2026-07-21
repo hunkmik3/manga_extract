@@ -558,6 +558,19 @@ export function thumbUrl(mediaId: string, w = 256): string {
   return `/api/media/${encodeURIComponent(clean)}/thumb?w=${w}`;
 }
 
+export interface FlowUsageGemini {
+  today: number;
+  total: number;
+  daily_quota: number;
+  remaining_est: number;
+}
+export interface FlowUsageSeedream {
+  today: number;
+  total: number;
+  usd_per_image: number;
+  cost_today: number; // USD spent today
+  cost_total: number; // USD spent all-time
+}
 export interface FlowUsage {
   today: number;
   total: number;
@@ -565,6 +578,9 @@ export interface FlowUsage {
   remaining_est: number;
   resets_at?: string; // ISO, server's next local midnight
   seconds_until_reset?: number;
+  // Per-engine split (optional — absent on older agents). Gemini is quota-based;
+  // Seedream is pay-per-use, so it reports money spent instead.
+  engines?: { gemini: FlowUsageGemini; seedream: FlowUsageSeedream };
 }
 export function getFlowUsage() {
   return api<FlowUsage>("/api/flow/usage");
