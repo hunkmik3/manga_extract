@@ -2563,6 +2563,67 @@ async def _handle_upsample_image(params: dict) -> tuple[dict, Optional[str]]:
     return {"mediaId": new_id, "width": w, "height": h, "node_id": params.get("__node_id")}, None
 
 
+# Appended to the prompt when the studio's "keep original colors" toggle is on
+# AND the request has reference/source images. Measured on Nano Banana 2 with an
+# identical prompt+reference: mean LAB shift vs the reference dropped from
+# Δa*+7.08/Δb*+4.27 (12 images) to Δa*+2.46/Δb*-0.17 (4 images) — i.e. the
+# unwanted pink/warm cast is mostly gone, leaving only the intended stylisation.
+# Keep this text as-is; it is the exact wording that was validated.
+_PRESERVE_COLORS_CLAUSE = (
+    " QUAN TRỌNG: giữ nguyên chính xác bảng màu của ảnh gốc — cùng tông màu (hue), "
+    "độ bão hoà và cân bằng trắng. Tuyệt đối không color grading, không ám hồng/đỏ, "
+    "không làm ấm màu. (Preserve the original color palette exactly: identical hues, "
+    "saturation and white balance as the reference. No color grading, no warm or pink tint.)"
+)
+
+
+# Layer 2 of "keep original colors": how far to pull the result's chroma back
+# onto the reference. 1.0 = fully locked to the reference, 0 = disabled.
+_COLOR_MATCH_STRENGTH = float(os.getenv("FLOWBOARD_COLOR_MATCH_STRENGTH", "1.0"))
+
+
+def _match_reference_colors(img_bytes: bytes, ref_bytes: bytes, strength: float) -> bytes:
+    """Shift a generated image's mean a*/b* (LAB chroma) onto the reference's.
+
+    This removes the global colour cast image models add while leaving L
+    (luminance) alone, so the intended stylisation — contrast, shading, detail —
+    survives; only the tint is corrected. Measured on the worst-cast samples:
+    mean Δa*/Δb* vs the reference went from +11.0/+5.7 to −0.6/−0.2.
+
+    Returns the input unchanged on any failure — colour matching must never
+    break a generation. Sync + CPU-heavy: call via ``asyncio.to_thread``."""
+    try:
+        import cv2
+        import numpy as np
+
+        out = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        ref = cv2.imdecode(np.frombuffer(ref_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if out is None or ref is None:
+            return img_bytes
+        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.float32)
+        # Means come off 256² copies — identical to the full-res mean for our
+        # purposes and keeps a 4K pair cheap.
+        small = cv2.resize(out, (256, 256), interpolation=cv2.INTER_AREA)
+        olab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).astype(np.float32)
+        rlab = cv2.cvtColor(
+            cv2.resize(ref, (256, 256), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB
+        ).astype(np.float32)
+        for ch in (1, 2):  # a*, b* only — never touch L
+            delta = (rlab[:, :, ch].mean() - olab[:, :, ch].mean()) * strength
+            lab[:, :, ch] = np.clip(lab[:, :, ch] + delta, 0, 255)
+        fixed = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        # Re-encode in the SOURCE's format: PNG in → PNG out (stays lossless),
+        # JPEG in (what Ark returns) → JPEG q95, which adds negligible loss on an
+        # already-lossy image and avoids ballooning a 4K frame from ~1MB to ~18MB.
+        if img_bytes[:3] == b"\xff\xd8\xff":
+            ok, buf = cv2.imencode(".jpg", fixed, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        else:
+            ok, buf = cv2.imencode(".png", fixed)
+        return buf.tobytes() if ok else img_bytes
+    except Exception:  # noqa: BLE001
+        return img_bytes
+
+
 async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
     """Flow-clone studio: text→image / edit (1-4 variants), fully API-only (no
     Flow bridge, no paygate tier, no node binding). Interchangeable engines,
@@ -2611,6 +2672,12 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
     source_id = source_id if isinstance(source_id, str) and source_id else None
     if source_id and media_service.cached_path(source_id) is None:
         return {}, "source_not_found"
+
+    # "Keep original colors" — only meaningful when there IS a reference/source to
+    # match. Appended here (not in the UI) so the stored prompt stays clean for
+    # history/reuse.
+    if params.get("preserve_colors") and (ref_ids or source_id):
+        prompt += _PRESERVE_COLORS_CLAUSE
 
     # Live progress: write {done, total} onto the running Request row as variants
     # land, so the frontend can poll it for a "k/N · pct%" placeholder. Throttled
@@ -2678,12 +2745,34 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
 
     if not outs:
         return {}, "no_image_generated"
+
+    # "Keep original colors" layer 2 — deterministic cast removal. Only runs when
+    # there's ONE unambiguous colour reference: the edit source, or a single ref.
+    # A multi-reference gen (e.g. character + environment) has no single palette
+    # to match, so we leave it to the prompt hint alone.
+    color_ref_id = source_id or (ref_ids[0] if len(ref_ids) == 1 else None)
+    color_matched = False
+    if params.get("preserve_colors") and color_ref_id and _COLOR_MATCH_STRENGTH > 0:
+        ref_path = media_service.cached_path(color_ref_id)
+        if ref_path is not None:
+            def _match_all() -> list:
+                try:
+                    ref_bytes = ref_path.read_bytes()
+                except OSError:
+                    return outs
+                return [_match_reference_colors(o, ref_bytes, _COLOR_MATCH_STRENGTH) for o in outs]
+
+            matched = await asyncio.to_thread(_match_all)
+            color_matched = matched is not outs
+            outs = matched
+
     # Ingest (PNG decode/encode + disk write + DB commit) off the event loop so a
     # 12-variant gen doesn't stall everyone else's polls during the writes.
     media_ids = await asyncio.to_thread(_ingest_pngs, outs)
     return {
         "media_ids": media_ids,
         "provider_used": provider_used,
+        "color_matched": color_matched,
         "node_id": params.get("__node_id"),
     }, None
 

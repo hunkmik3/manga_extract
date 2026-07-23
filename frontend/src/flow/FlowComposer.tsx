@@ -438,6 +438,21 @@ export function FlowComposer() {
                   ))}
                 </div>
               </div>
+              <div className="fc__pop-section">
+                <label className="fc__pop-label">
+                  Colors <span className="fc__muted">(with references)</span>
+                </label>
+                <div className="fc__chips">
+                  <button
+                    type="button"
+                    className={`fc__chip${settings.preserveColors ? " is-on" : ""}`}
+                    onClick={() => setSettings({ preserveColors: !settings.preserveColors })}
+                    title="Tell the model to match the reference's palette — no colour grading, no pink/warm tint. Only applied when the generation has reference/material images."
+                  >
+                    Keep original colors
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </div>

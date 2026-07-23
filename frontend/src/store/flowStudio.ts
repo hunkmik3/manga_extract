@@ -104,6 +104,9 @@ interface FlowGenSettings {
   model: string;
   size: FlowSize;
   provider: FlowProvider;
+  // Ask the model to match the reference's palette (no colour grading). Only
+  // sent when the gen actually has a reference/source image.
+  preserveColors: boolean;
 }
 
 /** One in-flight generation batch. Several can run at once (no wait-for-finish);
@@ -170,6 +173,7 @@ function loadPersisted(): { settings: FlowGenSettings; recentPrompts: string[] }
     model: "gemini-2.5-flash-image", // by id, not index — cheapest default, order-independent
     size: "1K",
     provider: "atrium",
+    preserveColors: true,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -186,6 +190,7 @@ function loadPersisted(): { settings: FlowGenSettings; recentPrompts: string[] }
         size: (FLOW_SIZES as readonly string[]).includes(s.size ?? "") ? (s.size as FlowSize) : fallback.size,
         // Provider follows the chosen model (Atrium for Gemini/Nano-Banana, BytePlus for Seedream).
         provider: modelProvider(FLOW_MODELS.some((m) => m.id === s.model) ? (s.model as string) : fallback.model),
+        preserveColors: typeof s.preserveColors === "boolean" ? s.preserveColors : fallback.preserveColors,
       },
       recentPrompts: Array.isArray(p.recentPrompts) ? p.recentPrompts.slice(0, 8) : [],
     };
@@ -270,6 +275,11 @@ function genParams(
     params.image_size = wanted;
   }
   if (refs.length) params.ref_media_ids = refs;
+  // Colour preservation only makes sense when there's a reference/source to
+  // match; the agent appends the instruction to the prompt.
+  if (settings.preserveColors && (refs.length > 0 || extra.source_media_id)) {
+    params.preserve_colors = true;
+  }
   return params;
 }
 
