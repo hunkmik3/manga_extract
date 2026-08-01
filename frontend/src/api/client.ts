@@ -551,8 +551,15 @@ export function mediaUrl(mediaId: string): string {
   return `/media/${encodeURIComponent(clean)}`;
 }
 
+export function mediaDownloadUrl(mediaId: string, filename?: string): string {
+  const clean = mediaId.replace(/^media\//, "");
+  const params = new URLSearchParams({ download: "1" });
+  if (filename?.trim()) params.set("filename", filename.trim());
+  return `/media/${encodeURIComponent(clean)}?${params.toString()}`;
+}
+
 /** Downscaled JPEG for grids/pickers (cached). Use mediaUrl for full-res
- *  detail views / downloads. */
+ *  detail views and mediaDownloadUrl for downloads. */
 export function thumbUrl(mediaId: string, w = 256): string {
   const clean = mediaId.replace(/^media\//, "");
   return `/api/media/${encodeURIComponent(clean)}/thumb?w=${w}`;
@@ -875,6 +882,9 @@ export interface ReferenceItem {
   // spawn skip the re-vision call entirely.
   aiBrief: string | null;
   aspectRatio: string | null;
+  // Image model that produced this (e.g. "gemini-3.1-flash-image"); null for
+  // uploads or rows saved before this field existed.
+  modelUsed: string | null;
   tags: string[];
   pinned: boolean;
   position: number;
@@ -893,6 +903,7 @@ export interface ReferenceCreateInput {
   url?: string | null;
   source_board_id?: number | null;
   source_node_short_id?: string | null;
+  model_used?: string | null;
   tags?: string[];
 }
 
@@ -912,6 +923,7 @@ interface ReferenceRowWire {
   kind: string;
   ai_brief: string | null;
   aspect_ratio: string | null;
+  model_used: string | null;
   tags: string[] | null;
   pinned: boolean;
   position: number;
@@ -942,6 +954,7 @@ function mapReferenceRow(row: ReferenceRowWire): ReferenceItem {
     kind,
     aiBrief: row.ai_brief,
     aspectRatio: row.aspect_ratio,
+    modelUsed: row.model_used,
     tags: Array.isArray(row.tags) ? row.tags : [],
     pinned: row.pinned,
     position: row.position,

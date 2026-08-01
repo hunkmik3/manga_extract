@@ -168,4 +168,7 @@ if _DIST is not None:
             raise HTTPException(status_code=404, detail="not found")
         if full_path and candidate.is_file():
             return FileResponse(str(candidate))
-        return FileResponse(str(_DIST / "index.html"))
+        return FileResponse(
+            str(_DIST / "index.html"),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )

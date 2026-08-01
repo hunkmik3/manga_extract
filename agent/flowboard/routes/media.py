@@ -7,9 +7,10 @@ state for the frontend to poll while it waits for a URL to arrive.
 from __future__ import annotations
 
 import logging
+import re
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from flowboard.services import media as media_service
 
@@ -18,18 +19,64 @@ logger = logging.getLogger(__name__)
 bytes_router = APIRouter(tags=["media"])
 api_router = APIRouter(prefix="/api/media", tags=["media"])
 
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+_DOWNLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _download_name(media_id: str, suffix: str, filename: str | None) -> str:
+    if isinstance(filename, str) and filename.strip():
+        name = filename.strip().replace("\\", "/").rsplit("/", 1)[-1]
+        name = _DOWNLOAD_NAME_RE.sub("_", name).strip("._")
+        if name:
+            if len(name) <= 160:
+                return name
+            if "." in name:
+                stem, ext = name.rsplit(".", 1)
+                ext = f".{ext[:16]}"
+                return f"{stem[: max(1, 160 - len(ext))]}{ext}"
+            return name[:160]
+    return f"{media_id}{suffix}"
+
+
+def _download_headers(media_id: str, suffix: str, filename: str | None = None) -> dict[str, str]:
+    return {
+        "Content-Disposition": f'attachment; filename="{_download_name(media_id, suffix, filename)}"',
+    }
+
 
 @bytes_router.get("/media/{media_id:path}")
-async def get_media_bytes(media_id: str):
+async def get_media_bytes(
+    media_id: str,
+    request: Request,
+    raw: int = 0,
+    download: int = 0,
+    filename: str | None = None,
+):
     media_id = media_service.normalize_media_id(media_id)
     if not media_service.is_valid_media_id(media_id):
         raise HTTPException(status_code=400, detail="invalid media_id")
 
+    as_download = bool(download)
     cached = media_service.cached_path(media_id)
     if cached is not None:
+        # Viewers on the public (tunnel) hostname get result images from the R2
+        # CDN copy when one exists — the ~20MB originals then don't stream up
+        # this machine's uplink on every view. Local hosts keep reading straight
+        # from disk (fastest, works offline, and no CDN round-trip). `?raw=1`
+        # forces the same-origin file (canvas consumers — annotate-edit — need
+        # it: the r2.dev bucket has no CORS policy, so a cross-origin redirect
+        # would taint/fail the canvas).
+        host = (request.headers.get("host") or "").lower()
+        if not raw and not as_download and not host.startswith(_LOCAL_HOSTS):
+            from flowboard.services.comic import r2
+
+            cdn = r2.result_public_url(media_id)
+            if cdn is not None:
+                return RedirectResponse(cdn, status_code=302)
         return FileResponse(
             path=str(cached),
             media_type=media_service._mime_from_ext(cached.suffix),
+            headers=_download_headers(media_id, cached.suffix, filename) if as_download else None,
         )
 
     # Cache miss — try one fetch through the stored URL.
@@ -38,7 +85,11 @@ async def get_media_bytes(media_id: str):
         status = media_service.status(media_id)
         return JSONResponse(status_code=404, content=status)
     _bytes, mime, path = result
-    return FileResponse(path=str(path), media_type=mime)
+    return FileResponse(
+        path=str(path),
+        media_type=mime,
+        headers=_download_headers(media_id, path.suffix, filename) if as_download else None,
+    )
 
 
 _THUMB_DIR = media_service.MEDIA_CACHE_DIR / "thumbs"

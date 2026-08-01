@@ -10,7 +10,7 @@ Design choices:
   round-trip and the caller (character node UI) needs the media_id immediately.
 - Project-scoped: Flow's uploadImage requires ``clientContext.projectId``.
   Frontend must call ``ensureBoardProject`` first and pass the ``project_id``.
-- 10 MB cap and ``image/*`` mime allowlist applied here as defence-in-depth;
+- 50 MB cap and ``image/*`` mime allowlist applied here as defence-in-depth;
   the route never trusts the browser-supplied content-type alone.
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["upload"])
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 ALLOWED_UPLOAD_MIMES = {
     "image/jpeg",
     "image/png",

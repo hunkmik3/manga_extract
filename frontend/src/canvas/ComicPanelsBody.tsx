@@ -1,5 +1,5 @@
 import { type FlowboardNodeData } from "../store/board";
-import { mediaUrl } from "../api/client";
+import { mediaDownloadUrl, mediaUrl } from "../api/client";
 import { useAppModeStore } from "../store/appMode";
 import {
   createRequest,
@@ -146,7 +146,7 @@ export function ComicPanelsBody({ rfId, data }: { rfId: string; data: FlowboardN
               {cleaned.map((c) =>
                 c.status === "cleaned" && c.mediaId ? (
                   <figure key={c.idx} style={{ margin: 0 }} title={`bubble ${c.idx + 1} · cleaned`}>
-                    <a href={mediaUrl(c.mediaId)} download={`bubble-${c.idx + 1}.png`} target="_blank" rel="noreferrer" title="Transparent PNG — click to download">
+                    <a href={mediaDownloadUrl(c.mediaId, `bubble-${c.idx + 1}.png`)} download={`bubble-${c.idx + 1}.png`} target="_blank" rel="noreferrer" title="Transparent PNG — click to download">
                       <img
                         src={mediaUrl(c.mediaId)}
                         alt={`cleaned bubble ${c.idx + 1}`}

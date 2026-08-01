@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -2634,8 +2635,8 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
       - "atrium"  → Atrium passthrough; input images must be PUBLIC urls
                     (``PUBLIC_MEDIA_BASE_URL`` / tunnel), so refs+edit need that
                     set. Plain text→image works without it.
-      - "ark"     → BytePlus Ark direct (Seedream); input images inline (base64),
-                    region ap-southeast. Needs ``ARK_API_KEY``.
+      - "avis"    → Avis gateway (Seedream 5.0 Pro), async job + poll under the
+                    hood; input images inline (base64). Needs ``AVIS_API_KEY``.
 
     Each result is cached as a local media id, returned in ``media_ids``."""
     from flowboard.services.comic.bridge import BridgeEditError
@@ -2652,9 +2653,9 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
 
     image_model = params.get("image_model")
     image_model = image_model.strip() if isinstance(image_model, str) and image_model.strip() else ""
-    if provider == "ark":
-        # BytePlus Ark Seedream (versioned) ids, e.g. "dola-seedream-5-0-pro-260628".
-        image_model = image_model or "dola-seedream-5-0-pro-260628"
+    if provider == "avis":
+        # Avis catalog id for Seedream 5.0 Pro — no version/date suffix.
+        image_model = image_model or "dola-seedream-5-0-pro"
     elif not image_model.startswith("gemini-"):
         # The Gemini and Atrium engines both speak Gemini model ids.
         image_model = "gemini-2.5-flash-image"
@@ -2726,8 +2727,8 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
                     prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
                     on_progress=_progress,
                 )
-        elif provider == "ark":
-            outs = await _flow_gen_ark(
+        elif provider == "avis":
+            outs = await _flow_gen_avis(
                 prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
                 on_progress=_progress,
             )
@@ -2769,12 +2770,40 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
     # Ingest (PNG decode/encode + disk write + DB commit) off the event loop so a
     # 12-variant gen doesn't stall everyone else's polls during the writes.
     media_ids = await asyncio.to_thread(_ingest_pngs, outs)
+    # Offload the results to R2 in the BACKGROUND so viewers on the public
+    # tunnel hostname are served from the CDN (routes/media.py redirects) —
+    # never blocks or fails the gen; local serving keeps working without it.
+    _spawn_result_offload(list(media_ids))
     return {
         "media_ids": media_ids,
         "provider_used": provider_used,
+        "image_model": image_model,
         "color_matched": color_matched,
         "node_id": params.get("__node_id"),
     }, None
+
+
+# Keep strong references to fire-and-forget offload tasks so the event loop
+# can't garbage-collect them mid-flight.
+_offload_tasks: set = set()
+
+
+def _spawn_result_offload(media_ids: list) -> None:
+    from flowboard.services.comic import r2
+
+    if not (r2.is_configured() and media_ids):
+        return
+
+    def _upload_all() -> None:
+        for mid in media_ids:
+            try:
+                r2.upload_result(mid)
+            except Exception as exc:  # noqa: BLE001 — CDN copy is best-effort
+                logger.warning("r2 result offload failed for %s: %s", mid, exc)
+
+    task = asyncio.create_task(asyncio.to_thread(_upload_all), name="r2-result-offload")
+    _offload_tasks.add(task)
+    task.add_done_callback(_offload_tasks.discard)
 
 
 class _FlowGenError(RuntimeError):
@@ -2822,17 +2851,17 @@ async def _flow_gen_gemini(
     )
 
 
-async def _flow_gen_ark(
+async def _flow_gen_avis(
     prompt: str, image_model: str, aspect: str, image_size: Optional[str],
     variant_count: int, ref_ids: list, source_id: Optional[str],
     on_progress=None,
 ) -> list[bytes]:
-    """BytePlus Ark (direct Seedream) engine — source + reference images sent
-    INLINE as base64 data URLs, so refs and edit work fully locally."""
-    from flowboard.services.comic import ark_api
+    """Avis gateway (Seedream 5.0 Pro) engine — source + reference images sent
+    INLINE as base64, so refs and edit work fully locally."""
+    from flowboard.services.comic import avis_api
 
-    if not ark_api.is_configured():
-        raise _FlowGenError("ark_not_configured: set ARK_API_KEY in .env")
+    if not avis_api.is_configured():
+        raise _FlowGenError("avis_not_configured: set AVIS_API_KEY in .env")
 
     def _load(mid: str) -> Optional[bytes]:
         p = media_service.cached_path(mid)
@@ -2854,7 +2883,7 @@ async def _flow_gen_ark(
         raise _FlowGenError("source_not_found")
 
     images = ([source_bytes] if source_bytes else []) + ref_bytes
-    return await ark_api.generate_image_variants(
+    return await avis_api.generate_image_variants(
         prompt, images or None,
         image_model=image_model,
         aspect_ratio="" if source_id else aspect,
@@ -2864,15 +2893,62 @@ async def _flow_gen_ark(
     )
 
 
+# Reference-counts R2 input uploads shared across CONCURRENT flow_gen_image
+# jobs (WORKER_CONCURRENCY can be > 1, see below) that happen to tag the same
+# source/ref media_id. Without this, one job's cleanup could delete the R2
+# object while a still-running sibling job's Atrium call is mid-fetch of that
+# same URL, surfacing as "atrium 400: fail to fetch media url (404)". Guarded
+# by a real threading.Lock (not asyncio.Lock) because the mutations happen
+# inside asyncio.to_thread'd sync functions, i.e. on worker-pool threads.
+_r2_input_refcount: dict[str, int] = {}
+_r2_input_refcount_lock = threading.Lock()
+
+
+def _r2_input_acquire(media_id: str) -> None:
+    with _r2_input_refcount_lock:
+        _r2_input_refcount[media_id] = _r2_input_refcount.get(media_id, 0) + 1
+
+
+def _r2_input_release_and_maybe_delete(media_id: str) -> None:
+    from flowboard.services.comic import r2
+
+    with _r2_input_refcount_lock:
+        # Not tracked → this input was never uploaded to R2 (e.g. it was
+        # self-hosted through the tunnel), so there's nothing in the bucket to
+        # release/delete. No-op instead of blindly issuing a delete.
+        if media_id not in _r2_input_refcount:
+            return
+        remaining = _r2_input_refcount[media_id] - 1
+        if remaining <= 0:
+            _r2_input_refcount.pop(media_id, None)
+        else:
+            _r2_input_refcount[media_id] = remaining
+    if remaining <= 0:
+        r2.delete_media(media_id)
+
+
 def _atrium_input_url(media_id: str) -> Optional[str]:
-    """Public URL for an Atrium input image — prefer R2 (upload the file and use
-    its r2.dev url), else a tunnel (PUBLIC_MEDIA_BASE_URL → /media). Sync (boto3
-    + disk); call via ``asyncio.to_thread``."""
+    """Public URL Atrium can fetch this input image from.
+
+    Prefer SELF-HOSTING through the tunnel: the machine already has the image
+    cached, so we hand Atrium a downscaled-JPEG thumbnail URL served straight
+    off this box (``PUBLIC_MEDIA_BASE_URL`` → /api/media/<id>/thumb). This
+    avoids the r2.dev input-fetch flakiness (intermittent "failed to fetch
+    media URL") and the per-gen upload/delete churn. R2 stays in use for RESULT
+    offload (see _spawn_result_offload) — only input hosting moves off it.
+
+    Falls back to an R2 upload (with refcounted cleanup) only when no tunnel is
+    configured. Sync (disk/boto3) — call via ``asyncio.to_thread``."""
     from flowboard.services.comic import r2, atrium_api
 
+    if atrium_api.public_media_base() is not None:
+        return atrium_api.media_input_url(media_id)
     if r2.is_configured():
-        return r2.upload_media(media_id)
-    return atrium_api.media_public_url(media_id)
+        url = r2.upload_media(media_id)
+        if url:
+            _r2_input_acquire(media_id)
+        return url
+    return None
 
 
 async def _flow_gen_atrium(
@@ -2922,14 +2998,17 @@ async def _flow_gen_atrium(
             on_progress=on_progress,
         )
     finally:
-        # Atrium has fetched the inputs by now — drop them from R2 so the bucket
-        # never accumulates (each input only lives there for one generation).
-        # The worker is single-consumer (sequential), so no concurrent gen can
-        # still be reading these objects. Local cache (storage/media) is kept.
+        # Inputs are normally self-hosted through the tunnel now (nothing in R2
+        # to clean up — the release below no-ops for those). This only does real
+        # work on the R2-fallback path (no tunnel configured): Atrium has fetched
+        # the inputs by now, so drop them from the bucket. WORKER_CONCURRENCY
+        # allows many jobs at once, so a sibling job may still be relying on the
+        # same media_id — the refcounted release only deletes once every
+        # concurrent user is done. Local cache (storage/media) is always kept.
         if r2.is_configured() and input_ids:
             def _cleanup() -> None:
                 for mid in input_ids:
-                    r2.delete_media(mid)
+                    _r2_input_release_and_maybe_delete(mid)
             await asyncio.to_thread(_cleanup)
 
 

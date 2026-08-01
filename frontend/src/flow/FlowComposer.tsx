@@ -10,6 +10,7 @@ import {
   deriveGroups,
   groupName,
   modelMaxSize,
+  modelProvider,
   useFlowStudioStore,
   type FlowSize,
   type Mention,
@@ -75,6 +76,9 @@ export function FlowComposer() {
   const generate = useFlowStudioStore((s) => s.generate);
   const prompt = useFlowStudioStore((s) => s.composerPrompt);
   const setPrompt = useFlowStudioStore((s) => s.setComposerPrompt);
+  const setComposerCaret = useFlowStudioStore((s) => s.setComposerCaret);
+  const pendingCaretApply = useFlowStudioStore((s) => s.pendingCaretApply);
+  const clearPendingCaretApply = useFlowStudioStore((s) => s.clearPendingCaretApply);
   const composerRefs = useFlowStudioStore((s) => s.composerRefs);
   const removeRef = useFlowStudioStore((s) => s.removeRef);
   const addRef = useFlowStudioStore((s) => s.addRef);
@@ -88,11 +92,11 @@ export function FlowComposer() {
 
   const [openSet, setOpenSet] = useState(false);
   const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
-  // Expand the prompt box while focused (typing) or hovered; collapse to one
-  // line when the pointer leaves AND it's not focused.
+  // Expand the prompt box while focused (typing) or manually toggled via the
+  // grow/collapse button; collapse to one line when neither holds.
   const [focused, setFocused] = useState(false);
-  const [hovered, setHovered] = useState(false);
-  const expanded = focused || hovered;
+  const [manualExpand, setManualExpand] = useState(false);
+  const expanded = focused || manualExpand;
   // Manual full-screen editor for the prompt (big distraction-free textarea).
   const [fullscreen, setFullscreen] = useState(false);
   const fsRef = useRef<HTMLTextAreaElement>(null);
@@ -110,8 +114,8 @@ export function FlowComposer() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [openSet]);
 
-  // Grow the prompt box while focused/hovered, collapse to one line when idle.
-  // (mirror follows via inset:0; CSS transition animates the height change.)
+  // Grow the prompt box while focused/manually-expanded, collapse to one line
+  // when idle. (mirror follows via inset:0; CSS transition animates the height change.)
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
@@ -123,12 +127,32 @@ export function FlowComposer() {
       if (mirrorRef.current) mirrorRef.current.scrollTop = 0;
       return;
     }
-    // Focused/hovered → grow to fit the prompt (incl. long pastes); cap at ~40%
+    // Focused/manually-expanded → grow to fit the prompt (incl. long pastes); cap at ~40%
     // of the viewport, then scroll. Keep in sync with .fc__input max-height.
     ta.style.height = "auto";
     const cap = Math.max(140, Math.round(window.innerHeight * 0.4));
     ta.style.height = `${Math.min(ta.scrollHeight, cap)}px`;
   }, [prompt, expanded]);
+
+  // Apply an externally-triggered insert (a grid card's "@" button, which runs
+  // in a different component and can't touch this textarea's DOM directly).
+  // Changing the React `value` alone doesn't move the browser's native caret,
+  // so once the new text lands, explicitly relocate it — then consume the
+  // one-shot signal so it doesn't reapply on the next unrelated render.
+  useEffect(() => {
+    if (pendingCaretApply === null) return;
+    const ta = taRef.current;
+    if (ta) {
+      // preventScroll: focusing an element the browser deems "off-screen"
+      // (e.g. below a long, scrolled grid) otherwise auto-scrolls the whole
+      // page to reveal it — jarring when the composer bar is already visible.
+      // setSelectionRange still scrolls the TEXTAREA'S OWN content to show
+      // the caret, which is the only scroll we actually want here.
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(pendingCaretApply, pendingCaretApply);
+    }
+    clearPendingCaretApply();
+  }, [pendingCaretApply, clearPendingCaretApply]);
 
   // Full-screen editor: focus it on open, close on Escape.
   useEffect(() => {
@@ -220,8 +244,10 @@ export function FlowComposer() {
 
   const pickMention = (e: MentionEntry) => {
     e.mediaIds.forEach(addRef);
-    const token = `@${e.name}`;
-    addComposerMention({ token, cover: e.cover, mediaIds: e.mediaIds });
+    // Registers the mention; if the display name collides with a DIFFERENT
+    // image/group already tagged, this comes back disambiguated ("@name 2") —
+    // use THAT text, not the raw requested name.
+    const { token } = addComposerMention({ token: `@${e.name}`, cover: e.cover, mediaIds: e.mediaIds });
     // Read the LIVE textarea value + caret (avoids stale React state that left a
     // stray "@" → "@@token"). Re-find the "@query" ending at the caret and
     // replace it wholesale with the token.
@@ -254,8 +280,10 @@ export function FlowComposer() {
     <div className="fc">
       {composerRefs.length > 0 && (
         <div className="fc__refs">
-          {composerRefs.map((m) => (
-            <span key={m} className="fc__refchip">
+          {composerRefs.map((m, i) => (
+            // Index in the key: the same image can now be attached more than
+            // once (duplicate chips), and mediaId alone would collide as a key.
+            <span key={`${m}-${i}`} className="fc__refchip">
               <img src={thumbUrl(m, 96)} alt="" loading="lazy" decoding="async" onClick={() => select(m)} />
               <button type="button" onClick={() => removeRef(m)} aria-label="Remove reference">
                 ✕
@@ -317,11 +345,7 @@ export function FlowComposer() {
           }}
         />
 
-        <div
-          className="fc__field"
-          onMouseEnter={() => setHovered(true)}
-          onMouseLeave={() => setHovered(false)}
-        >
+        <div className="fc__field">
           <textarea
             ref={taRef}
             className="fc__input"
@@ -330,6 +354,7 @@ export function FlowComposer() {
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             onChange={onChange}
+            onSelect={(e) => setComposerCaret(e.currentTarget.selectionStart ?? 0)}
             onScroll={() => {
               if (mirrorRef.current && taRef.current) mirrorRef.current.scrollTop = taRef.current.scrollTop;
             }}
@@ -357,9 +382,20 @@ export function FlowComposer() {
                     e.preventDefault();
                     const removeLen = before.endsWith(`${m.token} `) ? m.token.length + 1 : m.token.length;
                     const start = caret - removeLen;
-                    setPrompt(prompt.slice(0, start) + prompt.slice(caret));
+                    const nextPrompt = prompt.slice(0, start) + prompt.slice(caret);
+                    setPrompt(nextPrompt);
+                    // One mention entry can represent an image tagged SEVERAL
+                    // times (each tap inserts its own text occurrence but
+                    // shares one registry entry, since it's the same image).
+                    // Detach only the one ref this backspace removed; only
+                    // forget the mention once NO occurrence of its token is
+                    // left in the text — otherwise the remaining occurrences
+                    // would lose their pill highlighting even though their
+                    // images are still attached.
                     m.mediaIds.forEach(removeRef);
-                    removeComposerMention(m.token);
+                    if (!nextPrompt.includes(m.token)) {
+                      removeComposerMention(m.token);
+                    }
                     requestAnimationFrame(() => {
                       const t = taRef.current;
                       if (t) {
@@ -422,7 +458,12 @@ export function FlowComposer() {
               </div>
               <div className="fc__pop-section">
                 <label className="fc__pop-label">
-                  Resolution {cap !== "4K" && <span className="fc__muted">(4K: Pro only)</span>}
+                  {/* "Pro only" only makes sense for the Nano Banana family (switch
+                      model to unlock 4K); Seedream can't do 4K on ANY tier, so the
+                      hint would be misleading there — just omit it. */}
+                  Resolution {cap !== "4K" && modelProvider(settings.model) !== "avis" && (
+                    <span className="fc__muted">(4K: Pro only)</span>
+                  )}
                 </label>
                 <div className="fc__chips">
                   {FLOW_SIZES.map((sz) => (
@@ -456,6 +497,15 @@ export function FlowComposer() {
             </div>
           )}
         </div>
+
+        <button
+          type="button"
+          className="fc__icon fc__expand"
+          onClick={() => setManualExpand((v) => !v)}
+          title={manualExpand ? "Collapse prompt box" : "Expand prompt box"}
+        >
+          {manualExpand ? "⤡" : "⤢"}
+        </button>
 
         <button
           type="button"

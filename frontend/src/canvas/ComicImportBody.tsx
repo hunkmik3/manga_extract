@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useReactFlow } from "@xyflow/react";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
 import { useAppModeStore } from "../store/appMode";
-import { createNodesBulk, mediaUrl, uploadComicPages, type BulkNodeInput } from "../api/client";
+import { createNodesBulk, mediaDownloadUrl, mediaUrl, uploadComicPages, type BulkNodeInput } from "../api/client";
 import {
   createRequest,
   downstreamPageNodes,
@@ -181,9 +181,10 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       );
       const mid = result.mediaId as string | undefined;
       if (!mid) { setSpawnErr("Export failed"); return; }
+      const filename = `comic-all-panels-${data.shortId ?? rfId}.zip`;
       const a = document.createElement("a");
-      a.href = mediaUrl(mid);
-      a.download = `comic-all-panels-${data.shortId ?? rfId}.zip`;
+      a.href = mediaDownloadUrl(mid, filename);
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -220,9 +221,10 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       );
       const mid = result.mediaId as string | undefined;
       if (!mid) { setSpawnErr("Clean failed"); return; }
+      const filename = `bubbles-clean-${data.shortId ?? rfId}.zip`;
       const a = document.createElement("a");
-      a.href = mediaUrl(mid);
-      a.download = `bubbles-clean-${data.shortId ?? rfId}.zip`;
+      a.href = mediaDownloadUrl(mid, filename);
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();

@@ -15,13 +15,21 @@ export type AppMode = "manga" | "flow" | "bubble";
 
 /**
  * Flow-only deployment flag. Set `VITE_FLOW_ONLY=1` at build time (the team
- * deploy) and the whole app becomes Flow Studio: `/` serves Flow, the Manga
- * board is never reachable, and the "↤ Manga Extract" link is hidden. Unset
- * (normal dev) keeps both branches at `/` and `/flow`.
+ * deploy) and the whole app becomes Flow Studio: `/` serves Flow and the
+ * "↤ Manga Extract" link is hidden. One explicit SIDE DOOR stays open even in
+ * this mode: `/manga_extract` serves the Manga board (shared by URL only —
+ * nothing in the Flow UI links to it). Bubble stays off. Unset (normal dev)
+ * keeps all branches at `/`, `/flow` and `/bubble`.
  */
 export const FLOW_ONLY = import.meta.env.VITE_FLOW_ONLY === "1";
 
 function modeFromPath(): AppMode {
+  try {
+    // Side door — works in flow-only deploys too (checked before the flag).
+    if (window.location.pathname.startsWith("/manga_extract")) return "manga";
+  } catch {
+    /* fall through */
+  }
   if (FLOW_ONLY) return "flow";
   try {
     const p = window.location.pathname;
@@ -34,9 +42,15 @@ function modeFromPath(): AppMode {
 }
 
 function pushPath(mode: AppMode): void {
-  if (FLOW_ONLY) return; // single surface — never rewrite the URL
   try {
-    const path = mode === "flow" ? "/flow" : mode === "bubble" ? "/bubble" : "/";
+    let path: string;
+    if (FLOW_ONLY) {
+      // Flow owns every path except the /manga_extract side door; bubble is off.
+      if (mode === "bubble") return;
+      path = mode === "manga" ? "/manga_extract" : "/";
+    } else {
+      path = mode === "flow" ? "/flow" : mode === "bubble" ? "/bubble" : "/";
+    }
     if (window.location.pathname !== path) window.history.pushState({}, "", path);
   } catch {
     /* non-fatal */

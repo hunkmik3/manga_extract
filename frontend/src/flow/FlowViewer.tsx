@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { mediaUrl, thumbUrl, uploadComicSheet } from "../api/client";
-import { FLOW_MODELS, useFlowStudioStore, type FlowAsset } from "../store/flowStudio";
+import { mediaDownloadUrl, mediaUrl, thumbUrl, uploadComicSheet } from "../api/client";
+import { FLOW_MODELS, modelLabel as labelForModelId, useFlowStudioStore, type FlowAsset } from "../store/flowStudio";
 
 /**
  * Flow-style image viewer — a clean full-screen overlay opened by clicking a
@@ -367,7 +367,9 @@ export function FlowViewer() {
         }
       };
       img.onerror = () => resolve(null);
-      img.src = mediaUrl(mediaId);
+      // ?raw=1 keeps this same-origin (no CDN redirect) — drawing a cross-origin
+      // image would taint the canvas and break toBlob (see routes/media.py).
+      img.src = `${mediaUrl(mediaId)}?raw=1`;
     });
 
   const submitEdit = async () => {
@@ -450,7 +452,7 @@ export function FlowViewer() {
             📌
           </button>
         )}
-        <a className="fv__tool" title="Download" href={mediaUrl(mediaId)} download={`${mediaId}.png`}>
+        <a className="fv__tool" title="Download" href={mediaDownloadUrl(mediaId, `${mediaId}.png`)} download={`${mediaId}.png`}>
           ⬇
         </a>
         {asset && (
@@ -591,6 +593,14 @@ export function FlowViewer() {
           )}
         </div>
       </div>
+
+      {/* Which model generated this image (bottom-right, over the image but
+          fixed — a sibling of the zoom/pan stage so it never moves on zoom). */}
+      {asset?.modelUsed && (
+        <div className="fv__model" title={`Generated with ${labelForModelId(asset.modelUsed)}`}>
+          {labelForModelId(asset.modelUsed)}
+        </div>
+      )}
 
       {/* Zoom controls (bottom-left). */}
       <div className="fv__zoom" onPointerDown={(e) => e.stopPropagation()}>

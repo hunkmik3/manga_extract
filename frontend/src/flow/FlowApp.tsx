@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getFlowUsage, thumbUrl, type FlowUsage } from "../api/client";
 import { FLOW_ONLY, useAppModeStore } from "../store/appMode";
 import { useFlowProjectsStore } from "../store/flowProjects";
-import { CHAR_PREFIX, REF_PREFIX, SCENE_PREFIX, groupName, useFlowStudioStore, type GenJob } from "../store/flowStudio";
+import { CHAR_PREFIX, REF_PREFIX, SCENE_PREFIX, groupName, humanizeGenError, sanitizeErrorDetail, useFlowStudioStore, type GenJob } from "../store/flowStudio";
 import { FlowComposer } from "./FlowComposer";
 import { FlowViewer } from "./FlowViewer";
 
@@ -185,12 +185,23 @@ export function FlowApp() {
           <span className="fc-count">{gridAssets.length} items</span>
         </div>
 
-        {error && (
-          <div className="fc-banner fc-banner--err" onClick={clearError} role="alert">
-            ⚠ {error}
-            <span className="fc-banner__x">✕</span>
-          </div>
-        )}
+        {error && (() => {
+          const friendly = humanizeGenError(error);
+          const detail = sanitizeErrorDetail(error); // exact cause, backend vendor name masked
+          return (
+            <div className="fc-banner fc-banner--err" onClick={clearError} role="alert" title={detail}>
+              ⚠ {friendly ?? detail}
+              {/* Keep the exact cause (502, 413, safety, …) visible under the
+                  friendly line — with the provider name masked out. */}
+              {friendly && (
+                <div style={{ fontSize: "0.82em", opacity: 0.7, marginTop: 2, fontWeight: 400 }}>
+                  {detail}
+                </div>
+              )}
+              <span className="fc-banner__x">✕</span>
+            </div>
+          );
+        })()}
         {notice && (
           <div className="fc-banner fc-banner--info" onClick={clearNotice} role="status">
             ℹ {notice}
@@ -385,7 +396,7 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
   if (collapsed) {
     const title = [
       `Gemini: ${gToday}/${gQuota}`,
-      s ? `Seedream: ${usd(s.cost_today)} (${s.today} imgs)` : null,
+      s ? `Seedream: ${usd(s.cost_total)} (${s.total} imgs)` : null,
     ]
       .filter(Boolean)
       .join(" · ");
@@ -416,7 +427,7 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
           </div>
         )}
       </div>
-      {/* Seedream — pay-per-use, its own box showing money spent */}
+      {/* Seedream — pay-per-use, no daily reset: a running lifetime total */}
       {s && (
         <div
           className="fn__usage"
@@ -425,11 +436,9 @@ function FlowUsageBadge({ collapsed }: { collapsed: boolean }) {
         >
           <div className="fn__usage-row">
             <span>Seedream</span>
-            <span>{usd(s.cost_today)}</span>
+            <span>{usd(s.cost_total)}</span>
           </div>
-          <div className="fn__usage-sub">
-            {s.today} imgs today · total {usd(s.cost_total)}
-          </div>
+          <div className="fn__usage-sub">{s.total} imgs total</div>
         </div>
       )}
     </>
@@ -458,7 +467,7 @@ function GenPlaceholders() {
   return (
     <>
       {tiles.map(({ job, i }) => (
-        <div key={`gen-${i}`} className="fc-card fc-card--loading" style={{ aspectRatio: cssAspect(aspect) }}>
+        <div key={`gen-${job?.id ?? i}`} className="fc-card fc-card--loading" style={{ aspectRatio: cssAspect(aspect) }}>
           <span className="fc-load__icon" aria-hidden="true">🖼</span>
           <span className="fc-load__pct">{pcts[i] ?? 0}%</span>
           {job?.prompt && (

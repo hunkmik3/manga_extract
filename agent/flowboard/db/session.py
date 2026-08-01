@@ -71,6 +71,17 @@ def init_db() -> None:
                 )
                 conn.commit()
 
+        # Reference.model_used — records which image model produced a saved
+        # Flow Studio result (shown as a badge in the viewer). Existing rows
+        # default to NULL (unknown — predate this column). Idempotent ALTER.
+        if insp.has_table("reference"):
+            ref_cols = {c["name"] for c in insp.get_columns("reference")}
+            if "model_used" not in ref_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE reference ADD COLUMN model_used VARCHAR"
+                )
+                conn.commit()
+
     SQLModel.metadata.create_all(engine)
 
 

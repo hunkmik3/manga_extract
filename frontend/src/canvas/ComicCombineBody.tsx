@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent } from "react";
-import { ensureBoardProject, mediaUrl } from "../api/client";
+import { ensureBoardProject, mediaDownloadUrl, mediaUrl } from "../api/client";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
 import {
   addCharacter,
@@ -419,13 +419,17 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
     if (!mediaId || upscaling) return;
     const base = `comic-combine-${data.shortId ?? rfId}`;
     if (dlRes === "1K") {
-      triggerDownload(mediaUrl(mediaId), `${base}.png`);
+      const filename = `${base}.png`;
+      triggerDownload(mediaDownloadUrl(mediaId, filename), filename);
       return;
     }
     setUpscaling(true);
     const up = await upscaleMedia(mediaId, dlRes);
     setUpscaling(false);
-    if (up) triggerDownload(mediaUrl(up), `${base}-${dlRes}.jpg`);
+    if (up) {
+      const filename = `${base}-${dlRes}.jpg`;
+      triggerDownload(mediaDownloadUrl(up, filename), filename);
+    }
   }
 
   async function downloadCells(e: MouseEvent<HTMLButtonElement>) {
@@ -438,8 +442,9 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       cells.forEach((cid, i) => {
         if (typeof cid !== "string" || !cid) return;
         const delay = n++ * 250;
-        const url = mediaUrl(cid);
-        setTimeout(() => triggerDownload(url, `${base}-cell-${i + 1}.png`), delay);
+        const filename = `${base}-cell-${i + 1}.png`;
+        const url = mediaDownloadUrl(cid, filename);
+        setTimeout(() => triggerDownload(url, filename), delay);
       });
       return;
     }
@@ -450,7 +455,8 @@ export function ComicCombineBody({ rfId, data }: { rfId: string; data: Flowboard
       if (typeof cid !== "string" || !cid) continue;
       const up = await upscaleMedia(cid, dlRes);
       if (up) {
-        triggerDownload(mediaUrl(up), `${base}-cell-${i + 1}-${dlRes}.jpg`);
+        const filename = `${base}-cell-${i + 1}-${dlRes}.jpg`;
+        triggerDownload(mediaDownloadUrl(up, filename), filename);
         await new Promise((r) => setTimeout(r, 250));
       }
     }
