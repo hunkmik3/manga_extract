@@ -42,7 +42,7 @@ def _load():
     try:
         from ultralytics import YOLO
     except Exception as exc:  # noqa: BLE001
-        _load_failed = f"ultralytics/torch not installed ({exc}); run: pip install -e '.[ml]'"
+        _load_failed = f'ultralytics/torch not installed ({exc}); run: uv pip install --python .venv/bin/python -e ".[ml]"'
         raise MLUnavailable(_load_failed) from exc
     try:
         from huggingface_hub import hf_hub_download
@@ -93,17 +93,22 @@ def _cluster(crops_bgr: list[np.ndarray]) -> list[int]:
         return [0]
     import cv2
     from PIL import Image
-    from imgutils.metrics import ccip_clustering
+    from imgutils.metrics import ccip_batch_differences, ccip_default_clustering_params
+    from sklearn.cluster import OPTICS
 
     imgs = [Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in crops_bgr]
     try:
         # min_samples=2: a character appearing ≥2× still forms a cluster (the
         # optics default ~5 misses everything on shorter comics). CCIP's tight
         # eps keeps clusters single-identity.
-        return list(ccip_clustering(imgs, method="optics", min_samples=2))
+        eps, _ = ccip_default_clustering_params(method="optics")
+        distances = np.asarray(ccip_batch_differences(imgs), dtype=np.float32)
+        np.fill_diagonal(distances, 0.0)
+        clustering = OPTICS(max_eps=eps, min_samples=2, metric="precomputed").fit(distances)
+        return [int(label) for label in clustering.labels_]
     except Exception as exc:  # noqa: BLE001
-        logger.warning("ccip_clustering failed: %s", exc)
-        return [-1] * len(crops_bgr)
+        logger.exception("ccip_clustering failed")
+        raise RuntimeError(f"ccip_clustering_failed: {exc}") from exc
 
 
 def match_character(panel_bgr: np.ndarray, samples: list[tuple[str, np.ndarray]], threshold: float = 0.45) -> Optional[str]:

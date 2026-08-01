@@ -13,14 +13,28 @@ CLEAN_PROMPT = (
     "Match the original art style, line work, colors, lighting, and shading exactly. Do "
     "NOT change, move, or redraw any character, object, or part of the background that is "
     "not covered by text — keep everything else identical to the input. Do NOT add any new "
-    "text, watermark, or signature. Output a clean, high-resolution image."
+    "text, watermark, or signature. Do NOT leave any white or light halo, glowing rim, "
+    "outline, fringe, or cut-out seam around the characters or objects — the background must "
+    "continue seamlessly right up to their edges, with natural contact and shading, so nothing "
+    "looks pasted on. Output a clean, high-resolution image."
 )
 
 # Appended to CLEAN_PROMPT when the panel should fill a 9:16 vertical frame.
 EXTEND_9_16 = (
-    " Additionally, extend the scene to fill a full 9:16 vertical frame: naturally continue "
-    "the environment and background into the empty areas above and below, keeping the "
-    "original subject and framing intact and well-composed."
+    " Additionally, extend the scene to fill the ENTIRE 9:16 vertical frame, edge to edge: "
+    "naturally continue the environment, the background, and (where natural) the subject's body "
+    "into the areas above and below, keeping the original subject and framing intact and "
+    "well-composed. If the input shows blurred, stretched, or smeared bands at the top/bottom, "
+    "they are placeholder padding — PAINT OVER them completely with real, finished scene "
+    "content. Solid black / dark hatched LETTERBOX BARS spanning the full width at the very top "
+    "or bottom of the input are cinematic framing, NOT scene content: remove them and continue "
+    "the artwork through that space instead. The final image must be 100% finished artwork "
+    "across the whole 9:16 canvas: NO letterbox bars, NO black/white/empty bands, NO unfinished "
+    "placeholder areas. STYLE LOCK for everything newly painted: match the original panel's "
+    "exact art style — same line work, cel-shaded anime/manhwa rendering, same palette and "
+    "level of detail. Never shift toward photorealism, western-comic rendering, or a different "
+    "character design. Blend the extended areas seamlessly into the original art with no "
+    "visible border, seam, or pale halo where the new and original regions meet."
 )
 
 # Phase 5 — re-render as a cinematic anime still while preserving the scene.
@@ -44,7 +58,9 @@ ENHANCE_PROMPT = (
     "and never let it overpower the subjects.\n\n"
     "DO NOT: add any text, speech bubbles, captions, sound effects, logos, watermarks, or "
     "signatures. Keep it 2D hand-drawn anime — no realism, no 3D, no photographic look. Do "
-    "not alter the characters' identities or redesign them.\n\n"
+    "not alter the characters' identities or redesign them. Do not leave any white or light "
+    "halo, glowing outline, fringe, or cut-out seam around characters or objects — blend them "
+    "into the background seamlessly with natural contact shadows.\n\n"
     "Output a clean, high-resolution image."
 )
 
@@ -53,6 +69,207 @@ REFERENCE_CLAUSE = (
     " Use the additional reference images to keep character designs, costumes, and the "
     "setting consistent."
 )
+
+COMBINE_CHARACTER_REFERENCE_CLAUSE = (
+    " Use the additional reference images only as character identity and costume references. "
+    "Do not copy their backgrounds, camera angles, poses, layouts, or scene content into this "
+    "panel. The source panel remains the ground truth."
+)
+
+# ── Axis-aware OVERRIDE clauses ───────────────────────────────────────────────
+# The default combine/regen prompt orders the model to stay 100% faithful to the
+# source panel, so an attached canon reference is only a gentle identity hint and
+# the source wins every disagreement. That is correct for the common case (source
+# already on-model). But on the panels canon exists to FIX — an off-model drawing,
+# an outfit-change boundary, an art restyle — the source must NOT win. These
+# clauses invert authority for a NAMED axis only: the source keeps pose / layout /
+# camera / composition, while the reference becomes the design of record for that
+# axis and the model must match it even where the source panel differs. Selected
+# per panel via ``combine_reference_clause(override_axes=[...])``.
+OVERRIDE_AXES = ("identity", "outfit", "style")
+
+# The single most important guard: a strong reference (especially a full-body
+# character sheet) tends to drag its OWN framing/zoom/pose into an empty or
+# tightly-cropped source panel — e.g. a close-up of a face gets redrawn as the
+# reference's full body. This locks the SHOT to the source so the reference only
+# governs how the character LOOKS, never the camera. Appended whenever refs are
+# attached, in both the gentle and the override paths.
+_FRAMING_LOCK = (
+    " CRITICAL — keep the SOURCE panel's exact shot scale, framing, crop, and the direction the "
+    "character faces: if the source is a close-up the result stays that close-up; if the source "
+    "shows the back of the head, a profile, or the character turned away, the result MUST keep that "
+    "exact orientation. Do NOT zoom out, change the camera distance, add the rest of the body, "
+    "rotate the character to reveal the face, or adopt the reference image's framing, pose, facing "
+    "direction, or how much of the character is shown. The reference guides ONLY how the character "
+    "looks (face, hair, design), never the shot, the orientation, or the amount of body visible."
+)
+
+_OVERRIDE_PREAMBLE = (
+    " IMPORTANT: the source panel's drawing is OFF-MODEL and must be CORRECTED to match the "
+    "reference image(s). Treat the source panel as ground truth ONLY for pose, body position, "
+    "camera angle, framing, shot scale, the direction the character faces, layout, action, and "
+    "overall composition — not for the attributes below."
+)
+_OVERRIDE_TAIL = (
+    " Do not otherwise copy the reference images' backgrounds, poses, camera angles, framing, or "
+    "scene content into this panel."
+)
+
+
+def _identity_override(char_name: str | None) -> str:
+    who = f" the character {char_name}" if char_name else " the character"
+    return (
+        f" The reference image is the authoritative design for{who}: correct ONLY the parts of the "
+        "character that are ACTUALLY VISIBLE in the source (face, facial features, eye shape, "
+        "hairstyle, hair colour, build) so they match the reference's design. Do NOT add anything "
+        "the source does not show: if the source shows the back of the head, a profile, or the "
+        "character facing away, KEEP that orientation and do NOT rotate them to reveal the face — "
+        "just render whatever IS visible on-model. Stay within the source's framing and shot scale."
+    )
+
+
+def _outfit_override(outfit: str | None) -> str:
+    garment = f" ({outfit})" if outfit else ""
+    return (
+        f" If clothing is visible in the source panel, replace it with the outfit{garment} shown in "
+        "the reference image, keeping the character's face, hair, pose, framing, and composition "
+        "unchanged. Do not zoom out or add the body just to show the outfit."
+    )
+
+
+_STYLE_OVERRIDE = (
+    " Match the line weight, shading, rendering technique, and colour palette of the style "
+    "reference image."
+)
+
+
+# Background types where an environment MUST NOT be imposed — the blank /
+# speed-line / dramatic-band backdrop is an intentional storytelling device, not
+# a missing background. The Director's per-panel classifier tags these; combine/
+# regen then skip the environment clause for them.
+NO_ENV_BG_TYPES = ("flat-band", "abstract-action")
+
+
+def environment_clause(env_descriptor: str | None = None) -> str:
+    """Clause that anchors a panel's SETTING to its scene's environment, so every
+    panel of one sequence shares a consistent background (e.g. all airport panels
+    show the same airport). Applies the setting to whatever background is visible
+    or newly extended — never adds characters/props not in the source, never
+    touches the panel's own pose/framing."""
+    desc = env_descriptor.strip() if isinstance(env_descriptor, str) else ""
+    if not desc:
+        return ""
+    return (
+        f" SCENE SETTING — this panel takes place here: {desc}. Render any visible background, and "
+        "any area you extend to fill the frame, to match this setting consistently with the rest of "
+        "the scene. Keep the panel's own characters, poses, framing, and composition unchanged; do "
+        "NOT introduce new characters or objects that are not in the source panel."
+    )
+
+
+def mood_clause(mood: str | None) -> str:
+    """A light atmosphere/grade modifier for a panel, from the scene's mood tag.
+    Only KNOWN moods emit a clause (free-text VLM moods are ignored) so arbitrary
+    model output never leaks into the prompt. Flashback panels keep their pale
+    wash — an explicit storytelling signal that a full render would erase."""
+    m = mood.strip().lower() if isinstance(mood, str) else ""
+    if not m:
+        return ""
+    if "flashback" in m or "memory" in m or "pale" in m:
+        return (
+            " Render this panel as a flashback/memory: a pale, soft, desaturated wash with lower "
+            "contrast and muted colours — keep this faded look, do not render it as a full-saturation present-day scene."
+        )
+    if "night" in m or "dark" in m:
+        return " Light this panel as a night scene: cool, low-key lighting and muted tones."
+    if "sunset" in m or "dusk" in m or "golden" in m:
+        return " Light this panel with warm golden-hour / dusk lighting."
+    return ""
+
+
+# Final restyle pass — applied as its OWN step to an already-cleaned, extended
+# 9:16 panel, so the content/composition is locked and only the art style
+# changes. Pairs with style_frame_clause (the target style ref + descriptor).
+RESTYLE_PROMPT = (
+    "Re-render this finished comic / anime panel in a different ART STYLE while keeping the image's "
+    "content completely unchanged. Keep EXACTLY the same: every character and their identity, pose, "
+    "expression, and position; the camera angle, framing, and composition; the background, props, "
+    "and the whole scene; the lighting direction; the 9:16 frame. Do NOT add, remove, move, or "
+    "redraw any character or object, and do NOT change what is happening. Change ONLY the rendering "
+    "style."
+)
+
+
+def style_frame_clause(descriptor: str | None = None, *, has_ref: bool = False) -> str:
+    """Clause that pins a project-wide STYLE FRAME onto a panel render — a
+    uniform target art style applied across every panel of the chapter.
+
+    The style is supplied as a reference IMAGE (``has_ref``), a text
+    ``descriptor``, or both. Critically it must apply ONLY to the rendering
+    style, never drag the reference's subject/composition into the panel (the
+    same leak guard as character refs)."""
+    desc = descriptor.strip() if isinstance(descriptor, str) else ""
+    if has_ref:
+        mid = f" Target style notes: {desc}." if desc else ""
+        return (
+            " Render the FINAL image in the art style of the attached STYLE-REFERENCE image: match "
+            "its line weight, shading and rendering technique, colour palette, lighting treatment, "
+            "and level of finish." + mid + " Use the style reference ONLY for visual style — do NOT "
+            "copy its subject, characters, poses, composition, or background into this panel."
+        )
+    if desc:
+        return (
+            f" Render the FINAL image in this target art style: {desc}. Keep the source panel's own "
+            "content, characters, pose, and composition; change only the rendering style."
+        )
+    return ""
+
+
+def _char_sentence(char_name: str | None, char_desc: str | None) -> str:
+    """Verbatim character anchor appended to every prompt that carries refs.
+    Reusing the EXACT same descriptor wording across panels measurably improves
+    cross-panel consistency (prompt-token consistency), so this is built from
+    stored fields — never paraphrased per panel."""
+    if not char_name and not char_desc:
+        return ""
+    if char_name and char_desc:
+        return f" The character is {char_name}: {char_desc}"
+    return f" The character is {char_name}." if char_name else f" The character: {char_desc}"
+
+
+def combine_reference_clause(
+    *,
+    char_name: str | None = None,
+    char_desc: str | None = None,
+    outfit: str | None = None,
+    override_axes: object = None,
+) -> str:
+    """Build the reference clause appended to a combine/regen prompt when refs are
+    attached.
+
+    Default (``override_axes`` empty/None): the gentle identity+costume hint —
+    refs guide identity, the source panel stays ground truth.
+
+    With ``override_axes`` (a subset of :data:`OVERRIDE_AXES`): authority is
+    inverted for exactly those axes — the reference becomes the design of record
+    for identity / outfit / style while the source keeps pose, layout, and
+    composition. ``char_name`` / ``outfit`` are woven into the wording so the
+    model knows who and what.
+    """
+    axes = [a for a in OVERRIDE_AXES if isinstance(override_axes, (list, tuple, set)) and a in override_axes]
+    if not axes:
+        return COMBINE_CHARACTER_REFERENCE_CLAUSE + _FRAMING_LOCK + _char_sentence(char_name, char_desc)
+    parts = [_OVERRIDE_PREAMBLE]
+    if "identity" in axes:
+        parts.append(_identity_override(char_name))
+    if "outfit" in axes:
+        parts.append(_outfit_override(outfit))
+    if "style" in axes:
+        parts.append(_STYLE_OVERRIDE)
+    parts.append(_FRAMING_LOCK)
+    parts.append(_char_sentence(char_name, char_desc))
+    parts.append(_OVERRIDE_TAIL)
+    return "".join(parts)
 
 # Combine 4 panels (pre-stitched into a rough 2×2) into one clean vertical 9:16
 # storyboard image: remove text, keep characters 100% faithful, extend only

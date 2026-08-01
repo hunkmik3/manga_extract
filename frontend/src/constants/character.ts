@@ -9,18 +9,18 @@
 // injected into the dispatched prompt text.
 
 export const CHARACTER_GENDERS = [
-  { key: "male", label: "Nam", tag: "male" },
-  { key: "female", label: "Nữ", tag: "female" },
+  { key: "male", label: "Male", tag: "male" },
+  { key: "female", label: "Female", tag: "female" },
 ] as const;
 
 export const CHARACTER_COUNTRIES = [
-  { key: "vn", label: "Việt Nam", tag: "Vietnamese" },
-  { key: "jp", label: "Nhật Bản", tag: "Japanese" },
-  { key: "kr", label: "Hàn Quốc", tag: "Korean" },
-  { key: "cn", label: "Trung Quốc", tag: "Chinese" },
-  { key: "th", label: "Thái Lan", tag: "Thai" },
-  { key: "us", label: "Mỹ", tag: "American" },
-  { key: "fr", label: "Pháp", tag: "French" },
+  { key: "vn", label: "Vietnam", tag: "Vietnamese" },
+  { key: "jp", label: "Japan", tag: "Japanese" },
+  { key: "kr", label: "South Korea", tag: "Korean" },
+  { key: "cn", label: "China", tag: "Chinese" },
+  { key: "th", label: "Thailand", tag: "Thai" },
+  { key: "us", label: "USA", tag: "American" },
+  { key: "fr", label: "France", tag: "French" },
 ] as const;
 
 // Vibe presets drive everything *except* framing: makeup/grooming, hair,

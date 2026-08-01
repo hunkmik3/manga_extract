@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useBoardStore, type FlowboardNodeData, type FlowNode } from "../store/board";
 import { useGenerationStore } from "../store/generation";
-import { mediaUrl, patchEdge, patchNode, uploadImage, uploadImageFromUrl } from "../api/client";
+import { mediaDownloadUrl, mediaUrl, patchEdge, patchNode, uploadImage, uploadImageFromUrl } from "../api/client";
 import { requestAutoBrief } from "../api/autoBrief";
 import { useReferencesStore } from "../store/references";
 import {
@@ -1542,14 +1542,15 @@ export function NodeCard(props: NodeProps<FlowNode>) {
     if (ids.length === 0) return;
     const safeTitle = (data.title || data.type).replace(/[^A-Za-z0-9_-]+/g, "_");
     const ext = downloadExt(data.type);
-    // `<a download>` only honours the suggested filename when the resource
-    // is same-origin — `/media/<id>` *is* same-origin (proxied by FastAPI),
-    // so the title-based filename sticks.
+    // Keep downloads on the same-origin FastAPI route. Public viewers may use
+    // a CDN redirect for preview, but `download=1` suppresses that redirect and
+    // lets the backend send Content-Disposition: attachment.
     ids.forEach((mid, i) => {
       const a = document.createElement("a");
-      a.href = mediaUrl(mid);
       const suffix = ids.length > 1 ? `-${i + 1}` : "";
-      a.download = `${safeTitle}-${data.shortId}${suffix}.${ext}`;
+      const filename = `${safeTitle}-${data.shortId}${suffix}.${ext}`;
+      a.href = mediaDownloadUrl(mid, filename);
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();

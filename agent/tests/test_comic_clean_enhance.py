@@ -42,6 +42,25 @@ async def test_clean_panel_uses_clean_prompt_and_returns_media():
 
 
 @pytest.mark.asyncio
+async def test_clean_panel_variant_count_returns_all_media_ids():
+    """x4: clean asks the bridge for 4 candidates and returns them in mediaIds
+    (mediaId = the first). Uses edit_image_variants (not edit_image)."""
+    src = _ingest_source(300, 500)
+    variants = AsyncMock(return_value=[_png(300, 500) for _ in range(4)])
+    with patch("flowboard.services.comic.bridge.edit_image_variants", variants):
+        result, err = await _handle_clean_panel(
+            {"project_id": "proj1", "source_media_id": src, "variant_count": 4}
+        )
+    assert err is None
+    assert variants.await_count == 1
+    assert variants.await_args.kwargs["variant_count"] == 4
+    assert len(result["mediaIds"]) == 4
+    assert result["mediaId"] == result["mediaIds"][0]
+    for mid in result["mediaIds"]:
+        assert media_service.status(mid).get("available") is True
+
+
+@pytest.mark.asyncio
 async def test_clean_panel_extend_916_pads_and_requests_portrait():
     src = _ingest_source(400, 400)  # square source
     edit = AsyncMock(return_value=_png(400, 400))  # model returns square

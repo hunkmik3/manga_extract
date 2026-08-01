@@ -121,3 +121,42 @@ async def test_handler_rejects_bad_detector(tmp_path):
     from flowboard.worker.processor import _handle_extract_panels
     result, err = await _handle_extract_panels({"folder": str(tmp_path), "detector": "bogus"})
     assert err == "invalid_detector:bogus"
+
+
+def test_detect_panels_hybrid_backfills_panels_ml_missed():
+    """ML gives the true (full) panel extents but MISSES a band; the heuristic
+    band that ML left uncovered is backfilled, the one ML covers is dropped."""
+    img = np.zeros((4000, 1280, 3), np.uint8)
+    ml_boxes = [(0, 2000, 1280, 800)]                       # ML: creature panel (full width)
+    wt_boxes = [(80, 0, 780, 1300), (280, 2100, 660, 700)]  # heuristic: missed top panel + cropped creature
+    with patch.object(panel_ml, "detect_panels_ml", return_value=ml_boxes), \
+         patch.object(P, "detect_panels_webtoon", return_value=wt_boxes):
+        boxes = P.detect_panels_hybrid(img)
+    assert (0, 2000, 1280, 800) in boxes        # ML's full extent kept
+    assert (80, 0, 780, 1300) in boxes          # uncovered band backfilled
+    assert (280, 2100, 660, 700) not in boxes   # already covered by ML → no duplicate
+    assert len(boxes) == 2
+
+
+def test_detect_panels_hybrid_falls_back_to_heuristic_without_ml():
+    img = np.zeros((4000, 1280, 3), np.uint8)
+    wt_boxes = [(0, 0, 1280, 1000)]
+    with patch.object(panel_ml, "detect_panels_ml", side_effect=panel_ml.MLUnavailable("no deps")), \
+         patch.object(P, "detect_panels_webtoon", return_value=wt_boxes):
+        assert P.detect_panels_hybrid(img) == wt_boxes
+
+
+def test_detect_boxes_hybrid_dispatch():
+    img = np.zeros((4000, 1280, 3), np.uint8)
+    with patch.object(P, "detect_panels_hybrid", return_value=[(1, 2, 3, 4)]) as h:
+        boxes = P.detect_boxes(img, detector="hybrid")
+    h.assert_called_once()
+    assert boxes == [(1, 2, 3, 4)]
+
+
+def test_detect_boxes_auto_tall_uses_hybrid():
+    img = np.zeros((4000, 1000, 3), np.uint8)  # H/W = 4 ≥ WEBTOON_ASPECT → webtoon path
+    with patch.object(P, "detect_panels_hybrid", return_value=[(0, 0, 10, 10)]) as h:
+        boxes = P.detect_boxes(img, detector="auto")
+    h.assert_called_once()
+    assert boxes == [(0, 0, 10, 10)]

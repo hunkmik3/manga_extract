@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useBoardStore } from "../store/board";
+import { useAppModeStore } from "../store/appMode";
 import { AccountPanel } from "./AccountPanel";
 import {
   getFlowSyncStatus,
@@ -18,6 +19,7 @@ export function ProjectSidebar() {
   const activeId = useBoardStore((s) => s.boardId);
   const switchBoard = useBoardStore((s) => s.switchBoard);
   const createNewBoard = useBoardStore((s) => s.createNewBoard);
+  const setAppMode = useAppModeStore((s) => s.setMode);
   const deleteBoardById = useBoardStore((s) => s.deleteBoardById);
   const renameBoard = useBoardStore((s) => s.renameBoard);
 
@@ -214,6 +216,14 @@ export function ProjectSidebar() {
       </div>
       {!collapsed && (
         <>
+          <button
+            type="button"
+            className="project-sidebar__flow-cta"
+            onClick={() => setAppMode("flow")}
+            title="Open GiantFlow — generate Google Flow-style images via API"
+          >
+            ✦ GiantFlow
+          </button>
           <div className="project-sidebar__row">
             <button
               type="button"
@@ -280,7 +290,7 @@ export function ProjectSidebar() {
                         onClick={() => switchBoard(b.id)}
                         title={
                           isOrphan
-                            ? `${b.name} — Flow project ${status?.flow_project_id ?? ""} không tồn tại trên Google Flow. Click ⋯ → Rebind to re-link.`
+                            ? `${b.name} — Flow project ${status?.flow_project_id ?? ""} does not exist on Google Flow. Click ⋯ → Rebind to re-link.`
                             : b.name
                         }
                       >
@@ -357,9 +367,9 @@ export function ProjectSidebar() {
               Delete project?
             </h2>
             <p className="project-modal__hint">
-              <strong>"{deleteTarget.name}"</strong> sẽ bị xoá vĩnh viễn cùng
-              với tất cả nodes, edges, generations, và assets bên trong. Không
-              thể khôi phục.
+              <strong>"{deleteTarget.name}"</strong> will be permanently deleted
+              along with all its nodes, edges, generations, and assets. This
+              cannot be undone.
             </p>
             <div className="project-modal__actions">
               <button
@@ -402,7 +412,7 @@ export function ProjectSidebar() {
               New project
             </h2>
             <p className="project-modal__hint">
-              Tên project hiển thị trong sidebar. Có thể đổi sau.
+              The project name shown in the sidebar. You can change it later.
             </p>
             <input
               ref={newDialogInputRef}

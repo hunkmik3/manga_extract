@@ -7,6 +7,7 @@ import {
   patchBoard as apiPatchBoard,
   deleteBoard as apiDeleteBoard,
   createNode,
+  createNodesBulk,
   patchNode,
   deleteNode,
   createEdge,
@@ -98,6 +99,15 @@ export interface FlowboardNodeData extends Record<string, unknown> {
 
 export type FlowNode = Node<FlowboardNodeData>;
 
+/** A recorded deletion that {@link BoardState.undo} can replay. Nodes are
+ * captured by value (type/pos/data) — they're recreated with NEW ids, and the
+ * edges are remapped (a surviving endpoint keeps its id). */
+interface DeleteUndoEntry {
+  nodes: Array<{ rfId: string; type: NodeType; x: number; y: number; data: Record<string, unknown> }>;
+  edges: Array<{ source: string; target: string; sourceVariantIdx: number | null }>;
+}
+const MAX_UNDO = 25;
+
 // Per-edge data we attach to ReactFlow's `Edge.data` so dispatch and
 // edge-rendering paths can read it without a round-trip through the
 // backend. `sourceVariantIdx` mirrors `EdgeDTO.source_variant_idx`.
@@ -177,11 +187,12 @@ function nodeFromDto(n: {
 // ── Persisted active-board id ─────────────────────────────────────────────
 // Survives page reloads so refreshing on project #4 doesn't kick the user
 // back to project #1. localStorage is fine here — single-user, single-host.
-const ACTIVE_BOARD_KEY = "flowboard.activeBoardId";
+// Per-kind key so the Manga and Bubble workspaces remember their own active board.
+const activeBoardKey = (kind: string) => `flowboard.activeBoardId.${kind}`;
 
-function loadPersistedBoardId(): number | null {
+function loadPersistedBoardId(kind: string): number | null {
   try {
-    const raw = localStorage.getItem(ACTIVE_BOARD_KEY);
+    const raw = localStorage.getItem(activeBoardKey(kind));
     if (raw === null) return null;
     const n = parseInt(raw, 10);
     return Number.isFinite(n) && n > 0 ? n : null;
@@ -190,10 +201,10 @@ function loadPersistedBoardId(): number | null {
   }
 }
 
-function persistBoardId(id: number | null): void {
+function persistBoardId(id: number | null, kind: string): void {
   try {
-    if (id === null) localStorage.removeItem(ACTIVE_BOARD_KEY);
-    else localStorage.setItem(ACTIVE_BOARD_KEY, String(id));
+    if (id === null) localStorage.removeItem(activeBoardKey(kind));
+    else localStorage.setItem(activeBoardKey(kind), String(id));
   } catch {
     // Storage disabled / quota exceeded — non-fatal, just lose persistence.
   }
@@ -203,6 +214,9 @@ function persistBoardId(id: number | null): void {
 interface BoardState {
   boardId: number | null;
   boardName: string;
+  // Which workspace these boards belong to: "manga" (panel extraction) or
+  // "bubble" (speech-bubble extraction). Drives listBoards/createBoard kind.
+  boardKind: string;
   // Lightweight summary list rendered by the ProjectSidebar — full node /
   // edge content lives only on the active board to keep memory bounded.
   boards: Board[];
@@ -210,8 +224,11 @@ interface BoardState {
   edges: Edge[];
   loading: boolean;
   error: string | null;
+  // Undo stack for destructive actions (currently node/edge deletions). Each
+  // entry can recreate what was removed. Not persisted — session-only.
+  undoStack: DeleteUndoEntry[];
 
-  loadInitialBoard(): Promise<void>;
+  loadInitialBoard(kind?: string): Promise<void>;
   refreshBoardState(): Promise<void>;
   refreshBoardList(): Promise<void>;
   renameBoard(name: string): Promise<void>;
@@ -267,31 +284,41 @@ interface BoardState {
     nodes: Array<{ id: number; type: NodeType; x: number; y: number; short_id: string; data: Record<string, unknown>; status: NodeStatus }>,
     edges: Array<{ id: number; source_id: number; target_id: number; source_variant_idx?: number | null }>,
   ): void;
+  /** Snapshot the given nodes (+ their touching edges) onto the undo stack
+   * BEFORE they're deleted, so {@link undo} can recreate them. */
+  recordDeleteUndo(removedRfIds: string[]): void;
+  /** Undo the last recorded deletion: recreate the nodes (new ids) + edges,
+   * remapping endpoints. No-op when the stack is empty. */
+  undo(): Promise<void>;
   clearError(): void;
 }
 
 export const useBoardStore = create<BoardState>((set, get) => ({
   boardId: null,
   boardName: "",
+  boardKind: "manga",
   boards: [],
   nodes: [],
   edges: [],
   loading: false,
   error: null,
+  undoStack: [],
 
-  async loadInitialBoard() {
-    set({ loading: true, error: null });
+  async loadInitialBoard(kind = "manga") {
+    // Switching workspace (manga ⇄ bubble) reloads this kind's boards. Clear the
+    // current board immediately so the old workspace doesn't flash through.
+    set({ loading: true, error: null, boardKind: kind, boardId: null, nodes: [], edges: [] });
     try {
-      let boards = await listBoards();
+      let boards = await listBoards(kind);
       // Prefer the user's last-active board if it still exists; fall back
       // to the first board in the list. Without this, refresh always
       // snapped back to boards[0] regardless of what was selected before.
-      const persistedId = loadPersistedBoardId();
+      const persistedId = loadPersistedBoardId(kind);
       let board =
         (persistedId !== null && boards.find((b) => b.id === persistedId)) ||
         boards[0];
       if (!board) {
-        board = await createBoard("Untitled");
+        board = await createBoard("Untitled", kind);
         boards = [board];
       }
       const detail = await getBoard(board.id);
@@ -307,8 +334,9 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         nodes,
         edges,
         loading: false,
+        undoStack: [], // undo history is per-board
       });
-      persistBoardId(detail.board.id);
+      persistBoardId(detail.board.id, kind);
     } catch (err) {
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -316,7 +344,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   async refreshBoardList() {
     try {
-      const boards = await listBoards();
+      const boards = await listBoards(get().boardKind);
       set({ boards });
     } catch {
       // non-fatal
@@ -336,8 +364,9 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         nodes,
         edges,
         loading: false,
+        undoStack: [], // undo history is per-board
       });
-      persistBoardId(detail.board.id);
+      persistBoardId(detail.board.id, get().boardKind);
     } catch (err) {
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -345,7 +374,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   async createNewBoard(name) {
     try {
-      const board = await createBoard(name || "Untitled");
+      const board = await createBoard(name || "Untitled", get().boardKind);
       // Add to list (front of list so the newly-created project shows up
       // at the top of the sidebar) and switch to it.
       set((s) => ({ boards: [board, ...s.boards] }));
@@ -373,7 +402,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         await get().switchBoard(remaining[0].id);
       } else {
         try {
-          const board = await createBoard("Untitled");
+          const board = await createBoard("Untitled", get().boardKind);
           set({ boards: [board] });
           await get().switchBoard(board.id);
         } catch (err) {
@@ -674,5 +703,69 @@ export const useBoardStore = create<BoardState>((set, get) => ({
       nodes: [...s.nodes, ...nodeDtos.map(nodeFromDto)],
       edges: [...s.edges, ...edgeDtos.map(edgeFromDto)],
     })),
+
+  recordDeleteUndo: (removedRfIds) => {
+    const ids = new Set(removedRfIds);
+    const s = get();
+    const nodes = s.nodes
+      .filter((n) => ids.has(n.id))
+      .map((n) => ({
+        rfId: n.id,
+        type: n.data.type as NodeType,
+        x: Math.round(n.position.x),
+        y: Math.round(n.position.y),
+        data: { ...n.data },
+      }));
+    if (nodes.length === 0) return;
+    // Every edge touching a removed node is dropped server-side too → capture it.
+    const edges = s.edges
+      .filter((e) => ids.has(e.source) || ids.has(e.target))
+      .map((e) => ({
+        source: e.source,
+        target: e.target,
+        sourceVariantIdx: ((e.data as FlowboardEdgeData | undefined)?.sourceVariantIdx) ?? null,
+      }));
+    set((st) => ({ undoStack: [...st.undoStack.slice(-(MAX_UNDO - 1)), { nodes, edges }] }));
+  },
+
+  async undo() {
+    const { boardId, undoStack } = get();
+    if (boardId === null || undoStack.length === 0) return;
+    const entry = undoStack[undoStack.length - 1];
+    set((s) => ({ undoStack: s.undoStack.slice(0, -1) }));
+    try {
+      // Recreate the nodes (new ids), preserving order so we can remap edges.
+      const res = await createNodesBulk(
+        boardId,
+        entry.nodes.map((n) => ({ type: n.type, x: n.x, y: n.y, data: n.data })),
+      );
+      const idMap = new Map<string, string>();
+      entry.nodes.forEach((n, i) => {
+        if (res.nodes[i]) idMap.set(n.rfId, String(res.nodes[i].id));
+      });
+      get().appendNodesBulk(res.nodes, []);
+      // Recreate edges, remapping each endpoint (a surviving endpoint keeps its
+      // id). Skip an edge whose endpoint no longer exists anywhere.
+      const alive = new Set(get().nodes.map((n) => n.id));
+      for (const e of entry.edges) {
+        const src = idMap.get(e.source) ?? e.source;
+        const tgt = idMap.get(e.target) ?? e.target;
+        if (!alive.has(src) || !alive.has(tgt)) continue;
+        try {
+          const dto = await createEdge({
+            board_id: boardId,
+            source_id: parseInt(src, 10),
+            target_id: parseInt(tgt, 10),
+            source_variant_idx: e.sourceVariantIdx ?? undefined,
+          });
+          set((s) => ({ edges: [...s.edges, edgeFromDto(dto)] }));
+        } catch {
+          // ignore an individual edge that can't be recreated
+        }
+      }
+    } catch (err) {
+      console.error("undo failed", err);
+    }
+  },
   clearError: () => set({ error: null }),
 }));

@@ -146,6 +146,55 @@ def test_media_bytes_rejects_path_traversal(client):
     assert r.status_code in (400, 404)
 
 
+def test_media_preview_uses_cdn_redirect_on_public_host(client, tmp_path, monkeypatch):
+    mid = "abc123"
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    (tmp_path / f"{mid}.png").write_bytes(payload)
+    monkeypatch.setattr(media_service, "MEDIA_CACHE_DIR", tmp_path)
+
+    from flowboard.services.comic import r2
+
+    monkeypatch.setattr(
+        r2,
+        "result_public_url",
+        lambda media_id: f"https://cdn.example/results/{media_id}.png",
+    )
+
+    r = client.get(
+        f"/media/{mid}",
+        headers={"host": "public.example"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert r.headers["location"] == f"https://cdn.example/results/{mid}.png"
+
+
+def test_media_download_skips_cdn_redirect_and_sets_attachment(client, tmp_path, monkeypatch):
+    mid = "abc123"
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    (tmp_path / f"{mid}.png").write_bytes(payload)
+    monkeypatch.setattr(media_service, "MEDIA_CACHE_DIR", tmp_path)
+
+    from flowboard.services.comic import r2
+
+    monkeypatch.setattr(
+        r2,
+        "result_public_url",
+        lambda media_id: f"https://cdn.example/results/{media_id}.png",
+    )
+
+    r = client.get(
+        f"/media/{mid}?download=1&filename=nice-image.png",
+        headers={"host": "public.example"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert "location" not in r.headers
+    assert r.headers["content-type"].startswith("image/png")
+    assert r.headers["content-disposition"] == 'attachment; filename="nice-image.png"'
+    assert r.content == payload
+
+
 def test_media_bytes_fetches_and_caches_on_miss(client, tmp_path, monkeypatch):
     # Ingest a URL.
     mid = "cac1abad"

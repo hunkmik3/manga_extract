@@ -1,6 +1,8 @@
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from sqlmodel import delete as sql_delete, select
+from sqlmodel import delete as sql_delete, select, update as sql_update
 
 from flowboard.db import get_session
 from flowboard.db.models import (
@@ -13,6 +15,7 @@ from flowboard.db.models import (
     PipelineRun,
     Plan,
     PlanRevision,
+    Reference,
     Request,
 )
 
@@ -21,6 +24,7 @@ router = APIRouter(prefix="/api/boards", tags=["boards"])
 
 class BoardCreate(BaseModel):
     name: str
+    kind: str = "manga"
 
 
 class BoardUpdate(BaseModel):
@@ -28,15 +32,20 @@ class BoardUpdate(BaseModel):
 
 
 @router.get("")
-def list_boards():
+def list_boards(kind: Optional[str] = None):
+    """List boards. ``kind`` scopes to one surface — "manga" (node board) or
+    "flow" (Flow Studio) — so the two keep separate project lists."""
     with get_session() as s:
-        return s.exec(select(Board)).all()
+        stmt = select(Board)
+        if kind is not None:
+            stmt = stmt.where(Board.kind == kind)
+        return s.exec(stmt).all()
 
 
 @router.post("")
 def create_board(body: BoardCreate):
     with get_session() as s:
-        board = Board(name=body.name)
+        board = Board(name=body.name, kind=body.kind or "manga")
         s.add(board)
         s.commit()
         s.refresh(board)
@@ -76,6 +85,9 @@ def delete_board(board_id: int):
       Asset(node_id) → Request(node_id) → Node
       PipelineRun(plan_id) → PlanRevision(plan_id) → Plan
       Edge → ChatMessage → BoardFlowProject → Board.
+    Reference rows are the user's LIBRARY — they survive the board; only their
+    ``source_board_id`` provenance is detached (else the Board delete hits the
+    FK and 500s — the "delete project" button bug).
 
     Note: this only removes the *local* mapping to a Google Flow project.
     The project on labs.google itself is NOT deleted (Flow doesn't expose a
@@ -107,6 +119,12 @@ def delete_board(board_id: int):
         s.exec(sql_delete(Plan).where(Plan.board_id == board_id))
         s.exec(sql_delete(ChatMessage).where(ChatMessage.board_id == board_id))
         s.exec(sql_delete(BoardFlowProject).where(BoardFlowProject.board_id == board_id))
+        # Detach (don't delete) references sourced from this board — see docstring.
+        s.exec(
+            sql_update(Reference)
+            .where(Reference.source_board_id == board_id)
+            .values(source_board_id=None)
+        )
         s.delete(board)
         s.commit()
         return {"deleted": board_id}

@@ -7,6 +7,9 @@ auto-managed media cache index): references have user-curated
 lifetime and metadata; cache files in storage/media/{id}.{ext} are
 owned by Asset and never touched on reference DELETE.
 """
+import os
+import threading
+import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Response
@@ -17,6 +20,22 @@ from flowboard.db import get_session
 from flowboard.db.models import Reference
 
 router = APIRouter(prefix="/api/references", tags=["references"])
+
+# Building the JSON for a 500-item library (ORM row → dict, per row) is CPU-bound
+# Python work, and the GIL serializes it across the request threadpool — so many
+# tabs opening at once each spent ~0.5s and, run concurrently, stacked into
+# multi-second waits that made the app "spin" on load. Cache the (unfiltered)
+# list per board for a few seconds with a single-flight lock: repeated loads and
+# board switches reuse it, and one caller does the work instead of all of them.
+# Any write (save/edit/delete) clears the cache so the acting user stays exact.
+_REF_CACHE_TTL_S = float(os.getenv("FLOWBOARD_REF_CACHE_TTL_S", "10"))
+_ref_cache: dict[tuple, tuple[list, float]] = {}  # (board, limit, pinned_first) → (rows, ts)
+_ref_cache_lock = threading.Lock()
+
+
+def _ref_cache_clear() -> None:
+    with _ref_cache_lock:
+        _ref_cache.clear()
 
 
 # Valid kinds — matches the source node types that can be saved.
@@ -32,6 +51,7 @@ class ReferenceCreate(BaseModel):
     url: Optional[str] = None
     source_board_id: Optional[int] = None
     source_node_short_id: Optional[str] = None
+    model_used: Optional[str] = None
     tags: Optional[list[str]] = None
 
 
@@ -66,6 +86,7 @@ def _row_dict(row: Reference) -> dict[str, Any]:
         "kind": row.kind,
         "ai_brief": row.ai_brief,
         "aspect_ratio": row.aspect_ratio,
+        "model_used": row.model_used,
         "tags": list(row.tags or []),
         "pinned": row.pinned,
         "position": row.position,
@@ -107,11 +128,13 @@ def create_reference(body: ReferenceCreate):
             url=body.url,
             source_board_id=body.source_board_id,
             source_node_short_id=body.source_node_short_id,
+            model_used=body.model_used,
             tags=list(body.tags or []),
         )
         s.add(row)
         s.commit()
         s.refresh(row)
+        _ref_cache_clear()
         return _row_dict(row)
 
 
@@ -120,15 +143,40 @@ def list_references(
     q: Optional[str] = None,
     pinned_first: bool = True,
     limit: int = 200,
+    source_board_id: Optional[int] = None,
 ):
     """List references, sorted (pinned DESC, position ASC, created_at DESC).
 
     ``q``: case-insensitive substring match against label OR ai_brief.
     ``pinned_first``: when False, drop pinned from the ORDER BY so
     raw insertion order surfaces (debug / testing convenience).
+    ``source_board_id``: scope to one project/board — Flow Studio uses this so
+    each project shows only its own assets.
     """
+    # Only the plain (non-search) listing is cached — search results vary per
+    # keystroke and are far rarer than the flow-studio library load.
+    if q is None:
+        key = (source_board_id, limit, pinned_first)
+        hit = _ref_cache.get(key)
+        if hit is not None and (time.monotonic() - hit[1]) < _REF_CACHE_TTL_S:
+            return hit[0]
+        with _ref_cache_lock:
+            hit = _ref_cache.get(key)  # double-check: another caller may have just filled it
+            if hit is not None and (time.monotonic() - hit[1]) < _REF_CACHE_TTL_S:
+                return hit[0]
+            rows = _query_references(None, pinned_first, limit, source_board_id)
+            _ref_cache[key] = (rows, time.monotonic())
+            return rows
+    return _query_references(q, pinned_first, limit, source_board_id)
+
+
+def _query_references(
+    q: Optional[str], pinned_first: bool, limit: int, source_board_id: Optional[int]
+) -> list[dict[str, Any]]:
     with get_session() as s:
         stmt = select(Reference)
+        if source_board_id is not None:
+            stmt = stmt.where(Reference.source_board_id == source_board_id)
         if q:
             needle = f"%{q.lower()}%"
             # SQLite's LIKE is case-insensitive for ASCII by default but
@@ -175,6 +223,7 @@ def patch_reference(ref_id: int, body: ReferencePatch):
         s.add(row)
         s.commit()
         s.refresh(row)
+        _ref_cache_clear()
         return _row_dict(row)
 
 
@@ -191,4 +240,5 @@ def delete_reference(ref_id: int):
             raise HTTPException(404, "reference not found")
         s.delete(row)
         s.commit()
+        _ref_cache_clear()
     return Response(status_code=204)

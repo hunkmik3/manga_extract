@@ -28,6 +28,17 @@ def _fresh_db():
 
 
 @pytest.fixture(autouse=True)
+def _clear_bridge_upload_cache():
+    """The bridge de-dupes Flow uploads by (project_id, sha256) in a module-level
+    cache. Tests reuse identical synthetic PNGs + project ids, so clear it
+    between tests or one test's cached upload would skip another's."""
+    from flowboard.services.comic import bridge
+    bridge._UPLOAD_CACHE.clear()
+    yield
+    bridge._UPLOAD_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def _seed_default_paygate_tier():
     """Most tests exercise downstream behaviour (variant_count, ref_media_ids,
     SDK payload shape, etc.) and don't care about the upstream tier-resolution

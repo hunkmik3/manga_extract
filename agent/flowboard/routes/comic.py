@@ -28,6 +28,7 @@ from flowboard.routes.upload import (
     MAX_UPLOAD_BYTES,
     _sniff_image_mime,
 )
+from flowboard.services import media as media_service
 from flowboard.services.comic.bridge import BridgeEditError, edit_image
 from flowboard.services.comic.panels import PAGE_EXTS
 from flowboard.services.flow_sdk import is_valid_project_id
@@ -109,6 +110,20 @@ def _safe_page_name(raw_name: Optional[str], index: int) -> Optional[str]:
     if Path(base).suffix.lower() not in PAGE_EXTS:
         return None
     return base
+
+
+@router.post("/upload-sheet")
+async def upload_sheet(file: UploadFile = File(...)):
+    """Cache a character reference / turnaround sheet LOCALLY (no Flow upload) and
+    return its media_id. The frontend then dispatches the ``segment_character_sheet``
+    worker task to auto-crop it into face / body views. Local-only because the
+    sheet is only ever cropped on the agent — it never needs to reach Flow."""
+    raw, mime = await _read_image(file)
+    mid = str(uuid.uuid4())
+    if not media_service.ingest_inline_bytes(mid, raw, kind="image", mime=mime):
+        raise HTTPException(status_code=500, detail="failed to cache sheet")
+    logger.info("comic upload-sheet: media_id=%s size=%d mime=%s", mid, len(raw), mime)
+    return {"media_id": mid, "mime": mime, "size": len(raw)}
 
 
 @router.post("/upload-pages")

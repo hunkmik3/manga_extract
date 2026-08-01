@@ -12,6 +12,9 @@ def _utcnow() -> datetime:
 class Board(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
+    # Which app a board/project belongs to: "manga" (the node board) or "flow"
+    # (Flow Studio). Lets the two surfaces keep fully separate project lists.
+    kind: str = Field(default="manga", index=True)
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -120,6 +123,11 @@ class Reference(SQLModel, table=True):
     kind: str  # "image" | "character" | "visual_asset" | "storyboard_shot"
     ai_brief: Optional[str] = None
     aspect_ratio: Optional[str] = None
+    # Which image model actually produced this (e.g. "gemini-3.1-flash-image",
+    # "dola-seedream-5-0-pro-260628") — the Flow studio's resolved value, not
+    # necessarily what the caller requested (the backend can substitute a
+    # fallback). None for pre-existing rows / non-generated saves (uploads).
+    model_used: Optional[str] = None
     tags: list = Field(default_factory=list, sa_column=Column(JSON))
     pinned: bool = False
     position: int = 0

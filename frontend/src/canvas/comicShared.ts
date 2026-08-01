@@ -17,6 +17,8 @@ export const PANEL_COLS = 3;
 export const PANEL_CELL_W = 165;
 export const PANEL_CELL_H = 185;
 export const ROW_GAP = 60;
+const COMBINE_GAP_Y = 56;
+const DEFAULT_COMBINE_H = 420;
 
 export const COMIC_TYPES = new Set([
   "comic_import",
@@ -35,20 +37,47 @@ export interface PageItem {
   boxes?: BoxItem[];
   error?: string | null;
 }
+/** A panel corner [x, y] in source-page pixels. */
+export type QuadPoint = [number, number];
+/** 4 corners (TL, TR, BR, BL) of a diagonal/rotated panel. */
+export type Quad = [QuadPoint, QuadPoint, QuadPoint, QuadPoint];
+
 export interface BoxItem {
   id: string;
+  // x/y/w/h is ALWAYS the axis-aligned bounding box. `quad`, when present, is
+  // the true (possibly diagonal) panel shape and x/y/w/h must equal its bbox.
   x: number;
   y: number;
   w: number;
   h: number;
+  quad?: Quad;
 }
 export interface PanelItem {
   idx: number;
   pageIndex?: number;
   pageName?: string;
   panelIndex?: number;
-  box?: { x: number; y: number; w: number; h: number };
+  box?: { x: number; y: number; w: number; h: number; quad?: Quad };
   mediaId: string;
+}
+
+/** 4 corners (TL, TR, BR, BL) of an axis-aligned box. */
+export function rectToQuad(b: { x: number; y: number; w: number; h: number }): Quad {
+  return [
+    [b.x, b.y],
+    [b.x + b.w, b.y],
+    [b.x + b.w, b.y + b.h],
+    [b.x, b.y + b.h],
+  ];
+}
+
+/** Axis-aligned bounding box of a quad — keeps x/y/w/h in sync with the corners. */
+export function quadToAabb(q: Quad): { x: number; y: number; w: number; h: number } {
+  const xs = q.map((p) => p[0]);
+  const ys = q.map((p) => p[1]);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, w: Math.max(1, Math.max(...xs) - x), h: Math.max(1, Math.max(...ys) - y) };
 }
 
 /** Data of the single upstream comic node feeding `rfId` (via one edge), or null. */
@@ -175,6 +204,15 @@ export function resolveUpstreamImage(rfId: string): UpstreamImage | null {
   return null;
 }
 
+/** A typed reference view of a character (cropped from a model sheet): the
+ * Director attaches the view matching the panel's camera — face for close-ups,
+ * body for wides, back for back-facing panels. kind "auto" = untyped (e.g. a
+ * ⭐-promoted cell), used as a generic fallback. */
+export interface CharacterRefView {
+  mediaId: string;
+  kind: "face" | "body" | "back" | "auto";
+}
+
 export interface CharacterItem {
   id: string;
   name: string;
@@ -182,6 +220,12 @@ export interface CharacterItem {
   refMediaIds: string[];
   sampleMediaId: string;
   pages?: number[];
+  /** Typed views (from sheet segmentation). When present, the backend picks
+   * views by the panel's shot/orientation instead of the flat refMediaIds. */
+  refViews?: CharacterRefView[];
+  /** Canonical appearance description — appended VERBATIM to every prompt the
+   * character appears in (prompt-token consistency across panels). */
+  descriptor?: string;
 }
 /** The character DB from the (single) comic_chars node on the board, if built.
  * Passed to enhance so it can auto-match each panel's character. */
@@ -193,6 +237,101 @@ export function findCharacterDb(): CharacterItem[] | null {
     }
   }
   return null;
+}
+
+/** The comic_chars node (rfId + its characters) on the board, if present —
+ * even when empty, so cells can promote the first ref into it. */
+export function findCharacterDbNode(): { rfId: string; characters: CharacterItem[] } | null {
+  const { nodes } = useBoardStore.getState();
+  for (const n of nodes) {
+    if (n.data.type === "comic_chars" && Array.isArray(n.data.characters)) {
+      return { rfId: n.id, characters: n.data.characters as CharacterItem[] };
+    }
+  }
+  return null;
+}
+
+/**
+ * Promote a generated cell image into a character's FROZEN reference set
+ * (newest first, deduped, capped). This is the only sanctioned way canon refs
+ * grow: a human picks a good cell and blesses it as the design of record for
+ * that identity. Combine/regen then resolve that character's char_id to these
+ * exact refs (bypassing CCIP). Returns false if there is no character DB or the
+ * id is unknown.
+ */
+export function promoteCellToCharacter(charId: string, mediaId: string): boolean {
+  if (!charId || !mediaId) return false;
+  const node = findCharacterDbNode();
+  if (!node) return false;
+  const chars = node.characters.map((c) => ({ ...c }));
+  const c = chars.find((x) => x.id === charId);
+  if (!c) return false;
+  const prev = Array.isArray(c.refMediaIds) ? c.refMediaIds.filter((m) => m !== mediaId) : [];
+  c.refMediaIds = [mediaId, ...prev].slice(0, 8); // newest first, capped
+  if (Array.isArray(c.refViews) && c.refViews.length) {
+    // Keep the typed-view store in sync: a promoted cell has no known view kind,
+    // so it joins as "auto" (generic fallback after the typed views).
+    const prevViews = c.refViews.filter((v) => v.mediaId !== mediaId);
+    c.refViews = [{ mediaId, kind: "auto" as const }, ...prevViews].slice(0, 12);
+  }
+  if (!c.sampleMediaId) c.sampleMediaId = mediaId;
+  patchComicNode(node.rfId, { characters: chars });
+  return true;
+}
+
+export interface StyleFrame {
+  styleRefMediaId?: string;
+  styleDescriptor?: string;
+}
+/** Project-wide STYLE FRAME (uniform target art style applied to every panel),
+ * stored on the comic_chars node alongside the character canon. */
+export function findStyleFrame(): StyleFrame | null {
+  const { nodes } = useBoardStore.getState();
+  for (const n of nodes) {
+    if (n.data.type !== "comic_chars") continue;
+    const ref = typeof n.data.styleRefMediaId === "string" ? n.data.styleRefMediaId : undefined;
+    const desc = typeof n.data.styleDescriptor === "string" ? n.data.styleDescriptor : undefined;
+    if (ref || desc) return { styleRefMediaId: ref, styleDescriptor: desc };
+  }
+  return null;
+}
+
+/** The board's comic_chars node, creating one if none exists (so cold-start —
+ * defining characters by hand instead of via CCIP clustering — works). Returns
+ * its rfId, or null if the board isn't ready. */
+export async function ensureCharsNode(): Promise<string | null> {
+  const existing = findCharacterDbNode();
+  if (existing) return existing.rfId;
+  const store = useBoardStore.getState();
+  const up = store.nodes.find((n) => n.data.type === "comic_import");
+  const pos = up ? { x: up.position.x, y: up.position.y + 520 } : { x: 40, y: 40 };
+  return store.addNodeOfType("comic_chars", pos);
+}
+
+/**
+ * Define a NEW character by hand (cold-start, no CCIP) — creating the character
+ * DB node if needed — optionally seeded with a first frozen reference (e.g. the
+ * combine cell the user is blessing). Returns the new char id, or null.
+ */
+export async function addCharacter(name: string, firstRefMediaId?: string): Promise<string | null> {
+  const rfId = await ensureCharsNode();
+  if (!rfId) return null;
+  const node = useBoardStore.getState().nodes.find((n) => n.id === rfId);
+  const chars = (Array.isArray(node?.data?.characters) ? node!.data!.characters : []) as CharacterItem[];
+  const ids = new Set(chars.map((c) => c.id));
+  let n = chars.length;
+  let id = `char_${n}`;
+  while (ids.has(id)) id = `char_${++n}`;
+  const refs = firstRefMediaId ? [firstRefMediaId] : [];
+  const newChar: CharacterItem = {
+    id,
+    name: name.trim() || `Character ${chars.length + 1}`,
+    count: 0,
+    refMediaIds: refs,
+    sampleMediaId: firstRefMediaId ?? "",
+  };
+  patchComicNode(rfId, { characters: [...chars, newChar] });
+  return id;
 }
 
 export interface DownstreamPage {
@@ -297,10 +436,25 @@ export async function syncPanelsForPage(pageRfId: string): Promise<void> {
   }
 }
 
+/** boxIds of every panel that belongs to a combine group. Those panels are laid
+ * out next to their combine (see relayoutComicCombineChains) instead of in the
+ * page→panel grid, so this set tells relayoutComicChains to skip them. */
+function combineOwnedBoxIds(nodes: FlowNode[]): Set<string> {
+  const owned = new Set<string>();
+  for (const c of nodes.filter((n) => n.data.type === "comic_combine")) {
+    const panels = Array.isArray(c.data.panels) ? (c.data.panels as Array<Record<string, unknown>>) : [];
+    for (const p of panels) {
+      if (p && typeof p.boxId === "string") owned.add(p.boxId);
+    }
+  }
+  return owned;
+}
+
 export function relayoutComicChains(): void {
   const store = useBoardStore.getState();
   const { nodes, edges } = store;
   const moves = new Map<string, { x: number; y: number }>();
+  const owned = combineOwnedBoxIds(nodes); // panels claimed by a combine sit beside it
 
   for (const up of nodes.filter((n) => n.data.type === "comic_import")) {
     const pageX = up.position.x + PAGE_GAP_X;
@@ -321,11 +475,14 @@ export function relayoutComicChains(): void {
         .filter((e) => e.source === pn.id)
         .map((e) => nodes.find((n) => n.id === e.target))
         .filter((n): n is FlowNode => !!n && n.data.type === "comic_panel")
+        .filter((n) => !owned.has(n.data.boxId as string)) // combine-owned panels move beside it
         .sort((a, b) => boxOrder(a) - boxOrder(b));
 
-      const count = panelNodes.length || pageBoxes.length || 1;
+      const count = panelNodes.length || 1;
       const rows = Math.max(1, Math.ceil(count / PANEL_COLS));
-      const rowH = Math.max(PAGE_H, rows * PANEL_CELL_H) + ROW_GAP;
+      // Use the page node's real (measured) height — tall webtoon pages are far
+      // taller than PAGE_H, so a fixed advance would overlap the next page.
+      const rowH = Math.max(pageNodeHeight(pn), rows * PANEL_CELL_H) + ROW_GAP;
 
       moves.set(pn.id, { x: pageX, y: curY });
       panelNodes.forEach((qn, j) => {
@@ -342,6 +499,86 @@ export function relayoutComicChains(): void {
   });
   store.setNodes(newNodes);
   for (const [rfId, p] of moves) {
+    const dbId = parseInt(rfId, 10);
+    if (!Number.isNaN(dbId)) patchNode(dbId, { x: p.x, y: p.y }).catch(() => {});
+  }
+}
+
+function pageNodeHeight(n: FlowNode): number {
+  const measured = n.data.__measuredHeight;
+  if (typeof measured === "number" && Number.isFinite(measured) && measured > 0) {
+    return Math.max(PAGE_H, measured);
+  }
+  return PAGE_H;
+}
+
+function combineNodeHeight(n: FlowNode): number {
+  const measured = n.data.__measuredHeight;
+  if (typeof measured === "number" && Number.isFinite(measured) && measured > 0) {
+    return Math.max(180, measured);
+  }
+  return DEFAULT_COMBINE_H;
+}
+
+/** Re-pack combine nodes in each upload chain using their measured card height.
+ * Combine cards grow after a 9:16 result/cell grid appears; without moving the
+ * later combine nodes, the enlarged card visually overlaps the next one. */
+export function relayoutComicCombineChains(): void {
+  const store = useBoardStore.getState();
+  const { nodes, edges } = store;
+  const moves = new Map<string, { x: number; y: number }>();
+
+  for (const up of nodes.filter((n) => n.data.type === "comic_import")) {
+    const combineNodes = edges
+      .filter((e) => e.source === up.id)
+      .map((e) => nodes.find((n) => n.id === e.target))
+      .filter((n): n is FlowNode => !!n && n.data.type === "comic_combine")
+      .sort((a, b) => a.position.y - b.position.y);
+
+    if (combineNodes.length === 0) continue;
+
+    let curY = combineNodes[0].position.y;
+    const SRC_COLS = 2;
+    const SRC_GAP_X = 40; // gap between a combine's source-panel grid and the card
+    const gridW = SRC_COLS * PANEL_CELL_W;
+    for (const node of combineNodes) {
+      moves.set(node.id, { x: node.position.x, y: curY });
+      // Pin this combine's 4 source panel nodes (matched by boxId) in a 2×2 to
+      // its left, mirroring the 2×2 output for easy input→output comparison.
+      const panels = Array.isArray(node.data.panels)
+        ? (node.data.panels as Array<Record<string, unknown>>)
+        : [];
+      panels.slice(0, 4).forEach((spec, j) => {
+        const boxId = spec?.boxId;
+        if (typeof boxId !== "string") return;
+        const pnode = nodes.find(
+          (n) => n.data.type === "comic_panel" && n.data.boxId === boxId,
+        );
+        if (!pnode) return;
+        const col = j % SRC_COLS;
+        const row = Math.floor(j / SRC_COLS);
+        moves.set(pnode.id, {
+          x: node.position.x - SRC_GAP_X - gridW + col * PANEL_CELL_W,
+          y: curY + row * PANEL_CELL_H,
+        });
+      });
+      curY += combineNodeHeight(node) + COMBINE_GAP_Y;
+    }
+  }
+
+  if (moves.size === 0) return;
+  const changed = new Map<string, { x: number; y: number }>();
+  const nextNodes = nodes.map((n) => {
+    const mv = moves.get(n.id);
+    if (!mv || (Math.abs(n.position.x - mv.x) < 1 && Math.abs(n.position.y - mv.y) < 1)) {
+      return n;
+    }
+    changed.set(n.id, mv);
+    return { ...n, position: { x: mv.x, y: mv.y } };
+  });
+  if (changed.size === 0) return;
+  store.setNodes(nextNodes);
+  for (const [rfId, p] of changed) {
     const dbId = parseInt(rfId, 10);
     if (!Number.isNaN(dbId)) patchNode(dbId, { x: p.x, y: p.y }).catch(() => {});
   }

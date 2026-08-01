@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import {
   getAuthMe,
+  getFlowConnections,
   logoutExtension,
-  scanExtension,
+  setActiveFlowConnection,
   type AuthMe,
+  type FlowConnection,
 } from "../api/client";
 import { useGenerationStore } from "../store/generation";
 import { getLatestRelease, isNewerVersion, type LatestRelease } from "../api/github";
@@ -35,11 +37,14 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
   // while the extension is still doing its first round-trip.
   const [pollsWithoutTier, setPollsWithoutTier] = useState(0);
   // Scan / logout transient state for button affordances.
-  const [scanState, setScanState] = useState<"idle" | "scanning" | "no-extension">("idle");
   const [logoutPending, setLogoutPending] = useState(false);
   // Bumped by handleScan / handleLogout to kick the poll effect into
   // re-running immediately instead of waiting for the next 5s tick.
   const [pollNonce, setPollNonce] = useState(0);
+  // All connected extensions (one per Chrome profile / account). When >1, an
+  // account switcher appears so the user can pick which one the bridge uses
+  // (e.g. move to a fresh account when one hits its daily quota).
+  const [connections, setConnections] = useState<FlowConnection[]>([]);
 
   // Poll /api/auth/me until BOTH email and paygate_tier are populated.
   // Email comes from Google's userinfo (fetched once per token rotation
@@ -76,6 +81,34 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
     };
   }, [setStorePaygateTier, pollNonce]);
 
+  // Poll the connected-accounts list (independent of the /me stop condition so
+  // a second profile connecting later still shows up in the switcher).
+  useEffect(() => {
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      const conns = await getFlowConnections();
+      if (!alive) return;
+      setConnections(conns);
+      timer = setTimeout(poll, 5000);
+    };
+    poll();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [pollNonce]);
+
+  async function switchAccount(id: string) {
+    try {
+      const res = await setActiveFlowConnection(id);
+      setConnections(res.connections);
+    } catch {
+      // non-fatal
+    }
+    setPollNonce((n) => n + 1); // refresh /me (tier/credits) for the new active
+  }
+
   // Logout: clears agent-side cache + tells extension to drop in-memory
   // identity. Resets local state immediately so the chip flips to the
   // "Not connected" affordance without waiting for the next poll tick.
@@ -103,30 +136,6 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
     }
   }
 
-  // Scan: probe the extension state and, if a connection is open but
-  // userinfo is missing, ask the extension to re-fetch from Google.
-  // The poll loop above picks up the new state on the next /me hit.
-  async function handleScan() {
-    if (scanState === "scanning") return;
-    setScanState("scanning");
-    try {
-      const res = await scanExtension();
-      if (!res.extension_connected) {
-        setScanState("no-extension");
-        // Auto-clear the warning after 8s so the button doesn't get
-        // stuck — gives the user time to read it but recovers on its own.
-        setTimeout(() => setScanState("idle"), 8000);
-        return;
-      }
-      // Extension is alive — kick the poll loop so the chip refreshes
-      // as soon as userinfo lands. The 5s default would feel sluggish
-      // right after a deliberate user action.
-      setPollNonce((n) => n + 1);
-      setScanState("idle");
-    } catch {
-      setScanState("idle");
-    }
-  }
 
   // Surface "new version available" right under the account chip so
   // users notice without having to open Settings. GitHub's release
@@ -163,11 +172,16 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
 
   // Google Flow plan tiers — both are paid (Flowboard's hard
   // requirement). TIER_TWO = Ultra (higher tier), TIER_ONE = Pro.
+  // Google keeps adding tiers (PAYGATE_TIER_TIER1P5, …). Map the two we know to
+  // their names; for any other known tier, show the SKU (or a generic "Plan")
+  // rather than a blank so the chip still reflects a connected paid account.
   const tierLabel = tier === "PAYGATE_TIER_TWO"
     ? "Ultra"
     : tier === "PAYGATE_TIER_ONE"
       ? "Pro"
-      : "—";
+      : tier
+        ? (profile?.sku || "Plan")
+        : "—";
 
   return (
     <>
@@ -239,57 +253,37 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
                 )}
               </div>
             )}
-          </div>
-        )}
-        {!collapsed && !email && (
-          // Disconnected — skip the placeholder "Flow account" / "Connected
-          // via extension" copy entirely. When the scan probe says no
-          // extension is reachable, swap the bare button for a short
-          // recovery hint so the user knows the concrete next steps
-          // (refresh the Flow tab, reload the extension) instead of
-          // bouncing off a generic "not found" warning.
-          <div className="account-panel__meta account-panel__meta--disconnected">
-            {scanState === "no-extension" ? (
-              <div className="account-panel__scan-hint" role="alert">
-                <span className="account-panel__scan-hint-title">
-                  ⚠ Extension not detected
-                </span>
-                <span className="account-panel__scan-hint-text">
-                  Refresh the Flow tab, then reload the Flowboard extension.
-                </span>
-                <button
-                  type="button"
-                  className="account-panel__scan-btn"
-                  onClick={handleScan}
-                  title="Scan again for an extension connection"
-                >
-                  Try again
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                className="account-panel__scan-btn"
-                onClick={handleScan}
-                disabled={scanState === "scanning"}
-                title="Scan for an extension connection and re-fetch user info"
+            {connections.length > 1 && (
+              <select
+                value={connections.find((c) => c.active)?.id ?? ""}
+                onChange={(e) => switchAccount(e.target.value)}
+                title="Switch the active Flow account — the bridge routes generation through it"
+                style={{ marginTop: 4, width: "100%", fontSize: 11, padding: "2px 4px", boxSizing: "border-box" }}
               >
-                {scanState === "scanning" ? "Scanning…" : "🔍 Scan extension"}
-              </button>
+                {connections.map((c) => {
+                  const t = c.tier === "PAYGATE_TIER_TWO" ? "Ultra" : c.tier === "PAYGATE_TIER_ONE" ? "Pro" : "—";
+                  return (
+                    <option key={c.id} value={c.id}>
+                      {(c.email ?? "connecting…")} · {t}
+                    </option>
+                  );
+                })}
+              </select>
             )}
           </div>
         )}
-        {email && (
-          <button
-            type="button"
-            className="account-panel__cog"
-            onClick={() => setOpen((v) => !v)}
-            aria-label="Open settings"
-            title="Settings"
-          >
-            ⚙
-          </button>
-        )}
+        {/* Extension / Flow-account UI is hidden — this build generates
+            server-side via the image API, so there's no extension to scan
+            or connect. The settings cog stays always-available below. */}
+        <button
+          type="button"
+          className="account-panel__cog"
+          onClick={() => setOpen((v) => !v)}
+          aria-label="Open settings"
+          title="Settings"
+        >
+          ⚙
+        </button>
       </div>
       {!collapsed && (
         <div className="account-panel__version-row">

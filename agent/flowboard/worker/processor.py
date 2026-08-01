@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -670,7 +672,7 @@ async def _handle_extract_panels(params: dict) -> tuple[dict, Optional[str]]:
     folder = folder.strip().strip("'\"").strip()
     debug = bool(params.get("debug"))
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto"):
         return {}, f"invalid_detector:{detector}"
 
     try:
@@ -815,7 +817,7 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     if not isinstance(pages_in, list) or not pages_in:
         return {}, "missing_pages"
     detector = params.get("detector") or "heuristic"
-    if detector not in ("heuristic", "ml", "auto"):
+    if detector not in ("heuristic", "ml", "webtoon", "hybrid", "auto", "bubble"):
         return {}, f"invalid_detector:{detector}"
 
     def _run():
@@ -830,6 +832,14 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
             err = None
             if bgr is None:
                 err = "page_unreadable"
+            elif detector == "bubble":
+                # Speech-bubble seg model → bbox + mask polygon per bubble.
+                from flowboard.services.comic import panel_ml
+                for (x, y, w, h), poly in panel_ml.detect_bubbles_ml(bgr):
+                    b = {"id": str(uuid.uuid4()), "x": x, "y": y, "w": w, "h": h}
+                    if poly:
+                        b["poly"] = poly
+                    boxes.append(b)
             else:
                 for (x, y, w, h) in panel_svc.detect_boxes(bgr, detector):
                     boxes.append({"id": str(uuid.uuid4()), "x": x, "y": y, "w": w, "h": h})
@@ -857,6 +867,33 @@ async def _handle_detect_page_panels(params: dict) -> tuple[dict, Optional[str]]
     }
     logger.info("detect_page_panels: %d page(s) → %d box(es) [%s]", len(pages_out), total, detector)
     return result, None
+
+
+def _clean_poly(raw, min_pts=3):
+    """Validate a crop polygon from a box dict → list of [int,int] points (≥
+    min_pts), or None. Used for both 4-corner quads and N-point bubble masks."""
+    if not isinstance(raw, (list, tuple)) or len(raw) < min_pts:
+        return None
+    out = []
+    for p in raw:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            return None
+        try:
+            out.append([int(round(float(p[0]))), int(round(float(p[1])))])
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _clean_quad(raw):
+    """A 4-point quad (diagonal panel)."""
+    return _clean_poly(raw, min_pts=4) if isinstance(raw, (list, tuple)) and len(raw) == 4 else None
+
+
+def _box_crop_poly(b: dict):
+    """The crop polygon for a box dict: a bubble `poly` (N pts) or a panel
+    `quad` (4 pts), else None (→ plain rectangle slice)."""
+    return _clean_poly(b.get("poly")) or _clean_quad(b.get("quad"))
 
 
 async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
@@ -892,15 +929,21 @@ async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
                 y2 = min(H, y + max(1, h))
                 if x2 <= x or y2 <= y:
                     continue
-                crop = bgr[y:y2, x:x2]
+                poly = _box_crop_poly(b)  # bubble mask or diagonal quad → masked crop
+                crop = panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), poly)
                 cid = str(uuid.uuid4())
                 if not media_service.ingest_inline_bytes(
                     cid, panel_svc.encode_png(crop), kind="image", mime="image/png"
                 ):
                     continue
+                box_out = {"x": x, "y": y, "w": x2 - x, "h": y2 - y}
+                if isinstance(b.get("poly"), list):
+                    box_out["poly"] = b["poly"]
+                elif isinstance(b.get("quad"), list):
+                    box_out["quad"] = b["quad"]
                 panels_out.append({
                     "idx": gidx, "pageIndex": pg.get("idx"), "pageName": pg.get("name"),
-                    "panelIndex": j, "box": {"x": x, "y": y, "w": x2 - x, "h": y2 - y},
+                    "panelIndex": j, "box": box_out,
                     "mediaId": cid, "status": "extracted",
                 })
                 gidx += 1
@@ -914,6 +957,319 @@ async def _handle_crop_panels(params: dict) -> tuple[dict, Optional[str]]:
 
     result = {"panels": panels_out, "panel_count": len(panels_out), "node_id": params.get("__node_id")}
     logger.info("crop_panels: %d panel(s)", len(panels_out))
+    return result, None
+
+
+# ── Bubble-clean shared config (used by both the per-crop and batch handlers) ─
+def _bubble_clean_config(params: dict) -> tuple[dict, Optional[str]]:
+    """Resolve engine + prompt + model + transparency from request params.
+
+    Engine ``grok`` (xAI ``/v1/images/edits``), ``gemini`` (Gemini API direct),
+    or ``atrium`` (Atrium partner API → same gemini-3-pro-image, separate
+    billing). gemini/atrium share the white-fill prompt; grok uses its own.
+    Returns (config, error)."""
+    from flowboard.services.comic import atrium_api, gemini_api, r2, xai
+
+    engine = params.get("engine")
+    engine = engine.strip().lower() if isinstance(engine, str) and engine.strip() else "gemini"
+    if engine not in ("grok", "gemini", "atrium"):
+        engine = "gemini"
+    if engine == "grok" and not xai.is_available():
+        return {}, "xai_key_missing: add XAI_API_KEY to .env"
+    if engine == "gemini" and not gemini_api.api_key():
+        return {}, "gemini_key_missing: add GEMINI_API_KEY to .env"
+    if engine == "atrium":
+        if not atrium_api.is_configured():
+            return {}, "atrium_keys_missing: add ATRIUM_CLIENT_ID/SECRET to .env"
+        # Atrium fetches the source image from a public URL — R2 (preferred) or a tunnel.
+        if not (r2.is_configured() or atrium_api.public_media_base()):
+            return {}, "atrium_needs_public_url: configure R2_* in .env (or PUBLIC_MEDIA_BASE_URL tunnel)"
+
+    raw_prompt = params.get("prompt")
+    # gemini + atrium both hit gemini-3-pro-image → need the white-fill prompt.
+    default_prompt = xai.DEFAULT_PROMPT if engine == "grok" else xai.GEMINI_PROMPT
+    prompt = raw_prompt.strip() if isinstance(raw_prompt, str) and raw_prompt.strip() else default_prompt
+    model = params.get("image_model")
+    model = model if isinstance(model, str) and model.strip() else None
+    transparent = params.get("transparent")
+    transparent = True if transparent is None else bool(transparent)
+    return {
+        "engine": engine,
+        "prompt": prompt,
+        "model": model,
+        "gemini_model": model or "gemini-3-pro-image",
+        "transparent": transparent,
+    }, None
+
+
+async def _edit_bubble(cfg: dict, src_bytes: bytes, client) -> bytes:
+    """One engine call (Grok / Gemini / Atrium) → cleaned PNG bytes (green bg)."""
+    import uuid
+
+    from flowboard.services.comic import atrium_api, gemini_api, xai
+
+    if cfg["engine"] == "gemini":
+        outs = await gemini_api.edit_image_variants(
+            src_bytes, cfg["prompt"], image_model=cfg["gemini_model"], aspect_ratio="", variant_count=1
+        )
+        return outs[0]
+    if cfg["engine"] == "atrium":
+        from flowboard.services.comic import r2
+
+        # Atrium downloads the source server-side from a public URL, so the crop
+        # must be ingested as media first, then exposed via R2 (preferred) or a
+        # tunnel. The R2 object is deleted right after Atrium has fetched it.
+        mid = str(uuid.uuid4())
+        await asyncio.to_thread(
+            media_service.ingest_inline_bytes, mid, src_bytes, kind="image", mime="image/png"
+        )
+        url = await asyncio.to_thread(_atrium_input_url, mid)
+        if not url:
+            raise RuntimeError("atrium: could not resolve a public input URL (R2/tunnel)")
+        try:
+            outs = await atrium_api.generate_image_variants(
+                cfg["prompt"], image_urls=[url], image_model=cfg["gemini_model"], aspect_ratio="", variant_count=1
+            )
+            return outs[0]
+        finally:
+            if r2.is_configured():
+                await asyncio.to_thread(r2.delete_media, mid)
+    return await xai.clean_bubble(src_bytes, cfg["prompt"], model=cfg["model"], client=client)
+
+
+def _bubble_keyed_png(png: bytes) -> bytes:
+    """Chroma-key the solid green backdrop out → transparent PNG bytes."""
+    from flowboard.services.comic import panels as panel_svc
+
+    return panel_svc.encode_png(panel_svc.key_out_green(panel_svc.decode_bgr(png)))
+
+
+# ── Resume cache: (source bubble + prompt) → cleaned media_id ─────────────────
+# The clean is deterministic per (page+box, prompt) — so a re-run after a partial
+# failure (e.g. the engine ran out of credit mid-batch) can REUSE every bubble it
+# already cleaned instead of paying for them again. Keyed by prompt, not engine,
+# because gemini/atrium share the same model+prompt → identical output.
+def _bubble_cache_path():
+    return media_service.MEDIA_CACHE_DIR.parent / "bubble_clean_cache.json"
+
+
+def _bubble_cache_load() -> dict:
+    import json
+    try:
+        return json.loads(_bubble_cache_path().read_text())
+    except Exception:  # noqa: BLE001 — missing/corrupt → empty
+        return {}
+
+
+def _bubble_cache_save(cache: dict) -> None:
+    import json
+    try:
+        _bubble_cache_path().write_text(json.dumps(cache))
+    except OSError:
+        pass
+
+
+def _bubble_cache_key(spec: dict, prompt: str) -> str:
+    import hashlib
+    box = spec.get("box") or {}
+    raw = "{}|{},{},{},{}|{}".format(
+        spec.get("page_media_id") or spec.get("mediaId") or "",
+        box.get("x"), box.get("y"), box.get("w"), box.get("h"),
+        hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12],
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+async def _handle_clean_bubbles(params: dict) -> tuple[dict, Optional[str]]:
+    """Bubble Extract — final step. Run each detected bubble crop through an
+    image-edit model (engine = ``grok`` via xAI ``/v1/images/edits`` OR
+    ``gemini`` via the Gemini API): keep the text, solid green background, close
+    the bubble, sharpen. The solid green is then chroma-keyed out to a
+    transparent PNG in code (``key_out_green``). Bubbles are processed
+    concurrently (bounded) so a page of N bubbles doesn't run serially."""
+    import uuid
+
+    import httpx
+
+    from flowboard.services.comic import xai
+
+    panels_in = params.get("panels")
+    if not isinstance(panels_in, list) or not panels_in:
+        return {}, "missing_panels"
+
+    cfg, err = _bubble_clean_config(params)
+    if err:
+        return {}, err
+    engine = cfg["engine"]
+    transparent = cfg["transparent"]
+
+    def _to_transparent(png: bytes) -> bytes:
+        return _bubble_keyed_png(png)
+
+    # Cap parallel API calls so we don't hammer the provider on a dense page.
+    sem = asyncio.Semaphore(int(os.getenv("FLOWBOARD_XAI_CONCURRENCY", "3")))
+
+    async def _edit_one(src_bytes: bytes, client: httpx.AsyncClient) -> bytes:
+        return await _edit_bubble(cfg, src_bytes, client)
+
+    async def _clean_one(idx: int, panel: dict, client: httpx.AsyncClient) -> dict:
+        out = {"idx": idx, "sourceMediaId": panel.get("mediaId")}
+        mid = panel.get("mediaId")
+        if not isinstance(mid, str) or not mid:
+            return {**out, "status": "error", "error": "no_source"}
+        path = media_service.cached_path(mid)
+        if path is None:
+            return {**out, "status": "error", "error": "source_missing"}
+        try:
+            src_bytes = await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            return {**out, "status": "error", "error": f"read_failed: {exc}"}
+        async with sem:
+            try:
+                cleaned = await _edit_one(src_bytes, client)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("clean_bubble[%s] %s failed: %s", engine, mid, exc)
+                return {**out, "status": "error", "error": str(exc)[:200]}
+        if transparent:
+            try:
+                cleaned = await asyncio.to_thread(_to_transparent, cleaned)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("chroma-key %s failed (keeping green): %s", mid, exc)
+        cid = str(uuid.uuid4())
+        ok = await asyncio.to_thread(
+            media_service.ingest_inline_bytes, cid, cleaned, kind="image", mime="image/png"
+        )
+        if not ok:
+            return {**out, "status": "error", "error": "ingest_failed"}
+        return {**out, "status": "cleaned", "mediaId": cid}
+
+    try:
+        async with httpx.AsyncClient(timeout=xai._TIMEOUT) as client:
+            results = await asyncio.gather(
+                *(_clean_one(i, p, client) for i, p in enumerate(panels_in) if isinstance(p, dict))
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("clean_bubbles failed")
+        return {}, f"clean_failed: {str(exc)[:160]}"
+
+    cleaned_n = sum(1 for r in results if r.get("status") == "cleaned")
+    result = {
+        "cleaned": results,
+        "cleaned_count": cleaned_n,
+        "fail_count": len(results) - cleaned_n,
+        "engine": engine,
+        "node_id": params.get("__node_id"),
+    }
+    logger.info("clean_bubbles[%s]: %d/%d cleaned", engine, cleaned_n, len(results))
+    return result, None
+
+
+async def _handle_clean_all_bubbles(params: dict) -> tuple[dict, Optional[str]]:
+    """Bubble Extract — one-click batch from the Comic upload node. Takes every
+    bubble box across all pages (``panels = [{page_media_id, box}]``), crops each
+    on the fly, runs it through the chosen engine (Gemini/Grok), chroma-keys the
+    green to transparency, and bundles all the transparent PNGs into ONE .zip.
+
+    This is the bulk sibling of ``export_all_panels`` — same input shape — but
+    with the Gemini/Grok clean + background-removal step applied to each crop."""
+    import io
+    import uuid
+    import zipfile
+
+    import httpx
+
+    from flowboard.services.comic import xai
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+
+    cfg, err = _bubble_clean_config(params)
+    if err:
+        return {}, err
+    transparent = cfg["transparent"]
+
+    cache = _bubble_cache_load()
+    cache_lock = asyncio.Lock()
+    reused = 0
+    sem = asyncio.Semaphore(int(os.getenv("FLOWBOARD_XAI_CONCURRENCY", "3")))
+
+    async def _process(idx: int, spec: dict, client: httpx.AsyncClient) -> Optional[tuple[int, bytes]]:
+        nonlocal reused
+        # Resume: if this exact bubble+prompt was cleaned before and the media is
+        # still on disk, reuse it — no API call, no extra cost.
+        key = _bubble_cache_key(spec, cfg["prompt"])
+        hit = cache.get(key)
+        if isinstance(hit, str):
+            p = media_service.cached_path(hit)
+            if p is not None:
+                try:
+                    reused += 1
+                    return (idx, await asyncio.to_thread(p.read_bytes))
+                except OSError:
+                    pass
+
+        src = await asyncio.to_thread(_source_image_bytes, spec)  # crop the box → PNG
+        if not src:
+            return None
+        async with sem:
+            try:
+                cleaned = await _edit_bubble(cfg, src, client)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("clean_all_bubbles[%s] #%d failed: %s", cfg["engine"], idx, exc)
+                return None
+        if transparent:
+            try:
+                cleaned = await asyncio.to_thread(_bubble_keyed_png, cleaned)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("chroma-key #%d failed (keeping green): %s", idx, exc)
+        # Persist this cleaned bubble as media + remember it, so a re-run resumes.
+        cid = str(uuid.uuid4())
+        ok = await asyncio.to_thread(
+            media_service.ingest_inline_bytes, cid, cleaned, kind="image", mime="image/png"
+        )
+        if ok:
+            async with cache_lock:
+                cache[key] = cid
+                _bubble_cache_save(cache)
+        return (idx, cleaned)
+
+    try:
+        async with httpx.AsyncClient(timeout=xai._TIMEOUT) as client:
+            results = await asyncio.gather(
+                *(_process(i, s, client) for i, s in enumerate(specs) if isinstance(s, dict))
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("clean_all_bubbles failed")
+        return {}, f"clean_failed: {str(exc)[:160]}"
+
+    items = [r for r in results if r is not None]
+    if not items:
+        return {}, "no_bubbles_cleaned"
+    items.sort(key=lambda t: t[0])  # reading order = caller order
+
+    def _zip() -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, (_, png) in enumerate(items, 1):
+                zf.writestr(f"bubble-{i:04d}.png", png)
+        return buf.getvalue()
+
+    zip_bytes = await asyncio.to_thread(_zip)
+    mid = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(mid, zip_bytes, kind="file", mime="application/zip")
+    result = {
+        "mediaId": mid,
+        "count": len(items),
+        "fail_count": len(results) - len(items),
+        "reused": reused,
+        "engine": cfg["engine"],
+        "node_id": params.get("__node_id"),
+    }
+    logger.info(
+        "clean_all_bubbles[%s]: %d/%d cleaned (%d reused from cache) -> zip",
+        cfg["engine"], len(items), len(results), reused,
+    )
     return result, None
 
 
@@ -950,7 +1306,7 @@ def _source_image_bytes(params: dict) -> Optional[bytes]:
         x2 = min(W, x + int(box.get("w", 0)))
         y2 = min(H, y + int(box.get("h", 0)))
         if x2 > x and y2 > y:
-            return panel_svc.encode_png(bgr[y:y2, x:x2])
+            return panel_svc.encode_png(panel_svc.crop_box(bgr, (x, y, x2 - x, y2 - y), _box_crop_poly(box)))
     return None
 
 
@@ -982,36 +1338,48 @@ def _page_ref_bytes(params: dict) -> Optional[bytes]:
 
 async def _bridge_edit(
     raw: bytes, prompt: str, *, project_id: str, aspect: str, image_model: Optional[str],
-    references: Optional[list[bytes]], pad_916: bool, node_id,
+    references: Optional[list[bytes]], pad_916: bool, node_id, variant_count: int = 1,
 ) -> tuple[dict, Optional[str]]:
     """Run bridge.edit_image(raw + refs, prompt) → (optional 9:16 letterbox) →
-    cache → return media_id + dims."""
+    cache → return media_id + dims. With ``variant_count`` > 1, return every
+    candidate in ``mediaIds`` (the "x4" on Flow) — ``mediaId`` is the first."""
     from flowboard.services.comic import bridge, panels as panel_svc
     import uuid
 
+    n = max(1, min(int(variant_count or 1), 4))
     try:
-        out = await bridge.edit_image(
-            raw, prompt, reference_images=references,
-            project_id=project_id, aspect_ratio=aspect, image_model=image_model,
-        )
+        if n == 1:
+            outs = [await bridge.edit_image(
+                raw, prompt, reference_images=references,
+                project_id=project_id, aspect_ratio=aspect, image_model=image_model,
+            )]
+        else:
+            outs = await bridge.edit_image_variants(
+                raw, prompt, reference_images=references,
+                project_id=project_id, aspect_ratio=aspect, image_model=image_model,
+                variant_count=n,
+            )
     except bridge.BridgeEditError as exc:
         return {}, f"bridge_failed: {exc.reason}"[:200]
 
-    if pad_916:
-        try:
-            out = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
-        except Exception:  # noqa: BLE001
-            pass
-
-    media_id = str(uuid.uuid4())
-    media_service.ingest_inline_bytes(media_id, out, kind="image", mime="image/png")
+    media_ids: list[str] = []
     w = h = 0
-    try:
-        img = panel_svc.decode_bgr(out)
-        h, w = int(img.shape[0]), int(img.shape[1])
-    except Exception:  # noqa: BLE001
-        pass
-    return {"mediaId": media_id, "width": w, "height": h, "node_id": node_id}, None
+    for out in outs:
+        if pad_916:
+            try:
+                out = panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
+            except Exception:  # noqa: BLE001
+                pass
+        mid = str(uuid.uuid4())
+        media_service.ingest_inline_bytes(mid, out, kind="image", mime="image/png")
+        media_ids.append(mid)
+        if w == 0:
+            try:
+                img = panel_svc.decode_bgr(out)
+                h, w = int(img.shape[0]), int(img.shape[1])
+            except Exception:  # noqa: BLE001
+                pass
+    return {"mediaId": media_ids[0], "mediaIds": media_ids, "width": w, "height": h, "node_id": node_id}, None
 
 
 async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
@@ -1050,6 +1418,7 @@ async def _handle_clean_panel(params: dict) -> tuple[dict, Optional[str]]:
     return await _bridge_edit(
         raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
         references=refs, pad_916=extend, node_id=params.get("__node_id"),
+        variant_count=params.get("variant_count") or 1,
     )
 
 
@@ -1099,6 +1468,148 @@ def _match_and_load_char_refs(panel_bytes: bytes, chars: list) -> list[bytes]:
     return refs
 
 
+def _find_char(chars: object, char_id: object) -> Optional[dict]:
+    if not isinstance(chars, list) or not isinstance(char_id, str) or not char_id:
+        return None
+    return next((c for c in chars if isinstance(c, dict) and str(c.get("id")) == char_id), None)
+
+
+def _order_views_for_panel(views: list, shot: object, orientation: object) -> list[str]:
+    """Order a character's typed reference views (``refViews``: [{mediaId, kind}])
+    to best match the panel's camera: a close-up wants the FACE view, a wide
+    shot wants the BODY view, a back-facing panel wants the BACK view. Attaching
+    the wrong-scale view is what caused the reproduced failures (full-body sheet
+    hijacking a close-up; face ref rotating a back view). Unknown/auto kinds are
+    kept as generic fallbacks after the preferred kinds."""
+    if orientation == "back":
+        pref = ["back", "body", "face"]
+    elif shot in ("closeup", "close-up"):
+        pref = ["face", "body", "back"]
+    elif shot == "wide":
+        pref = ["body", "face", "back"]
+    else:  # medium / untagged — current default: face first, then body
+        pref = ["face", "body", "back"]
+    rank = {k: i for i, k in enumerate(pref)}
+    by_pref = sorted(
+        range(len(views)),
+        key=lambda i: (
+            rank.get(str((views[i] or {}).get("kind")), len(pref)),  # preferred kinds first
+            i,                                                        # stable within a kind
+        ),
+    )
+    # KIND-DIVERSE pick: at most ONE view per kind (the best face + the best
+    # body + …), not three near-identical sheet crops. Several clean white-bg
+    # sheet views of the same kind OVERPOWER the source panel — the model (esp.
+    # the lighter flash tier) just reproduces the sheet instead of editing the
+    # panel. One identity anchor + one scale anchor carries the same signal at
+    # half the pull.
+    ordered: list[str] = []
+    seen_kinds: set = set()
+    leftovers: list[str] = []
+    for idx in by_pref:
+        v = views[idx]
+        mid = v.get("mediaId") if isinstance(v, dict) else None
+        if not (isinstance(mid, str) and mid) or mid in ordered or mid in leftovers:
+            continue
+        kind = str(v.get("kind"))
+        if kind not in seen_kinds:
+            seen_kinds.add(kind)
+            ordered.append(mid)
+        else:
+            leftovers.append(mid)
+    return ordered + leftovers
+
+
+def _assigned_char_refs(spec: object, chars: object, limit: int = 2) -> list[bytes]:
+    """If the panel spec names an explicit ``char_id``, load that character's
+    reference crops directly — bypassing CCIP entirely. This is the
+    human/Director-assigned path that replaces the appearance-clustering CCIP
+    match, which can't separate this comic's characters.
+
+    When the character carries typed ``refViews`` (face/body/back crops from a
+    segmented character sheet), the views are reordered to match the panel's
+    ``shot`` + ``orientation`` tags so a close-up gets the face view and a wide
+    gets the body view. Falls back to the flat ``refMediaIds`` (newest first —
+    canon is prepended on promote). Returns [] when no char_id / no such
+    character / no readable refs."""
+    char = _find_char(chars, spec.get("char_id") if isinstance(spec, dict) else None)
+    if char is None:
+        return []
+    views = char.get("refViews")
+    if isinstance(views, list) and views:
+        sp = spec if isinstance(spec, dict) else {}
+        media_ids = _order_views_for_panel(views, sp.get("shot"), sp.get("orientation"))
+    else:
+        media_ids = [m for m in (char.get("refMediaIds") or []) if isinstance(m, str)]
+    refs: list[bytes] = []
+    for mid in media_ids[:limit]:
+        p = media_service.cached_path(mid)
+        if p is None:
+            continue
+        try:
+            refs.append(p.read_bytes())
+        except OSError:
+            continue
+    return refs
+
+
+def _assigned_char_name(spec: object, chars: object) -> Optional[str]:
+    """Human-readable name of the spec's assigned character (for prompt wording)."""
+    char = _find_char(chars, spec.get("char_id") if isinstance(spec, dict) else None)
+    name = char.get("name") if isinstance(char, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def _assigned_char_desc(spec: object, chars: object) -> Optional[str]:
+    """The character's canonical text descriptor — reused VERBATIM in every
+    prompt that character appears in (prompt-token consistency)."""
+    char = _find_char(chars, spec.get("char_id") if isinstance(spec, dict) else None)
+    desc = char.get("descriptor") if isinstance(char, dict) else None
+    desc = desc.strip() if isinstance(desc, str) else ""
+    return desc or None
+
+
+def _style_ref_bytes(media_id: object) -> Optional[bytes]:
+    """Load the project's STYLE FRAME reference image bytes (a uniform look
+    applied across every panel), or None."""
+    if not isinstance(media_id, str) or not media_id:
+        return None
+    p = media_service.cached_path(media_id)
+    if p is None:
+        return None
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
+def _panel_reference_bytes(
+    panel_bytes: bytes,
+    panel_params: dict,
+    chars: object,
+    *,
+    include_page: bool = True,
+    auto_match: bool = True,
+) -> list[bytes]:
+    """References for a comic panel edit: the full source page for environment
+    continuity plus character crops for identity/costume continuity.
+
+    Character refs are resolved in priority order: an explicit per-cell
+    ``char_id`` (human-assigned, frozen canon — always used) wins; otherwise, only
+    when ``auto_match`` is on, fall back to the CCIP appearance match."""
+    refs: list[bytes] = []
+    if include_page:
+        page_ref = _page_ref_bytes(panel_params)
+        if page_ref:
+            refs.append(page_ref)
+    assigned = _assigned_char_refs(panel_params, chars)
+    if assigned:
+        refs.extend(assigned)
+    elif auto_match and isinstance(chars, list) and chars:
+        refs.extend(_match_and_load_char_refs(panel_bytes, chars))
+    return refs[:5]
+
+
 async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     from flowboard.services.comic import prompts
 
@@ -1108,15 +1619,8 @@ async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     raw = await asyncio.to_thread(_source_image_bytes, params)
     if raw is None:
         return {}, "no_source_image"
-    page_ref = await asyncio.to_thread(_page_ref_bytes, params)
-    refs: list[bytes] = []
-    if page_ref:
-        refs.append(page_ref)
     # Auto-match the panel's character → add its reference crops for consistency.
-    chars = params.get("characters")
-    if isinstance(chars, list) and chars:
-        refs.extend(await asyncio.to_thread(_match_and_load_char_refs, raw, chars))
-    refs = refs[:5]  # cap multi-image input
+    refs = await asyncio.to_thread(_panel_reference_bytes, raw, params, params.get("characters"))
 
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
@@ -1125,6 +1629,7 @@ async def _handle_enhance_panel(params: dict) -> tuple[dict, Optional[str]]:
     return await _bridge_edit(
         raw, prompt, project_id=project_id.strip(), aspect=aspect, image_model=image_model,
         references=refs or None, pad_916=False, node_id=params.get("__node_id"),
+        variant_count=params.get("variant_count") or 1,
     )
 
 
@@ -1197,11 +1702,19 @@ async def _handle_build_character_db(params: dict) -> tuple[dict, Optional[str]]
 # that single "ground truth" image to the bridge with COMBINE_2X2_PROMPT → the
 # model removes text, keeps characters faithful, extends backgrounds to 9:16.
 
+# How many panel cleans run at once during a combine. Parallel Flow generations
+# are faster but a big burst can trip Google's anti-abuse
+# (PUBLIC_ERROR_UNUSUAL_ACTIVITY / reCAPTCHA), so default to a modest 2 and let
+# it be tuned (1 = fully sequential / safest).
+COMBINE_CONCURRENCY = max(1, int(os.getenv("FLOWBOARD_COMBINE_CONCURRENCY", "2")))
+
+
 async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     """Clean each of the up-to-4 panels INDIVIDUALLY via the bridge (remove
     text/bubbles + reconstruct art), then code-stitch the cleaned panels into a
     clean 2×2 grid. The model never does the layout — code does — so the grid is
-    exact (no re-selecting/rearranging/invented panels)."""
+    exact (no re-selecting/rearranging/invented panels). The four cleans run in
+    parallel (capped) so the Flow generations overlap instead of serialising."""
     from flowboard.services.comic import bridge, panels as panel_svc, prompts
 
     project_id = params.get("project_id")
@@ -1212,6 +1725,10 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "missing_panels"
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
+    chars = params.get("characters")
+    # CCIP appearance-match is the opt-in fallback; an explicit per-cell char_id
+    # always wins regardless of this flag.
+    auto_match = bool(params.get("auto_match", True))
     pid = project_id.strip()
 
     raws = await asyncio.to_thread(
@@ -1220,26 +1737,64 @@ async def _handle_combine_panels(params: dict) -> tuple[dict, Optional[str]]:
     if all(r is None for r in raws):
         return {}, "no_source_image"
 
-    # Clean + extend EVERY panel to the same 9:16 portrait so all four cells are
-    # uniformly filled (no white letterbox on the landscape panels).
-    cell_prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16
-    cleaned: list = []
-    for raw in raws:
+    # Clean + extend every panel to the same 9:16 portrait so all four cells are
+    # filled before code stitches the exact 2×2 layout. Run the cleans in
+    # parallel (capped) so the Flow generations overlap. Character refs remain
+    # opt-in and are used only for identity/costume consistency.
+    sem = asyncio.Semaphore(COMBINE_CONCURRENCY)
+
+    async def _clean_one(spec, raw) -> tuple[Optional["object"], Optional[str]]:
         if raw is None:
-            cleaned.append(None)
-            continue
-        try:
-            out = await bridge.edit_image(
-                raw, cell_prompt, project_id=pid,
-                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+            return None, None
+        sp = spec if isinstance(spec, dict) else {}
+        refs = await asyncio.to_thread(
+            lambda: _panel_reference_bytes(raw, sp, chars, include_page=False, auto_match=auto_match)
+        )
+        # Pre-pad the panel onto a 9:16 canvas with edge-replicated seed bands
+        # (same trick as the standalone clean node): the model then OUTPAINTS
+        # the full frame instead of letterboxing. Without this, an extreme-wide
+        # strip (e.g. a letterboxed close-up) comes back as a face with empty
+        # bars instead of a fully painted 9:16 panel.
+        def _prep() -> bytes:
+            try:
+                return panel_svc.encode_png(
+                    panel_svc.pad_to_aspect(panel_svc.decode_bgr(raw), 9, 16, mode="replicate")
+                )
+            except Exception:  # noqa: BLE001
+                return raw
+        raw916 = await asyncio.to_thread(_prep)
+        clause = (
+            prompts.combine_reference_clause(
+                char_name=_assigned_char_name(sp, chars),
+                char_desc=_assigned_char_desc(sp, chars),
+                outfit=sp.get("outfit"),
+                override_axes=sp.get("override_axes"),
             )
-        except bridge.BridgeEditError as exc:
-            return {}, f"bridge_failed: {exc.reason}"[:200]
+            if refs
+            else ""
+        )
+        if sp.get("bg_type") not in prompts.NO_ENV_BG_TYPES:
+            clause += prompts.environment_clause(sp.get("env_descriptor"))
+        clause += prompts.mood_clause(sp.get("mood"))
+        prompt = prompts.CLEAN_PROMPT + prompts.EXTEND_9_16 + clause
+        async with sem:
+            try:
+                out = await bridge.edit_image(
+                    raw916, prompt, reference_images=refs or None, project_id=pid,
+                    aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                )
+            except bridge.BridgeEditError as exc:
+                return None, f"bridge_failed: {exc.reason}"[:200]
         try:
-            # guarantee exact 9:16 even if the model returned a slightly off size
-            cleaned.append(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16))
+            return panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16), None
         except Exception:  # noqa: BLE001
-            cleaned.append(None)
+            return None, None
+
+    results = await asyncio.gather(*[_clean_one(s, r) for s, r in zip(specs[:4], raws)])
+    err = next((e for _, e in results if e), None)
+    if err:
+        return {}, err
+    cleaned: list = [bgr for bgr, _ in results]
 
     if all(c is None for c in cleaned):
         return {}, "all_panels_failed"
@@ -1270,10 +1825,26 @@ def _ingest_pngs(pngs: list) -> list:
     return [None if p is None else _ingest_png(p) for p in pngs]
 
 
+def _stitch_cells(cells: list) -> tuple[bytes, int, int]:
+    """Code-stitch the 2×2 composite from up to 4 cell media ids (each already a
+    cleaned 9:16 cell). Missing/unreadable cells become blank slots."""
+    from flowboard.services.comic import panels as panel_svc
+    bgrs = []
+    for cid in cells[:4]:
+        path = media_service.cached_path(cid) if isinstance(cid, str) else None
+        try:
+            bgrs.append(panel_svc.decode_bgr(path.read_bytes()) if path else None)
+        except Exception:  # noqa: BLE001
+            bgrs.append(None)
+    comp = panel_svc.stitch_2x2(bgrs)
+    return panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+
+
 async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
     """Re-clean ONE panel of a combine group and re-stitch the 2×2, reusing the
     other (already-cleaned) cells. Lets the user fix the one cell that came out
-    wrong without re-running all four."""
+    wrong without re-running all four. With ``variant_count`` > 1, returns
+    ``candidates`` for the cell instead of committing — the user picks one."""
     from flowboard.services.comic import bridge, panels as panel_svc, prompts
 
     project_id = params.get("project_id")
@@ -1290,39 +1861,1162 @@ async def _handle_regen_cell(params: dict) -> tuple[dict, Optional[str]]:
         return {}, "bad_index"
     image_model = params.get("image_model")
     image_model = image_model if isinstance(image_model, str) and image_model else None
+    chars = params.get("characters")
+    auto_match = bool(params.get("auto_match", True))
 
     raw = await asyncio.to_thread(_source_image_bytes, panel)
     if raw is None:
         return {}, "no_source_image"
-    try:
-        out = await bridge.edit_image(
-            raw, prompts.CLEAN_PROMPT + prompts.EXTEND_9_16, project_id=project_id.strip(),
-            aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+    refs = await asyncio.to_thread(
+        lambda: _panel_reference_bytes(raw, panel, chars, include_page=False, auto_match=auto_match)
+    )
+    # Optional custom prompt — lets the user steer a single re-gen (e.g. "make
+    # the lighting warmer") instead of the default clean+extend. Blank → default.
+    custom = params.get("prompt")
+    custom = custom.strip() if isinstance(custom, str) else ""
+    base = custom or (prompts.CLEAN_PROMPT + prompts.EXTEND_9_16)
+    clause = (
+        prompts.combine_reference_clause(
+            char_name=_assigned_char_name(panel, chars),
+            char_desc=_assigned_char_desc(panel, chars),
+            outfit=panel.get("outfit"),
+            override_axes=panel.get("override_axes"),
         )
+        if refs
+        else ""
+    )
+    if panel.get("bg_type") not in prompts.NO_ENV_BG_TYPES:
+        clause += prompts.environment_clause(panel.get("env_descriptor"))
+    clause += prompts.mood_clause(panel.get("mood"))
+    prompt = base + clause
+
+    # Same 9:16 pre-pad as the combine path: give the model a full-frame canvas
+    # with edge-replicated seed bands to outpaint, so a wide strip doesn't come
+    # back letterboxed.
+    def _prep() -> bytes:
+        try:
+            return panel_svc.encode_png(
+                panel_svc.pad_to_aspect(panel_svc.decode_bgr(raw), 9, 16, mode="replicate")
+            )
+        except Exception:  # noqa: BLE001
+            return raw
+    raw = await asyncio.to_thread(_prep)
+    n = max(1, min(int(params.get("variant_count") or 1), 4))
+    try:
+        if n == 1:
+            outs = [await bridge.edit_image(
+                raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
+                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+            )]
+        else:
+            outs = await bridge.edit_image_variants(
+                raw, prompt, reference_images=refs or None, project_id=project_id.strip(),
+                aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                variant_count=n,
+            )
     except bridge.BridgeEditError as exc:
         return {}, f"bridge_failed: {exc.reason}"[:200]
 
+    def _pad_ingest(b: bytes) -> str:
+        return _ingest_png(panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(b), 9, 16)))
+
+    if n > 1:
+        # x4: return the candidates for this cell — the user picks one, then the
+        # frontend commits it via restitch_cells. Don't change the grid yet.
+        candidates = await asyncio.to_thread(lambda: [_pad_ingest(o) for o in outs])
+        return {"candidates": candidates, "index": index, "node_id": params.get("__node_id")}, None
+
     def _rebuild() -> tuple[list, bytes, int, int]:
         new_cells = list(cells)
-        new_cells[index] = _ingest_png(panel_svc.encode_png(panel_svc.pad_to_aspect(panel_svc.decode_bgr(out), 9, 16)))
-        bgrs = []
-        for cid in new_cells[:4]:
-            path = media_service.cached_path(cid) if isinstance(cid, str) else None
-            try:
-                bgrs.append(panel_svc.decode_bgr(path.read_bytes()) if path else None)
-            except Exception:  # noqa: BLE001
-                bgrs.append(None)
-        comp = panel_svc.stitch_2x2(bgrs)
-        return new_cells, panel_svc.encode_png(comp), int(comp.shape[1]), int(comp.shape[0])
+        new_cells[index] = _pad_ingest(outs[0])
+        composite, w, h = _stitch_cells(new_cells)
+        return new_cells, composite, w, h
 
     new_cells, composite, w, h = await asyncio.to_thread(_rebuild)
     return {"mediaId": _ingest_png(composite), "cells": new_cells, "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_export_all_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Crop every detected/hand-adjusted panel box (already in reading order) and
+    bundle them as INDIVIDUAL PNG files into ONE downloadable ZIP — all panels
+    gathered in one archive, not stitched into a single image. Pure local (no
+    bridge call)."""
+    import io
+    import uuid
+    import zipfile
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+
+    def _run() -> Optional[tuple[bytes, int]]:
+        pngs: list[bytes] = []
+        for s in specs:
+            if not isinstance(s, dict):
+                continue
+            b = _source_image_bytes(s)  # already a PNG crop of the box region
+            if b:
+                pngs.append(b)
+        if not pngs:
+            return None
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, png in enumerate(pngs, 1):
+                zf.writestr(f"panel-{i:04d}.png", png)  # reading order = caller order
+        return buf.getvalue(), len(pngs)
+
+    res = await asyncio.to_thread(_run)
+    if res is None:
+        return {}, "no_panels"
+    zip_bytes, count = res
+    mid = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(mid, zip_bytes, kind="file", mime="application/zip")
+    return {"mediaId": mid, "count": count, "node_id": params.get("__node_id")}, None
+
+
+# ── Comic pipeline — Director: chapter-wide WHO via magiv2 ───────────────────
+# One local pass (no Flow, no LLM): magiv2 reads the chapter pages with a named
+# character bank built from the Character DB's reference views and returns
+# character boxes per page. Each named box is mapped to the panel box that
+# contains it; the largest named figure in a panel becomes that panel's
+# char_id. The frontend then routes those assignments into every combine
+# node's per-cell settings.
+
+
+def _box_containment(inner: tuple, outer: tuple) -> float:
+    """Fraction of ``inner``'s area inside ``outer`` (both (x, y, w, h))."""
+    ix, iy, iw, ih = inner
+    ox, oy, ow, oh = outer
+    x0, y0 = max(ix, ox), max(iy, oy)
+    x1, y1 = min(ix + iw, ox + ow), min(iy + ih, oy + oh)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0) / float(max(1, iw * ih))
+
+
+def _primary_char_per_panel(
+    panel_boxes: list[dict], char_boxes: list[tuple], min_containment: float = 0.4
+) -> dict:
+    """Map detected character boxes to panel boxes → {panel box id: char_id}.
+
+    A character belongs to the panel that contains most of it; per panel the
+    LARGEST assigned character wins (the focal figure). Unnamed detections
+    ("Other") never made it into ``char_boxes``."""
+    best: dict = {}
+    area: dict = {}
+    for (cbox, char_id) in char_boxes:
+        panel_id, panel_frac = None, min_containment
+        for pb in panel_boxes:
+            frac = _box_containment(cbox, (pb["x"], pb["y"], pb["w"], pb["h"]))
+            if frac > panel_frac:
+                panel_id, panel_frac = pb["id"], frac
+        if panel_id is None:
+            continue
+        c_area = cbox[2] * cbox[3]
+        if c_area > area.get(panel_id, 0):
+            best[panel_id] = char_id
+            area[panel_id] = c_area
+    return best
+
+
+async def _handle_magi_assign_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Chapter-wide character assignment: run magiv2 over the given pages with a
+    character bank from the Character DB, then map each named character box to
+    its panel box. Returns {assignments: {page_media_id: {box_id: char_id}}}.
+    Pure local (no bridge / no LLM call)."""
+    from flowboard.services.comic import panels as panel_svc
+    from flowboard.services.comic.panel_ml import MLUnavailable
+
+    pages_in = params.get("pages")
+    if not isinstance(pages_in, list) or not pages_in:
+        return {}, "missing_pages"
+    chars = params.get("characters")
+    chars = [c for c in chars if isinstance(c, dict)] if isinstance(chars, list) else []
+    if not chars:
+        return {}, "missing_characters"
+
+    def _run() -> Optional[tuple[dict, int]]:
+        from flowboard.services.comic import magi as magi_svc
+
+        # Character bank: up to 2 reference crops per character (face + body
+        # views carry the most identity signal), all sharing the char_id name.
+        bank_imgs: list = []
+        bank_names: list[str] = []
+        for c in chars:
+            mids = [m for m in (c.get("refMediaIds") or []) if isinstance(m, str)][:2]
+            for mid in mids:
+                p = media_service.cached_path(mid)
+                if p is None:
+                    continue
+                try:
+                    bank_imgs.append(panel_svc.decode_bgr(p.read_bytes()))
+                    bank_names.append(str(c.get("id")))
+                except Exception:  # noqa: BLE001
+                    continue
+        if not bank_imgs:
+            return None
+
+        page_bgrs: list = []
+        page_meta: list[tuple[str, list[dict]]] = []  # (media_id, boxes)
+        for pg in pages_in:
+            if not isinstance(pg, dict):
+                continue
+            mid = pg.get("media_id") or pg.get("mediaId")
+            boxes = pg.get("boxes")
+            if not isinstance(mid, str) or not isinstance(boxes, list) or not boxes:
+                continue
+            p = media_service.cached_path(mid)
+            if p is None:
+                continue
+            try:
+                page_bgrs.append(panel_svc.decode_bgr(p.read_bytes()))
+            except Exception:  # noqa: BLE001
+                continue
+            page_meta.append((mid, [b for b in boxes if isinstance(b, dict) and "id" in b]))
+        if not page_bgrs:
+            return None
+
+        per_page = magi_svc.predict_page_characters(page_bgrs, bank_imgs, bank_names)
+        known = {str(c.get("id")) for c in chars}
+        assignments: dict = {}
+        n_assigned = 0
+        for (mid, boxes), detections in zip(page_meta, per_page):
+            named = [(box, name) for (box, name) in detections if name in known]
+            mapping = _primary_char_per_panel(boxes, named)
+            if mapping:
+                assignments[mid] = mapping
+                n_assigned += len(mapping)
+        return assignments, n_assigned
+
+    try:
+        res = await asyncio.to_thread(_run)
+    except MLUnavailable as exc:
+        return {}, f"ml_unavailable: {str(exc)[:200]}"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("magi_assign_panels failed")
+        return {}, f"magi_failed: {str(exc)[:200]}"
+    if res is None:
+        return {}, "no_readable_inputs"
+    assignments, n_assigned = res
+    return {
+        "assignments": assignments,
+        "panels_assigned": n_assigned,
+        "node_id": params.get("__node_id"),
+    }, None
+
+
+# ── Comic pipeline — Director: auto-tag panels (who / shot / orientation) ────
+# One vision call per combine group: the configured Vision provider (the same
+# LLM CLI already used for aiBriefs — zero Flow cost) looks at the cast's
+# sample crops + the panel crops and returns, per panel, WHICH character is the
+# primary figure, the SHOT scale, and the facing ORIENTATION. The frontend
+# turns those tags into per-cell routing (char_id, view selection, and
+# auto-disabling the identity override on back/profile panels — the tag that
+# prevents the "back of head rotated to face camera" failure).
+
+_TAG_SYSTEM = (
+    "You are a comic panel annotator. You are given character reference images "
+    "followed by comic panel images. For EACH panel, identify: (1) which listed "
+    "character is the PRIMARY (largest / focal) figure, or null if none of the "
+    "listed characters is present or you are unsure; (2) the shot scale: "
+    "\"closeup\" (face or a detail fills the panel), \"medium\" (roughly "
+    "waist-up), or \"wide\" (full body or environment dominates); (3) the "
+    "primary figure's facing: \"front\" (face mostly visible), \"profile\" "
+    "(side view), or \"back\" (facing away / back of head). Respond with ONLY a "
+    "JSON array, one object per panel, in panel order: "
+    '[{"panel": 1, "char_id": "char_0" | null, "shot": "closeup|medium|wide", '
+    '"orientation": "front|profile|back", "confidence": 0.0-1.0}]. '
+    "No prose, no markdown fences — just the JSON array."
+)
+
+_VALID_SHOTS = {"closeup", "medium", "wide"}
+_VALID_ORIENTATIONS = {"front", "profile", "back"}
+
+
+def _parse_panel_tags(text: str, n_panels: int, char_ids: set) -> Optional[list[dict]]:
+    """Parse + sanitize the model's JSON tag array. Returns None if unusable."""
+    import json
+    import re
+
+    raw = (text or "").strip()
+    m = re.search(r"\[.*\]", raw, re.DOTALL)  # tolerate prose / fences around the array
+    if not m:
+        return None
+    try:
+        arr = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(arr, list):
+        return None
+    tags: list[dict] = []
+    for i in range(n_panels):
+        entry = arr[i] if i < len(arr) and isinstance(arr[i], dict) else {}
+        cid = entry.get("char_id")
+        shot = str(entry.get("shot") or "").lower().replace("close-up", "closeup")
+        ori = str(entry.get("orientation") or "").lower()
+        conf = entry.get("confidence")
+        tags.append({
+            "char_id": cid if isinstance(cid, str) and cid in char_ids else None,
+            "shot": shot if shot in _VALID_SHOTS else None,
+            "orientation": ori if ori in _VALID_ORIENTATIONS else None,
+            "confidence": float(conf) if isinstance(conf, (int, float)) else None,
+        })
+    return tags
+
+
+async def _handle_tag_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Auto-tag up to 4 panels: primary character (from the cast), shot scale,
+    and facing orientation — via the configured Vision provider. Local + LLM CLI
+    only; no Flow generation is spent."""
+    import shutil
+    import tempfile
+
+    from flowboard.services.llm.base import LLMError
+    from flowboard.services.llm.registry import run_llm
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+    chars = params.get("characters")
+    chars = [c for c in chars if isinstance(c, dict)] if isinstance(chars, list) else []
+
+    tmpdir = tempfile.mkdtemp(prefix="flowboard-tag-")
+
+    from flowboard.services.llm.cli_utils import MAX_ATTACHMENTS
+
+    def _prepare() -> Optional[tuple[list[str], list[str], int]]:
+        """Write cast samples + panel crops as files → (paths, cast_lines, n_panels).
+        Total attachments are capped at MAX_ATTACHMENTS — panels (≤4) take
+        priority, the cast bank fills the rest."""
+        n_specs = min(len([s for s in specs[:4] if isinstance(s, dict)]), 4)
+        cast_budget = max(0, MAX_ATTACHMENTS - n_specs)
+        paths: list[str] = []
+        cast_lines: list[str] = []
+        for c in chars:
+            if len(cast_lines) >= cast_budget:
+                break
+            sid = c.get("sampleMediaId")
+            p = media_service.cached_path(sid) if isinstance(sid, str) else None
+            if p is None:
+                continue
+            dst = f"{tmpdir}/cast_{len(cast_lines)}.png"
+            try:
+                shutil.copyfile(p, dst)
+            except OSError:
+                continue
+            paths.append(dst)
+            cast_lines.append(f"Image {len(paths)}: character id \"{c.get('id')}\" — {c.get('name') or c.get('id')}")
+        n_panels = 0
+        for s in specs[:4]:
+            if not isinstance(s, dict):
+                continue
+            b = _source_image_bytes(s)
+            if not b:
+                continue
+            dst = f"{tmpdir}/panel_{n_panels}.png"
+            try:
+                with open(dst, "wb") as f:
+                    f.write(b)
+            except OSError:
+                continue
+            paths.append(dst)
+            n_panels += 1
+        if n_panels == 0:
+            return None
+        return paths, cast_lines, n_panels
+
+    prepared = await asyncio.to_thread(_prepare)
+    if prepared is None:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return {}, "no_source_image"
+    paths, cast_lines, n_panels = prepared
+
+    user_prompt = (
+        (("Character references:\n" + "\n".join(cast_lines) + "\n\n") if cast_lines else "")
+        + f"Images {len(cast_lines) + 1}-{len(cast_lines) + n_panels}: comic panels 1-{n_panels} in order.\n"
+        + f"Tag the {n_panels} panel(s)."
+    )
+    try:
+        text = await run_llm(
+            "vision", user_prompt, system_prompt=_TAG_SYSTEM,
+            attachments=paths, timeout=180.0,
+        )
+    except LLMError as exc:
+        return {}, f"vision_failed: {str(exc)[:160]}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    tags = _parse_panel_tags(text, n_panels, {str(c.get("id")) for c in chars})
+    if tags is None:
+        return {}, "bad_tag_response"
+    return {"tags": tags, "node_id": params.get("__node_id")}, None
+
+
+# ── Comic pipeline — Director: chapter-wide SCENE / ENVIRONMENT segmentation ──
+# A cheap VLM pass (the wired LLM CLI — no Flow cost) reads the chapter's panels
+# in reading order and groups them by SETTING, so every panel of one scene gets
+# the SAME environment descriptor (an airport scene all shows the same airport).
+# Keyed by location_label, not a fragile running scene-id: a label seen again
+# later (a place the story revisits) reuses its canonical descriptor for free,
+# and same-label panels get byte-identical wording → strong consistency.
+
+_SCENE_SYSTEM = (
+    "You are a comic SCENE annotator. You are given comic panels in READING ORDER. For EACH panel "
+    "decide its SETTING and return a JSON object: "
+    "{\"panel\": <1-based index>, \"location_label\": <short stable name for the place, e.g. "
+    "\"forest clearing\", \"HQ control room\", \"airport interior\">, \"env_descriptor\": <ONE "
+    "concrete sentence describing the background/setting for image generation: architecture or "
+    "terrain, time of day, palette>, \"bg_type\": one of \"real-location\" (a real place is or "
+    "would be shown), \"flat-band\" (plain/solid/dramatic colour band, no real setting), "
+    "\"abstract-action\" (speed-lines / impact / emotional rays, no real setting), \"mood\": "
+    "<optional short tag like \"flashback-pale\", \"night\", \"\">}. "
+    "REUSE an earlier location_label verbatim when a panel returns to a place already listed under "
+    "\"Locations so far\". Respond with ONLY a JSON array, one object per panel, in order. No prose."
+)
+
+
+def _parse_scene_tags(text: str, n_panels: int) -> Optional[list[dict]]:
+    import json
+    import re
+
+    m = re.search(r"\[.*\]", (text or "").strip(), re.DOTALL)
+    if not m:
+        return None
+    try:
+        arr = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(arr, list):
+        return None
+    out: list[dict] = []
+    for i in range(n_panels):
+        e = arr[i] if i < len(arr) and isinstance(arr[i], dict) else {}
+        label = str(e.get("location_label") or "").strip()
+        bg = str(e.get("bg_type") or "").strip().lower()
+        out.append({
+            "location_label": label or None,
+            "env_descriptor": str(e.get("env_descriptor") or "").strip() or None,
+            "bg_type": bg if bg in ("real-location", "flat-band", "abstract-action") else "real-location",
+            "mood": str(e.get("mood") or "").strip() or None,
+        })
+    return out
+
+
+async def _handle_scene_assign_panels(params: dict) -> tuple[dict, Optional[str]]:
+    """Tag every panel (chapter-wide, reading order) with its scene SETTING via
+    the configured Vision provider, then canonicalize: all panels sharing a
+    location_label get that label's first env_descriptor. Returns per-panel tags
+    (aligned to input order) + a locations map. Local + LLM CLI only (no Flow)."""
+    import shutil
+    import tempfile
+
+    from flowboard.services.llm.base import LLMError
+    from flowboard.services.llm.registry import run_llm
+
+    specs = params.get("panels")
+    if not isinstance(specs, list) or not specs:
+        return {}, "missing_panels"
+    # The wired vision CLIs cap attachments at MAX_ATTACHMENTS (10) per call, so
+    # a scene chunk is ≤ that; cross-chunk continuity is carried via the
+    # "Locations so far" text.
+    from flowboard.services.llm.cli_utils import MAX_ATTACHMENTS
+    chunk_size = max(4, min(int(params.get("chunk_size") or MAX_ATTACHMENTS), MAX_ATTACHMENTS))
+
+    # Crop every panel up front (off-thread); keep only the readable ones, but
+    # remember each one's original index so tags map back exactly.
+    def _crops() -> list[tuple[int, bytes]]:
+        out = []
+        for i, s in enumerate(specs):
+            if not isinstance(s, dict):
+                continue
+            b = _source_image_bytes(s)
+            if b:
+                out.append((i, b))
+        return out
+
+    crops = await asyncio.to_thread(_crops)
+    if not crops:
+        return {}, "no_source_image"
+
+    tags_by_index: dict[int, dict] = {}
+    locations: dict[str, str] = {}  # label → canonical descriptor (first seen)
+    for start in range(0, len(crops), chunk_size):
+        chunk = crops[start:start + chunk_size]
+        tmpdir = tempfile.mkdtemp(prefix="flowboard-scene-")
+        try:
+            def _write() -> list[str]:
+                paths = []
+                for j, (_idx, b) in enumerate(chunk):
+                    p = f"{tmpdir}/panel_{j}.png"
+                    with open(p, "wb") as f:
+                        f.write(b)
+                    paths.append(p)
+                return paths
+            paths = await asyncio.to_thread(_write)
+            seen = "; ".join(f"\"{lbl}\"" for lbl in list(locations)[:30]) or "(none yet)"
+            user = (
+                f"Locations so far: {seen}.\n"
+                f"Here are {len(paths)} comic panels in reading order. Tag all {len(paths)}."
+            )
+            try:
+                text = await run_llm("vision", user, system_prompt=_SCENE_SYSTEM,
+                                     attachments=paths, timeout=180.0)
+            except LLMError as exc:
+                return {}, f"vision_failed: {str(exc)[:160]}"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        parsed = _parse_scene_tags(text, len(chunk))
+        if parsed is None:
+            return {}, "bad_scene_response"
+        for (orig_idx, _b), tag in zip(chunk, parsed):
+            label = tag["location_label"]
+            if label and tag["env_descriptor"] and label not in locations:
+                locations[label] = tag["env_descriptor"]
+            tags_by_index[orig_idx] = tag
+
+    # Canonicalize: every panel inherits its label's first descriptor, so a
+    # revisited place reads identically across the whole chapter.
+    result_tags: list[dict] = []
+    for i in range(len(specs)):
+        t = tags_by_index.get(i)
+        if t is None:
+            result_tags.append({"location_label": None, "env_descriptor": None, "bg_type": "real-location", "mood": None})
+            continue
+        canon = locations.get(t["location_label"]) if t["location_label"] else None
+        result_tags.append({**t, "env_descriptor": canon or t["env_descriptor"]})
+
+    return {
+        "tags": result_tags,
+        "locations": locations,
+        "scene_count": len(locations),
+        "node_id": params.get("__node_id"),
+    }, None
+
+
+async def _handle_segment_character_sheet(params: dict) -> tuple[dict, Optional[str]]:
+    """Auto-split an uploaded character turnaround/reference sheet into individual
+    keyed views (face close-ups + full-body views) and ingest each crop as media.
+    The frontend turns the kept views into a character's frozen canon refs. Pure
+    local (no bridge call)."""
+    import uuid
+
+    from flowboard.services.comic import panels as panel_svc, sheet as sheet_svc
+
+    media_id = params.get("media_id")
+    if not isinstance(media_id, str) or not media_id:
+        return {}, "missing_media_id"
+    path = media_service.cached_path(media_id)
+    if path is None:
+        return {}, "no_source_image"
+
+    def _run() -> Optional[list[tuple[str, bytes, dict]]]:
+        try:
+            bgr = panel_svc.decode_bgr(path.read_bytes())
+        except Exception:  # noqa: BLE001
+            return None
+        seg = sheet_svc.segment_character_sheet(bgr)
+        H, W = bgr.shape[0], bgr.shape[1]
+        crops: list[tuple[str, bytes, dict]] = []
+        for plural, singular in (("faces", "face"), ("bodies", "body")):
+            for (x, y, w, h) in seg.get(plural, []):
+                x2, y2 = min(W, x + w), min(H, y + h)
+                if x2 <= x or y2 <= y:
+                    continue
+                crops.append((singular, panel_svc.encode_png(bgr[y:y2, x:x2]),
+                              {"x": x, "y": y, "w": w, "h": h}))
+        return crops
+
+    crops = await asyncio.to_thread(_run)
+    if crops is None:
+        return {}, "decode_failed"
+    if not crops:
+        return {}, "no_views_found"
+    views: list[dict] = []
+    for kind, png, box in crops:
+        mid = str(uuid.uuid4())
+        media_service.ingest_inline_bytes(mid, png, kind="image", mime="image/png")
+        views.append({"kind": kind, "mediaId": mid, "box": box})
+    return {"views": views, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_restitch_cells(params: dict) -> tuple[dict, Optional[str]]:
+    """Re-stitch the 2×2 from given cell media ids — used after the user picks a
+    re-gen candidate for one cell. Pure local (no bridge call)."""
+    cells = params.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return {}, "missing_cells"
+
+    def _do() -> tuple[str, int, int]:
+        composite, w, h = _stitch_cells(cells)
+        return _ingest_png(composite), w, h
+
+    mid, w, h = await asyncio.to_thread(_do)
+    return {"mediaId": mid, "cells": cells[:4], "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_style_cells(params: dict) -> tuple[dict, Optional[str]]:
+    """FINAL STYLE PASS — restyle already-cleaned/extended 9:16 cells to the
+    project style frame, as a separate step from clean+extend so content is
+    locked and only the art style changes. Restyles the given cell indexes (or
+    all), pushing the styled results back + a fresh 2×2 composite."""
+    from flowboard.services.comic import bridge, prompts
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    cells = params.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return {}, "missing_cells"
+    image_model = params.get("image_model")
+    image_model = image_model if isinstance(image_model, str) and image_model else None
+    style_bytes = await asyncio.to_thread(_style_ref_bytes, params.get("style_ref_media_id"))
+    style_desc = params.get("style_descriptor")
+    style_desc = style_desc.strip() if isinstance(style_desc, str) else ""
+    if not style_bytes and not style_desc:
+        return {}, "missing_style"
+
+    raw_idxs = params.get("indexes")
+    if isinstance(raw_idxs, list) and raw_idxs:
+        targets = [i for i in raw_idxs if isinstance(i, int) and 0 <= i < len(cells)
+                   and isinstance(cells[i], str) and cells[i]]
+    else:
+        targets = [i for i, c in enumerate(cells) if isinstance(c, str) and c]
+    if not targets:
+        return {}, "no_cells"
+
+    prompt = prompts.RESTYLE_PROMPT + prompts.style_frame_clause(style_desc or None, has_ref=bool(style_bytes))
+    refs = [style_bytes] if style_bytes else None
+    pid = project_id.strip()
+    sem = asyncio.Semaphore(COMBINE_CONCURRENCY)
+
+    async def _style_one(i: int):
+        path = media_service.cached_path(cells[i])
+        if path is None:
+            return i, None
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return i, None
+        async with sem:
+            try:
+                out = await bridge.edit_image(
+                    raw, prompt, reference_images=refs, project_id=pid,
+                    aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", image_model=image_model,
+                )
+            except bridge.BridgeEditError as exc:
+                return i, ("err", exc.reason)
+        return i, out
+
+    results = await asyncio.gather(*[_style_one(i) for i in targets])
+    err = next((r[1] for _i, r in results if isinstance(r, tuple) and r[0] == "err"), None)
+    if err:
+        return {}, f"bridge_failed: {err}"[:200]
+
+    def _commit() -> tuple[list, str, int, int]:
+        new_cells = list(cells)
+        for i, out in results:
+            if isinstance(out, (bytes, bytearray)):
+                new_cells[i] = _ingest_png(out)
+        composite, w, h = _stitch_cells(new_cells)
+        return new_cells, _ingest_png(composite), w, h
+
+    new_cells, mid, w, h = await asyncio.to_thread(_commit)
+    return {"mediaId": mid, "cells": new_cells, "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
+async def _handle_upsample_image(params: dict) -> tuple[dict, Optional[str]]:
+    """Upscale a cached image to 2K/4K via Flow (its Download → "Upscaled").
+    ``media_id`` is the local cache id of the image to upscale (any combine
+    cell, the 2×2, a panel, …)."""
+    from flowboard.services.comic import bridge, panels as panel_svc
+    import uuid
+
+    project_id = params.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        return {}, "missing_project_id"
+    media_id = params.get("media_id")
+    if not isinstance(media_id, str) or not media_id:
+        return {}, "missing_media_id"
+    target = params.get("resolution") or params.get("target") or "4K"
+
+    path = media_service.cached_path(media_id)
+    if path is None:
+        return {}, "no_source_image"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return {}, "no_source_image"
+
+    try:
+        out = await bridge.upsample_image(raw, project_id=project_id.strip(), target=str(target))
+    except bridge.BridgeEditError as exc:
+        return {}, f"bridge_failed: {exc.reason}"[:200]
+
+    new_id = str(uuid.uuid4())
+    media_service.ingest_inline_bytes(new_id, out, kind="image", mime="image/jpeg")
+    w = h = 0
+    try:
+        img = panel_svc.decode_bgr(out)
+        h, w = int(img.shape[0]), int(img.shape[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"mediaId": new_id, "width": w, "height": h, "node_id": params.get("__node_id")}, None
+
+
+# Appended to the prompt when the studio's "keep original colors" toggle is on
+# AND the request has reference/source images. Measured on Nano Banana 2 with an
+# identical prompt+reference: mean LAB shift vs the reference dropped from
+# Δa*+7.08/Δb*+4.27 (12 images) to Δa*+2.46/Δb*-0.17 (4 images) — i.e. the
+# unwanted pink/warm cast is mostly gone, leaving only the intended stylisation.
+# Keep this text as-is; it is the exact wording that was validated.
+_PRESERVE_COLORS_CLAUSE = (
+    " QUAN TRỌNG: giữ nguyên chính xác bảng màu của ảnh gốc — cùng tông màu (hue), "
+    "độ bão hoà và cân bằng trắng. Tuyệt đối không color grading, không ám hồng/đỏ, "
+    "không làm ấm màu. (Preserve the original color palette exactly: identical hues, "
+    "saturation and white balance as the reference. No color grading, no warm or pink tint.)"
+)
+
+
+# Layer 2 of "keep original colors": how far to pull the result's chroma back
+# onto the reference. 1.0 = fully locked to the reference, 0 = disabled.
+_COLOR_MATCH_STRENGTH = float(os.getenv("FLOWBOARD_COLOR_MATCH_STRENGTH", "1.0"))
+
+
+def _match_reference_colors(img_bytes: bytes, ref_bytes: bytes, strength: float) -> bytes:
+    """Shift a generated image's mean a*/b* (LAB chroma) onto the reference's.
+
+    This removes the global colour cast image models add while leaving L
+    (luminance) alone, so the intended stylisation — contrast, shading, detail —
+    survives; only the tint is corrected. Measured on the worst-cast samples:
+    mean Δa*/Δb* vs the reference went from +11.0/+5.7 to −0.6/−0.2.
+
+    Returns the input unchanged on any failure — colour matching must never
+    break a generation. Sync + CPU-heavy: call via ``asyncio.to_thread``."""
+    try:
+        import cv2
+        import numpy as np
+
+        out = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        ref = cv2.imdecode(np.frombuffer(ref_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if out is None or ref is None:
+            return img_bytes
+        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.float32)
+        # Means come off 256² copies — identical to the full-res mean for our
+        # purposes and keeps a 4K pair cheap.
+        small = cv2.resize(out, (256, 256), interpolation=cv2.INTER_AREA)
+        olab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).astype(np.float32)
+        rlab = cv2.cvtColor(
+            cv2.resize(ref, (256, 256), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB
+        ).astype(np.float32)
+        for ch in (1, 2):  # a*, b* only — never touch L
+            delta = (rlab[:, :, ch].mean() - olab[:, :, ch].mean()) * strength
+            lab[:, :, ch] = np.clip(lab[:, :, ch] + delta, 0, 255)
+        fixed = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        # Re-encode in the SOURCE's format: PNG in → PNG out (stays lossless),
+        # JPEG in (what Ark returns) → JPEG q95, which adds negligible loss on an
+        # already-lossy image and avoids ballooning a 4K frame from ~1MB to ~18MB.
+        if img_bytes[:3] == b"\xff\xd8\xff":
+            ok, buf = cv2.imencode(".jpg", fixed, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        else:
+            ok, buf = cv2.imencode(".png", fixed)
+        return buf.tobytes() if ok else img_bytes
+    except Exception:  # noqa: BLE001
+        return img_bytes
+
+
+async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
+    """Flow-clone studio: text→image / edit (1-4 variants), fully API-only (no
+    Flow bridge, no paygate tier, no node binding). Interchangeable engines,
+    chosen by ``provider`` (default env ``FLOW_IMAGE_PROVIDER`` else "gemini"):
+
+      - "gemini"  → direct Gemini API, reference/source images sent inline
+                    (works fully locally).
+      - "atrium"  → Atrium passthrough; input images must be PUBLIC urls
+                    (``PUBLIC_MEDIA_BASE_URL`` / tunnel), so refs+edit need that
+                    set. Plain text→image works without it.
+      - "avis"    → Avis gateway (Seedream 5.0 Pro), async job + poll under the
+                    hood; input images inline (base64). Needs ``AVIS_API_KEY``.
+
+    Each result is cached as a local media id, returned in ``media_ids``."""
+    from flowboard.services.comic.bridge import BridgeEditError
+
+    prompt = params.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return {}, "missing_prompt"
+    prompt = prompt.strip()
+
+    provider = params.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        provider = os.getenv("FLOW_IMAGE_PROVIDER", "gemini")
+    provider = provider.strip().lower() or "gemini"
+
+    image_model = params.get("image_model")
+    image_model = image_model.strip() if isinstance(image_model, str) and image_model.strip() else ""
+    if provider == "avis":
+        # Avis catalog id for Seedream 5.0 Pro — no version/date suffix.
+        image_model = image_model or "dola-seedream-5-0-pro"
+    elif not image_model.startswith("gemini-"):
+        # The Gemini and Atrium engines both speak Gemini model ids.
+        image_model = "gemini-2.5-flash-image"
+    aspect = params.get("aspect_ratio")
+    aspect = aspect if isinstance(aspect, str) and aspect else "1:1"
+    image_size = params.get("image_size")
+    image_size = image_size if isinstance(image_size, str) and image_size else None
+    try:
+        variant_count = int(params.get("variant_count") or 1)
+    except (TypeError, ValueError):
+        variant_count = 1
+
+    ref_ids = [r for r in (params.get("ref_media_ids") or []) if isinstance(r, str) and r]
+    source_id = params.get("source_media_id")
+    source_id = source_id if isinstance(source_id, str) and source_id else None
+    if source_id and media_service.cached_path(source_id) is None:
+        return {}, "source_not_found"
+
+    # "Keep original colors" — only meaningful when there IS a reference/source to
+    # match. Appended here (not in the UI) so the stored prompt stays clean for
+    # history/reuse.
+    if params.get("preserve_colors") and (ref_ids or source_id):
+        prompt += _PRESERVE_COLORS_CLAUSE
+
+    # Live progress: write {done, total} onto the running Request row as variants
+    # land, so the frontend can poll it for a "k/N · pct%" placeholder. Throttled
+    # to ≤1 write / ~0.8s (the final done==total always writes) so a big-batch gen
+    # doesn't flood the DB with one write per variant under concurrency.
+    rid = params.get("__request_id")
+    _last_progress = [0.0]
+
+    def _progress(done: int, total: int) -> None:
+        if rid is None:
+            return
+        now = time.monotonic()
+        if done < total and (now - _last_progress[0]) < 0.8:
+            return
+        _last_progress[0] = now
+        try:
+            with get_session() as s:
+                req = s.get(Request, rid)
+                if req is not None and req.status == "running":
+                    req.result = {"progress": {"done": int(done), "total": int(total)}}
+                    s.add(req)
+                    s.commit()
+        except Exception:  # noqa: BLE001 — best-effort; never break a gen
+            pass
+
+    provider_used = provider
+    try:
+        if provider == "atrium":
+            from flowboard.services.comic import atrium_api, gemini_api, r2
+
+            needs_input = bool(source_id) or bool(ref_ids)
+            # Atrium can only ingest input images by PUBLIC url — either R2
+            # (agent uploads, recommended) or a tunnel to /media. When NEITHER
+            # is configured, reference/edit requests have no public url, so we
+            # transparently fall back to the Gemini engine (inline bytes) for
+            # THAT request; pure text→image stays on Atrium.
+            has_public = r2.is_configured() or atrium_api.public_media_base() is not None
+            if needs_input and not has_public and gemini_api.api_key():
+                provider_used = "gemini"
+                outs = await _flow_gen_gemini(
+                    prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                    on_progress=_progress,
+                )
+            else:
+                outs = await _flow_gen_atrium(
+                    prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                    on_progress=_progress,
+                )
+        elif provider == "avis":
+            outs = await _flow_gen_avis(
+                prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                on_progress=_progress,
+            )
+        else:
+            outs = await _flow_gen_gemini(
+                prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                on_progress=_progress,
+            )
+    except BridgeEditError as exc:
+        return {}, f"gen_failed: {exc.reason}"[:200]
+    except _FlowGenError as exc:
+        return {}, str(exc)[:200]
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"gen_failed: {type(exc).__name__}: {exc}"[:200]
+
+    if not outs:
+        return {}, "no_image_generated"
+
+    # "Keep original colors" layer 2 — deterministic cast removal. Only runs when
+    # there's ONE unambiguous colour reference: the edit source, or a single ref.
+    # A multi-reference gen (e.g. character + environment) has no single palette
+    # to match, so we leave it to the prompt hint alone.
+    color_ref_id = source_id or (ref_ids[0] if len(ref_ids) == 1 else None)
+    color_matched = False
+    if params.get("preserve_colors") and color_ref_id and _COLOR_MATCH_STRENGTH > 0:
+        ref_path = media_service.cached_path(color_ref_id)
+        if ref_path is not None:
+            def _match_all() -> list:
+                try:
+                    ref_bytes = ref_path.read_bytes()
+                except OSError:
+                    return outs
+                return [_match_reference_colors(o, ref_bytes, _COLOR_MATCH_STRENGTH) for o in outs]
+
+            matched = await asyncio.to_thread(_match_all)
+            color_matched = matched is not outs
+            outs = matched
+
+    # Ingest (PNG decode/encode + disk write + DB commit) off the event loop so a
+    # 12-variant gen doesn't stall everyone else's polls during the writes.
+    media_ids = await asyncio.to_thread(_ingest_pngs, outs)
+    # Offload the results to R2 in the BACKGROUND so viewers on the public
+    # tunnel hostname are served from the CDN (routes/media.py redirects) —
+    # never blocks or fails the gen; local serving keeps working without it.
+    _spawn_result_offload(list(media_ids))
+    return {
+        "media_ids": media_ids,
+        "provider_used": provider_used,
+        "image_model": image_model,
+        "color_matched": color_matched,
+        "node_id": params.get("__node_id"),
+    }, None
+
+
+# Keep strong references to fire-and-forget offload tasks so the event loop
+# can't garbage-collect them mid-flight.
+_offload_tasks: set = set()
+
+
+def _spawn_result_offload(media_ids: list) -> None:
+    from flowboard.services.comic import r2
+
+    if not (r2.is_configured() and media_ids):
+        return
+
+    def _upload_all() -> None:
+        for mid in media_ids:
+            try:
+                r2.upload_result(mid)
+            except Exception as exc:  # noqa: BLE001 — CDN copy is best-effort
+                logger.warning("r2 result offload failed for %s: %s", mid, exc)
+
+    task = asyncio.create_task(asyncio.to_thread(_upload_all), name="r2-result-offload")
+    _offload_tasks.add(task)
+    task.add_done_callback(_offload_tasks.discard)
+
+
+class _FlowGenError(RuntimeError):
+    """Caller-facing flow-gen failure carrying an already-formatted reason."""
+
+
+async def _flow_gen_gemini(
+    prompt: str, image_model: str, aspect: str, image_size: Optional[str],
+    variant_count: int, ref_ids: list, source_id: Optional[str],
+    on_progress=None,
+) -> list[bytes]:
+    """Direct Gemini engine — reference/source images sent inline (bytes)."""
+    from flowboard.services.comic import gemini_api
+
+    def _load(mid: str) -> Optional[bytes]:
+        p = media_service.cached_path(mid)
+        if p is None:
+            return None
+        try:
+            return p.read_bytes()
+        except OSError:
+            return None
+
+    def _load_all() -> tuple[Optional[bytes], list[bytes]]:
+        src = _load(source_id) if source_id else None
+        refs = [b for b in (_load(r) for r in ref_ids) if b]
+        return src, refs
+
+    source_bytes, ref_bytes = await asyncio.to_thread(_load_all)
+    if source_id and source_bytes is None:
+        raise _FlowGenError("source_not_found")
+
+    if source_bytes is not None:
+        # Edit/refine: re-render the source, preserving its frame (empty aspect).
+        return await gemini_api.edit_image_variants(
+            source_bytes, prompt, ref_bytes or None,
+            image_model=image_model, aspect_ratio="", variant_count=variant_count,
+            on_progress=on_progress,
+        )
+    return await gemini_api.generate_image_variants(
+        prompt, ref_bytes or None,
+        image_model=image_model, aspect_ratio=aspect,
+        variant_count=variant_count, image_size=image_size,
+        on_progress=on_progress,
+    )
+
+
+async def _flow_gen_avis(
+    prompt: str, image_model: str, aspect: str, image_size: Optional[str],
+    variant_count: int, ref_ids: list, source_id: Optional[str],
+    on_progress=None,
+) -> list[bytes]:
+    """Avis gateway (Seedream 5.0 Pro) engine — source + reference images sent
+    INLINE as base64, so refs and edit work fully locally."""
+    from flowboard.services.comic import avis_api
+
+    if not avis_api.is_configured():
+        raise _FlowGenError("avis_not_configured: set AVIS_API_KEY in .env")
+
+    def _load(mid: str) -> Optional[bytes]:
+        p = media_service.cached_path(mid)
+        if p is None:
+            return None
+        try:
+            b = p.read_bytes()
+        except OSError:
+            return None
+        return b or None
+
+    def _load_all() -> tuple[Optional[bytes], list[bytes]]:
+        src = _load(source_id) if source_id else None
+        refs = [b for b in (_load(r) for r in ref_ids) if b]
+        return src, refs
+
+    source_bytes, ref_bytes = await asyncio.to_thread(_load_all)
+    if source_id and source_bytes is None:
+        raise _FlowGenError("source_not_found")
+
+    images = ([source_bytes] if source_bytes else []) + ref_bytes
+    return await avis_api.generate_image_variants(
+        prompt, images or None,
+        image_model=image_model,
+        aspect_ratio="" if source_id else aspect,
+        variant_count=variant_count,
+        image_size=None if source_id else image_size,
+        on_progress=on_progress,
+    )
+
+
+# Reference-counts R2 input uploads shared across CONCURRENT flow_gen_image
+# jobs (WORKER_CONCURRENCY can be > 1, see below) that happen to tag the same
+# source/ref media_id. Without this, one job's cleanup could delete the R2
+# object while a still-running sibling job's Atrium call is mid-fetch of that
+# same URL, surfacing as "atrium 400: fail to fetch media url (404)". Guarded
+# by a real threading.Lock (not asyncio.Lock) because the mutations happen
+# inside asyncio.to_thread'd sync functions, i.e. on worker-pool threads.
+_r2_input_refcount: dict[str, int] = {}
+_r2_input_refcount_lock = threading.Lock()
+
+
+def _r2_input_acquire(media_id: str) -> None:
+    with _r2_input_refcount_lock:
+        _r2_input_refcount[media_id] = _r2_input_refcount.get(media_id, 0) + 1
+
+
+def _r2_input_release_and_maybe_delete(media_id: str) -> None:
+    from flowboard.services.comic import r2
+
+    with _r2_input_refcount_lock:
+        # Not tracked → this input was never uploaded to R2 (e.g. it was
+        # self-hosted through the tunnel), so there's nothing in the bucket to
+        # release/delete. No-op instead of blindly issuing a delete.
+        if media_id not in _r2_input_refcount:
+            return
+        remaining = _r2_input_refcount[media_id] - 1
+        if remaining <= 0:
+            _r2_input_refcount.pop(media_id, None)
+        else:
+            _r2_input_refcount[media_id] = remaining
+    if remaining <= 0:
+        r2.delete_media(media_id)
+
+
+def _atrium_input_url(media_id: str) -> Optional[str]:
+    """Public URL Atrium can fetch this input image from.
+
+    Prefer SELF-HOSTING through the tunnel: the machine already has the image
+    cached, so we hand Atrium a downscaled-JPEG thumbnail URL served straight
+    off this box (``PUBLIC_MEDIA_BASE_URL`` → /api/media/<id>/thumb). This
+    avoids the r2.dev input-fetch flakiness (intermittent "failed to fetch
+    media URL") and the per-gen upload/delete churn. R2 stays in use for RESULT
+    offload (see _spawn_result_offload) — only input hosting moves off it.
+
+    Falls back to an R2 upload (with refcounted cleanup) only when no tunnel is
+    configured. Sync (disk/boto3) — call via ``asyncio.to_thread``."""
+    from flowboard.services.comic import r2, atrium_api
+
+    if atrium_api.public_media_base() is not None:
+        return atrium_api.media_input_url(media_id)
+    if r2.is_configured():
+        url = r2.upload_media(media_id)
+        if url:
+            _r2_input_acquire(media_id)
+        return url
+    return None
+
+
+async def _flow_gen_atrium(
+    prompt: str, image_model: str, aspect: str, image_size: Optional[str],
+    variant_count: int, ref_ids: list, source_id: Optional[str],
+    on_progress=None,
+) -> list[bytes]:
+    """Atrium engine — input images must be PUBLIC urls (fileData.fileUri),
+    served from R2 (preferred) or a tunnel."""
+    from flowboard.services.comic import atrium_api, r2
+
+    if not atrium_api.is_configured():
+        raise _FlowGenError("atrium_not_configured: set ATRIUM_CLIENT_ID/ATRIUM_CLIENT_SECRET in .env")
+
+    needs_input = bool(source_id) or bool(ref_ids)
+    if needs_input and not (r2.is_configured() or atrium_api.public_media_base() is not None):
+        raise _FlowGenError(
+            "atrium_needs_public_url: references/edit on Atrium need R2 (R2_* in .env) or a "
+            "tunnel (PUBLIC_MEDIA_BASE_URL). Plain text→image works without either."
+        )
+
+    # Build the public input URLs (R2 uploads happen here, off the event loop).
+    def _build_urls() -> list[str]:
+        urls: list[str] = []
+        for mid in ([source_id] if source_id else []) + list(ref_ids):
+            try:
+                u = _atrium_input_url(mid)
+            except Exception as exc:  # noqa: BLE001 — upload/network failure
+                raise _FlowGenError(f"r2_upload_failed: {type(exc).__name__}: {exc}"[:180])
+            if u:
+                urls.append(u)
+        return urls
+
+    image_urls = await asyncio.to_thread(_build_urls)
+    if needs_input and not image_urls:
+        raise _FlowGenError("atrium_input_unavailable: could not resolve a public URL for the input image")
+
+    input_ids = ([source_id] if source_id else []) + list(ref_ids)
+    try:
+        # On edit (source present) preserve the frame by not forcing an aspect.
+        return await atrium_api.generate_image_variants(
+            prompt, image_urls or None,
+            image_model=image_model,
+            aspect_ratio="" if source_id else aspect,
+            variant_count=variant_count,
+            image_size=image_size,
+            on_progress=on_progress,
+        )
+    finally:
+        # Inputs are normally self-hosted through the tunnel now (nothing in R2
+        # to clean up — the release below no-ops for those). This only does real
+        # work on the R2-fallback path (no tunnel configured): Atrium has fetched
+        # the inputs by now, so drop them from the bucket. WORKER_CONCURRENCY
+        # allows many jobs at once, so a sibling job may still be relying on the
+        # same media_id — the refcounted release only deletes once every
+        # concurrent user is done. Local cache (storage/media) is always kept.
+        if r2.is_configured() and input_ids:
+            def _cleanup() -> None:
+                for mid in input_ids:
+                    _r2_input_release_and_maybe_delete(mid)
+            await asyncio.to_thread(_cleanup)
 
 
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
     "create_project": _handle_create_project,
     "gen_image": _handle_gen_image,
+    "flow_gen_image": _handle_flow_gen_image,
     "gen_video": _handle_gen_video,
     "gen_video_omni": _handle_gen_video_omni,
     "edit_image": _handle_edit_image,
@@ -1330,16 +3024,36 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "import_pages": _handle_import_pages,
     "detect_page_panels": _handle_detect_page_panels,
     "crop_panels": _handle_crop_panels,
+    "clean_bubbles": _handle_clean_bubbles,
+    "clean_all_bubbles": _handle_clean_all_bubbles,
     "clean_panel": _handle_clean_panel,
     "enhance_panel": _handle_enhance_panel,
     "build_character_db": _handle_build_character_db,
     "combine_panels": _handle_combine_panels,
     "regen_cell": _handle_regen_cell,
+    "restitch_cells": _handle_restitch_cells,
+    "style_cells": _handle_style_cells,
+    "export_all_panels": _handle_export_all_panels,
+    "segment_character_sheet": _handle_segment_character_sheet,
+    "tag_panels": _handle_tag_panels,
+    "magi_assign_panels": _handle_magi_assign_panels,
+    "scene_assign_panels": _handle_scene_assign_panels,
+    "upsample_image": _handle_upsample_image,
 }
 
 
+# How many requests the worker runs concurrently. Atrium has no per-second /
+# concurrency limit (only a daily quota), and the API-key path has no reCAPTCHA,
+# so several generations can run at once. Image gen is I/O-bound (mostly awaiting
+# the provider HTTP), so the async loop handles many in flight cheaply — default
+# 12 lets ~3-5 users each fire a multi-image batch without queueing. Effective
+# parallel provider calls ≈ WORKER_CONCURRENCY × variant_count. Override via
+# FLOWBOARD_WORKER_CONCURRENCY.
+WORKER_CONCURRENCY = max(1, int(os.getenv("FLOWBOARD_WORKER_CONCURRENCY", "12")))
+
+
 class WorkerController:
-    """Single-consumer async queue worker."""
+    """Async queue worker that processes up to WORKER_CONCURRENCY requests at once."""
 
     def __init__(self, handlers: Optional[dict[str, Handler]] = None) -> None:
         self._queue: asyncio.Queue[int] = asyncio.Queue()
@@ -1347,6 +3061,8 @@ class WorkerController:
         self._shutdown = asyncio.Event()
         self._active = 0
         self._started_at: Optional[float] = None
+        self._sem = asyncio.Semaphore(WORKER_CONCURRENCY)
+        self._tasks: set[asyncio.Task] = set()
 
     # ── enqueue ────────────────────────────────────────────────────────────
     def enqueue(self, request_id: int) -> None:
@@ -1355,12 +3071,20 @@ class WorkerController:
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self) -> None:
         self._started_at = time.time()
-        logger.info("worker started")
+        logger.info("worker started (concurrency=%d)", WORKER_CONCURRENCY)
         while not self._shutdown.is_set():
             try:
                 rid = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
+            # Run concurrently up to the semaphore cap; don't block the loop so
+            # other queued requests can start while this one is in flight.
+            task = asyncio.create_task(self._run_capped(rid))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _run_capped(self, rid: int) -> None:
+        async with self._sem:
             await self._process_one(rid)
 
     def request_shutdown(self) -> None:

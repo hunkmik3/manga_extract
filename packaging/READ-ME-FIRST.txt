@@ -1,0 +1,28 @@
+Flowboard — Windows quickstart
+==============================
+
+1. Run  flowboard.exe
+   A console window opens (the local server + logs) and your browser opens the
+   app at http://127.0.0.1:8101 . Keep the console window open while you use it.
+
+2. Load the Chrome bridge extension (required for any image generation):
+   - Chrome -> chrome://extensions -> turn ON "Developer mode"
+   - Click "Load unpacked" and pick the  extension  folder next to this file.
+   - IMPORTANT: if you previously loaded an OLDER Flowboard extension, REMOVE it
+     first. The extension version must match this build (see extension version
+     in the popup vs. the one shipped here).
+
+3. Connect your Google Flow plan:
+   - Open  https://labs.google/fx/tools/flow  and sign in.
+   - Reload that tab once so the extension can read your plan/tier.
+   - Back in Flowboard the "Tier unknown" warning should clear and the
+     extension dot turns green. Now Clean / Enhance / Combine can run.
+
+Notes
+-----
+- All generation rides your own Flow session through the extension — no API
+  billing. You need a Flow Pro/Ultra plan for video; image edits work on Flow.
+- Your data (database + cached images) is saved in the  storage  folder next to
+  flowboard.exe . Delete it to start fresh.
+- Optional: to hard-set the Flow public API key, put a file named  .env  next to
+  flowboard.exe containing:  FLOWBOARD_FLOW_API_KEY=AIza...

@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from flowboard.services import media as media_service
+from flowboard.services.comic import characters as character_service
 from flowboard.worker.processor import _handle_build_character_db, _handle_enhance_panel
 
 
@@ -20,6 +21,27 @@ def _ingest(data=None) -> str:
     mid = str(uuid.uuid4())
     media_service.ingest_inline_bytes(mid, data or _png(), kind="image", mime="image/png")
     return mid
+
+
+def test_character_cluster_uses_precomputed_distances():
+    crops = [
+        np.full((90, 70, 3), 80, np.uint8),
+        np.full((90, 70, 3), 90, np.uint8),
+        np.full((90, 70, 3), 200, np.uint8),
+    ]
+    distances = np.array(
+        [
+            [0.0, 0.12, 0.8],
+            [0.12, 0.0, 0.82],
+            [0.8, 0.82, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    with patch("imgutils.metrics.ccip_batch_differences", return_value=distances):
+        labels = character_service._cluster(crops)
+
+    assert labels[0] == labels[1]
+    assert labels[2] != labels[0]
 
 
 @pytest.mark.asyncio

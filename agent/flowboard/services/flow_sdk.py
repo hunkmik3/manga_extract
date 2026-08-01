@@ -33,6 +33,7 @@ VIDEO_I2V_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoStartImage"
 VIDEO_OMNI_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoReferenceImages"
 VIDEO_POLL_URL = f"{FLOW_API_BASE}/v1/video:batchCheckAsyncVideoGenerationStatus"
 UPLOAD_IMAGE_URL = f"{FLOW_API_BASE}/v1/flow/uploadImage"
+UPSAMPLE_IMAGE_URL = f"{FLOW_API_BASE}/v1/flow/upsampleImage"
 
 
 # Omni Flash — variable-duration r2v video model. Each duration maps to a
@@ -282,13 +283,14 @@ def _client_context(project_id: str, paygate_tier: str) -> dict:
 
     `paygate_tier` is REQUIRED (no default). Pre-v1.1.5 the default was
     `"PAYGATE_TIER_ONE"` which silently downgraded Ultra users when any
-    upstream code path forgot to pass tier. Now we raise loudly on
-    invalid / unknown values so a code regression can't quietly serve
-    Pro to an Ultra account.
+    upstream code path forgot to pass tier. We still reject a missing/garbage
+    value, but accept ANY ``PAYGATE_TIER_*`` string — Google keeps adding tiers
+    (e.g. ``PAYGATE_TIER_TIER1P5``) and the value is the account's authoritative
+    tier from /v1/credits, passed straight back to Flow, not something we guess.
     """
-    if paygate_tier not in _VALID_TIERS:
+    if not (isinstance(paygate_tier, str) and paygate_tier.startswith("PAYGATE_TIER_")):
         raise ValueError(
-            f"invalid paygate_tier {paygate_tier!r} — must be one of {sorted(_VALID_TIERS)}"
+            f"invalid paygate_tier {paygate_tier!r} — expected a PAYGATE_TIER_* value"
         )
     return {
         "projectId": str(project_id),
@@ -894,16 +896,22 @@ class FlowSDK:
         aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
         paygate_tier: Optional[str] = None,
         image_model: Optional[str] = None,
+        variant_count: int = 1,
     ) -> dict[str, Any]:
         """Refine an existing image with an optional list of reference media.
 
         Order of ``imageInputs`` matters — flowkit puts BASE_IMAGE first so
         Flow knows which is the canonical source.
 
+        ``variant_count`` (1-4) replicates the request item with distinct seeds
+        so Flow returns several edited candidates in one dispatch (the "x4" on
+        the Flow UI). ``media_entries`` holds one entry per variant.
+
         ``paygate_tier`` is required. See ``gen_video`` for rationale.
         """
         if paygate_tier is None:
             raise ValueError("paygate_tier is required — caller must resolve before dispatch")
+        n = max(1, min(int(variant_count), MAX_VARIANT_COUNT))
         ts = int(time.time() * 1000)
         ctx = _client_context(project_id, paygate_tier)
         model_name = resolve_image_model(image_model)
@@ -917,19 +925,21 @@ class FlowSDK:
                     {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
                 )
 
-        request_item = {
-            "clientContext": {**ctx, "sessionId": f";{ts}"},
-            "seed": ts % 1_000_000,
-            "structuredPrompt": {"parts": [{"text": prompt}]},
-            "imageAspectRatio": aspect_ratio,
-            "imageModelName": model_name,
-            "imageInputs": image_inputs,
-        }
+        requests_arr: list[dict[str, Any]] = []
+        for i in range(n):
+            requests_arr.append({
+                "clientContext": {**ctx, "sessionId": f";{ts + i}"},
+                "seed": (ts + i * 9973) % 1_000_000,  # distinct seed per variant
+                "structuredPrompt": {"parts": [{"text": prompt}]},
+                "imageAspectRatio": aspect_ratio,
+                "imageModelName": model_name,
+                "imageInputs": list(image_inputs),
+            })
         body = {
             "clientContext": ctx,
             "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
             "useNewMedia": True,
-            "requests": [request_item],
+            "requests": requests_arr,
         }
 
         resp = await self._client.api_request(
@@ -948,6 +958,46 @@ class FlowSDK:
         entries = extract_media_entries(resp)
         media_ids = [e["media_id"] for e in entries]
         return {"raw": resp, "media_ids": media_ids, "media_entries": entries}
+
+    # ── image upscale / upsample (1K → 2K / 4K) ─────────────────────────────
+    async def upsample_image(
+        self,
+        media_id: str,
+        project_id: str,
+        paygate_tier: Optional[str] = None,
+        target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K",
+    ) -> dict[str, Any]:
+        """Upscale a Flow image to 2K/4K (Flow's Download → "2K/4K Upscaled").
+
+        ``media_id`` is a Flow media id in this project (upload the image first
+        if you only have bytes). Returns ``{raw, encoded_image}`` — a base64
+        JPEG of the upscaled result — or ``{raw, error}``.
+        """
+        if paygate_tier is None:
+            raise ValueError("paygate_tier is required — caller must resolve before dispatch")
+        ctx = _client_context(project_id, paygate_tier)
+        body = {
+            "mediaId": media_id,
+            "targetResolution": target_resolution,
+            "clientContext": ctx,
+        }
+        resp = await self._client.api_request(
+            url=UPSAMPLE_IMAGE_URL,
+            method="POST",
+            headers=dict(_API_HEADERS),
+            body=body,
+            captcha_action=CAPTCHA_IMAGE,
+        )
+        if isinstance(resp, dict) and resp.get("error"):
+            return {"raw": resp, "error": resp["error"]}
+        inner_err = _extract_inner_api_error(resp)
+        if inner_err:
+            return {"raw": resp, "error": inner_err}
+        data = resp.get("data") if isinstance(resp, dict) else None
+        encoded = data.get("encodedImage") if isinstance(data, dict) else None
+        if not isinstance(encoded, str) or not encoded:
+            return {"raw": resp, "error": "no_encoded_image"}
+        return {"raw": resp, "encoded_image": encoded}
 
     # ── image upload (api_request, no captcha) ─────────────────────────────
     async def upload_image(

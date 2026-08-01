@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { useReactFlow } from "@xyflow/react";
 import { useBoardStore, type FlowboardNodeData } from "../store/board";
-import { createNodesBulk, mediaUrl, uploadComicPages, type BulkNodeInput } from "../api/client";
+import { useAppModeStore } from "../store/appMode";
+import { createNodesBulk, mediaDownloadUrl, mediaUrl, uploadComicPages, type BulkNodeInput } from "../api/client";
 import {
   createRequest,
   downstreamPageNodes,
+  findCharacterDb,
   nodePosition,
   patchComicNode,
+  relayoutComicChains,
+  relayoutComicCombineChains,
   runComicRequest,
   runRequestToResult,
   syncPanelsForPage,
@@ -31,16 +35,19 @@ const cleanPath = (v: string) => v.trim().replace(/^['"]+/, "").replace(/['"]+$/
  *      (uses the possibly hand-edited boxes).
  */
 export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const bubble = useAppModeStore((s) => s.mode) === "bubble";
   const folder = typeof data.folder === "string" ? data.folder : "";
   const pages = (Array.isArray(data.pages) ? data.pages : []) as PageItem[];
   const pageCount = typeof data.pageCount === "number" ? data.pageCount : pages.length;
-  const detector = typeof data.detector === "string" ? data.detector : "auto";
+  const detector = typeof data.detector === "string" ? data.detector : bubble ? "bubble" : "auto";
   const status = typeof data.status === "string" ? data.status : "idle";
   const isImporting = status === "queued" || status === "running";
 
   const [draftFolder, setDraftFolder] = useState(folder);
-  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine">(null);
+  const [busy, setBusy] = useState<null | "pages" | "panels" | "combine" | "download" | "assign" | "scenes" | "cleanbubbles">(null);
+  const cleanEngine = typeof data.cleanEngine === "string" ? data.cleanEngine : "atrium";
   const [spawnErr, setSpawnErr] = useState<string | undefined>();
+  const [assignInfo, setAssignInfo] = useState<string | undefined>();
   const dirInputRef = useRef<HTMLInputElement | null>(null);
   const rf = useReactFlow();
 
@@ -140,7 +147,196 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       for (const pn of pageNodes) {
         await syncPanelsForPage(String(pn.dbId));
       }
+      patchComicNode(rfId, { panelsMaterialized: true });
       setTimeout(() => { try { rf.fitView({ duration: 600 }); } catch { /* noop */ } }, 80);
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Download EVERY panel (detected + hand-adjusted boxes) across all pages as
+  // individual image files, bundled into ONE .zip in reading order.
+  async function downloadAllPanels() {
+    if (busy) return;
+    const pageNodes = downstreamPageNodes(rfId);
+    if (pageNodes.length === 0) { setSpawnErr("Create page nodes first"); return; }
+    setSpawnErr(undefined);
+    setBusy("download");
+    try {
+      const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
+      const panels: Array<{ page_media_id: string; box: { x: number; y: number; w: number; h: number } }> = [];
+      for (const pn of sorted) {
+        const mediaId = pn.data.pageMediaId;
+        if (typeof mediaId !== "string" || !mediaId) continue;
+        const boxes = ((pn.data.boxes as BoxItem[]) ?? [])
+          .slice()
+          .sort((a, b) => (a.y - b.y) || (a.x - b.x)); // reading order: top→bottom, left→right
+        for (const b of boxes) panels.push({ page_media_id: mediaId, box: { x: b.x, y: b.y, w: b.w, h: b.h } });
+      }
+      if (panels.length === 0) { setSpawnErr("No panels — detect/adjust boxes first"); setBusy(null); return; }
+      const result = await runRequestToResult(
+        createRequest({ type: "export_all_panels", node_id: parseInt(rfId, 10), params: { panels } }),
+      );
+      const mid = result.mediaId as string | undefined;
+      if (!mid) { setSpawnErr("Export failed"); return; }
+      const filename = `comic-all-panels-${data.shortId ?? rfId}.zip`;
+      const a = document.createElement("a");
+      a.href = mediaDownloadUrl(mid, filename);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // ✨ Bubble Extract — one click: crop every bubble box across all pages, clean
+  // each through the chosen engine (Gemini/Grok), chroma-key the green out in
+  // code, and download all the transparent PNGs as ONE .zip.
+  async function cleanAllBubbles() {
+    if (busy) return;
+    const pageNodes = downstreamPageNodes(rfId);
+    if (pageNodes.length === 0) { setSpawnErr("Create page nodes first"); return; }
+    setSpawnErr(undefined);
+    setBusy("cleanbubbles");
+    try {
+      const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
+      const panels: Array<{ page_media_id: string; box: { x: number; y: number; w: number; h: number } }> = [];
+      for (const pn of sorted) {
+        const mediaId = pn.data.pageMediaId;
+        if (typeof mediaId !== "string" || !mediaId) continue;
+        const boxes = ((pn.data.boxes as BoxItem[]) ?? [])
+          .slice()
+          .sort((a, b) => (a.y - b.y) || (a.x - b.x)); // reading order
+        for (const b of boxes) panels.push({ page_media_id: mediaId, box: { x: b.x, y: b.y, w: b.w, h: b.h } });
+      }
+      if (panels.length === 0) { setSpawnErr("No bubbles — detect boxes first"); setBusy(null); return; }
+      const result = await runRequestToResult(
+        createRequest({ type: "clean_all_bubbles", node_id: parseInt(rfId, 10), params: { panels, engine: cleanEngine } }),
+      );
+      const mid = result.mediaId as string | undefined;
+      if (!mid) { setSpawnErr("Clean failed"); return; }
+      const filename = `bubbles-clean-${data.shortId ?? rfId}.zip`;
+      const a = document.createElement("a");
+      a.href = mediaDownloadUrl(mid, filename);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      const fails = (result.fail_count as number) ?? 0;
+      setSpawnErr(fails > 0 ? `Done — ${result.count} cleaned, ${fails} failed` : undefined);
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // 🪄 Director (chapter-wide WHO): run magiv2 locally over every page with the
+  // Character DB as a named bank, then write the per-panel character
+  // assignments into every combine node's per-cell settings. No Flow calls.
+  async function magiAssignChapter() {
+    if (busy) return;
+    const characterRefs = findCharacterDb();
+    if (!characterRefs?.length) { setSpawnErr("Define characters first (Character DB node)"); return; }
+    const pageNodes = downstreamPageNodes(rfId);
+    if (pageNodes.length === 0) { setSpawnErr("Create page nodes first"); return; }
+    setSpawnErr(undefined);
+    setAssignInfo(undefined);
+    setBusy("assign");
+    try {
+      const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
+      const pagesParam = sorted
+        .map((pn) => ({
+          media_id: pn.data.pageMediaId as string,
+          boxes: ((pn.data.boxes as BoxItem[]) ?? []).map((b) => ({ id: b.id, x: b.x, y: b.y, w: b.w, h: b.h })),
+        }))
+        .filter((p) => typeof p.media_id === "string" && p.media_id && p.boxes.length > 0);
+      if (pagesParam.length === 0) { setSpawnErr("No detected panels — run detection first"); setBusy(null); return; }
+      const cast = characterRefs.map((c) => ({ id: c.id, name: c.name, refMediaIds: c.refMediaIds, sampleMediaId: c.sampleMediaId }));
+      const result = await runRequestToResult(
+        createRequest({ type: "magi_assign_panels", node_id: parseInt(rfId, 10), params: { pages: pagesParam, characters: cast } }),
+      );
+      const assignments = (result.assignments as Record<string, Record<string, string>>) ?? {};
+      // Route the assignments into every combine node's per-cell settings
+      // (matched by the cell's page + box identity). Existing manual choices
+      // for other fields (🔒/outfit) are preserved.
+      const store = useBoardStore.getState();
+      let applied = 0;
+      for (const n of store.nodes) {
+        if (n.data.type !== "comic_combine") continue;
+        const panels = Array.isArray(n.data.panels) ? (n.data.panels as Array<Record<string, unknown>>) : [];
+        const cur = ((n.data.cellAssign as Record<string, Record<string, unknown>>) ?? {});
+        const merged = { ...cur };
+        let changed = false;
+        panels.slice(0, 4).forEach((p, i) => {
+          const pageId = p.pageMediaId as string | undefined;
+          const boxId = p.boxId as string | undefined;
+          const cid = pageId && boxId ? assignments[pageId]?.[boxId] : undefined;
+          if (cid) {
+            merged[String(i)] = { ...(merged[String(i)] ?? {}), charId: cid };
+            changed = true;
+            applied++;
+          }
+        });
+        if (changed) patchComicNode(n.id, { cellAssign: merged });
+      }
+      const total = Number(result.panels_assigned ?? 0);
+      setAssignInfo(`Magi assigned ${total} panel(s) · routed into ${applied} combine cell(s)`);
+    } catch (e) {
+      setSpawnErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // 🎬 Director (chapter-wide WHERE): a VLM reads every combine cell in reading
+  // order, groups them by SETTING, and writes each cell's scene environment +
+  // background type into the combine nodes' per-cell settings. No Flow calls.
+  async function sceneAssignChapter() {
+    if (busy) return;
+    const store = useBoardStore.getState();
+    const combineNodes = store.nodes.filter((n) => n.data.type === "comic_combine");
+    if (combineNodes.length === 0) { setSpawnErr("Create combine nodes first (③)"); return; }
+    setSpawnErr(undefined);
+    setAssignInfo(undefined);
+    setBusy("scenes");
+    try {
+      // Gather every combine cell in reading order, remembering (node, cell) so
+      // results map back exactly.
+      const ordered: Array<{ node: string; cell: number; page_media_id: string; box: unknown }> = [];
+      for (const n of combineNodes) {
+        const panels = Array.isArray(n.data.panels) ? (n.data.panels as Array<Record<string, unknown>>) : [];
+        panels.slice(0, 4).forEach((p, i) => {
+          const pid = p.pageMediaId as string | undefined;
+          if (typeof pid === "string" && pid && p.box) ordered.push({ node: n.id, cell: i, page_media_id: pid, box: p.box });
+        });
+      }
+      if (ordered.length === 0) { setSpawnErr("No combine cells found"); setBusy(null); return; }
+      const result = await runRequestToResult(
+        createRequest({ type: "scene_assign_panels", node_id: parseInt(rfId, 10), params: { panels: ordered.map((o) => ({ page_media_id: o.page_media_id, box: o.box })) } }),
+      );
+      const tags = (result.tags as Array<{ env_descriptor?: string | null; bg_type?: string | null; mood?: string | null }>) ?? [];
+      // Merge env + bg_type into each combine node's cellAssign (preserving
+      // char/override choices). Build per-node from the freshest stored map.
+      const byNode = new Map<string, Record<string, Record<string, unknown>>>();
+      ordered.forEach((o, i) => {
+        const t = tags[i];
+        if (!t) return;
+        if (!byNode.has(o.node)) {
+          const node = store.nodes.find((n) => n.id === o.node);
+          byNode.set(o.node, { ...((node?.data.cellAssign as Record<string, Record<string, unknown>>) ?? {}) });
+        }
+        const ca = byNode.get(o.node)!;
+        ca[String(o.cell)] = { ...(ca[String(o.cell)] ?? {}), env: t.env_descriptor ?? undefined, bgType: t.bg_type ?? undefined, mood: t.mood ?? undefined };
+      });
+      for (const [nodeId, ca] of byNode) patchComicNode(nodeId, { cellAssign: ca });
+      setAssignInfo(`🎬 ${Number(result.scene_count ?? 0)} scene(s) tagged across ${ordered.length} cell(s)`);
     } catch (e) {
       setSpawnErr(String(e));
     } finally {
@@ -159,18 +355,57 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
     setSpawnErr(undefined);
     setBusy("combine");
     try {
+      const store = useBoardStore.getState();
       const sorted = [...pageNodes].sort((a, b) => ((a.data.pageIdx as number) ?? 0) - ((b.data.pageIdx as number) ?? 0));
       const flat: Array<Record<string, unknown>> = [];
-      for (const pn of sorted) {
-        const boxes = (pn.data.boxes as BoxItem[]) ?? [];
-        boxes.forEach((b, j) =>
-          flat.push({
-            pageMediaId: pn.data.pageMediaId, box: b, w: pn.data.w, h: pn.data.h,
-            pageName: pn.data.pageName, panelIndex: j,
-          }),
-        );
+      const pageIds = new Set(pageNodes.map((p) => String(p.dbId)));
+      const panelLayerExists =
+        Boolean(store.nodes.find((n) => n.id === rfId)?.data.panelsMaterialized)
+        || store.edges.some((e) => {
+          const tgt = store.nodes.find((n) => n.id === e.target);
+          return pageIds.has(e.source) && tgt?.data.type === "comic_panel";
+        });
+
+      if (panelLayerExists) {
+        for (const pn of sorted) {
+          const boxes = ((pn.data.boxes as BoxItem[]) ?? []).filter((b) => b?.id);
+          const panelByBoxId = new Map<string, string>();
+          for (const e of store.edges) {
+            if (e.source !== String(pn.dbId)) continue;
+            const panel = store.nodes.find((n) => n.id === e.target);
+            const boxId = panel?.data.boxId;
+            if (panel?.data.type === "comic_panel" && typeof boxId === "string") {
+              panelByBoxId.set(boxId, panel.id);
+            }
+          }
+          boxes.forEach((b, j) => {
+            if (!panelByBoxId.has(b.id)) return;
+            flat.push({
+              pageMediaId: pn.data.pageMediaId,
+              box: b,
+              w: pn.data.w,
+              h: pn.data.h,
+              pageName: pn.data.pageName,
+              panelIndex: j,
+              boxId: b.id,
+            });
+          });
+        }
+      } else {
+        for (const pn of sorted) {
+          const boxes = (pn.data.boxes as BoxItem[]) ?? [];
+          boxes.forEach((b, j) =>
+            flat.push({
+              pageMediaId: pn.data.pageMediaId, box: b, w: pn.data.w, h: pn.data.h,
+              pageName: pn.data.pageName, panelIndex: j,
+            }),
+          );
+        }
       }
-      if (flat.length === 0) { setSpawnErr("No panel boxes — detect/draw first"); return; }
+      if (flat.length === 0) {
+        setSpawnErr(panelLayerExists ? "No current panel nodes — create or keep at least one panel" : "No panel boxes — detect/draw first");
+        return;
+      }
       const pos = nodePosition(rfId);
       const bulk: BulkNodeInput[] = [];
       for (let i = 0; i < flat.length; i += 4) {
@@ -187,6 +422,12 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
       const res = await createNodesBulk(boardId, bulk);
       useBoardStore.getState().appendNodesBulk(res.nodes, res.edges);
       focusNew(res.nodes);
+      // Pull each combine's source panels beside it + drop them from the page
+      // column (the combine now "owns" their layout).
+      setTimeout(() => {
+        relayoutComicCombineChains();
+        relayoutComicChains();
+      }, 0);
     } catch (e) {
       setSpawnErr(String(e));
     } finally {
@@ -216,9 +457,17 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
             <label style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 3 }}>
               Detector
               <select value={detector} onChange={(e) => patchComicNode(rfId, { detector: e.target.value })} style={{ fontSize: 11, padding: "2px 4px" }}>
-                <option value="heuristic">Heuristic</option>
-                <option value="ml">YOLO</option>
-                <option value="auto">Auto</option>
+                {bubble ? (
+                  <option value="bubble">Speech bubbles</option>
+                ) : (
+                  <>
+                    <option value="heuristic">Heuristic</option>
+                    <option value="ml">YOLO</option>
+                    <option value="webtoon">Webtoon</option>
+                    <option value="hybrid">Hybrid (ML+webtoon)</option>
+                    <option value="auto">Auto</option>
+                  </>
+                )}
               </select>
             </label>
           </div>
@@ -231,9 +480,55 @@ export function ComicImportBody({ rfId, data }: { rfId: string; data: FlowboardN
           <button className="comic-btn" onClick={spawnCombine} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title="Group panels in reading order into 2×2 storyboard images (4 per group)">
             {busy === "combine" ? "Creating combine…" : "③ Combine 2×2 (groups of 4)"}
           </button>
+          <button className="comic-btn" onClick={downloadAllPanels} disabled={busy !== null} style={{ fontSize: 12, padding: "4px 10px" }} title={`Crop every ${bubble ? "bubble" : "panel"} (detected + hand-adjusted) into separate files, bundled into ONE .zip`}>
+            {busy === "download" ? "Exporting…" : `⬇ Download all ${bubble ? "bubbles" : "panels"} (.zip)`}
+          </button>
+          {bubble && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <select
+                value={cleanEngine}
+                onChange={(e) => patchComicNode(rfId, { cleanEngine: e.target.value })}
+                disabled={busy !== null}
+                title="Image-edit engine for the clean step. Background removal is always done in code (chroma-key)."
+                style={{ fontSize: 11, padding: "2px 4px" }}
+              >
+                <option value="atrium">Atrium (Gemini 3 Pro)</option>
+                <option value="gemini">Gemini 3 Pro (direct key)</option>
+                <option value="grok">Grok (quality)</option>
+              </select>
+              <button
+                className="comic-btn"
+                onClick={cleanAllBubbles}
+                disabled={busy !== null}
+                style={{ fontSize: 12, padding: "4px 10px" }}
+                title="Crop every bubble, clean it (keep text, close bubble, sharpen), remove the background in code, and download all transparent PNGs as ONE .zip"
+              >
+                {busy === "cleanbubbles" ? "Cleaning… (may take a while)" : "✨ Clean all bubbles → .zip"}
+              </button>
+            </div>
+          )}
+          <button
+            className="comic-btn"
+            onClick={magiAssignChapter}
+            disabled={busy !== null}
+            style={{ fontSize: 12, padding: "4px 10px" }}
+            title="Director (local Magi v2): read the whole chapter with the Character DB as a named bank and auto-assign each panel's character into every combine cell. No Flow calls. First run loads the model (~30s), then ~2-3s per page."
+          >
+            {busy === "assign" ? "Assigning… (local model)" : "🪄 Auto-assign characters (chapter)"}
+          </button>
+          <button
+            className="comic-btn"
+            onClick={sceneAssignChapter}
+            disabled={busy !== null}
+            style={{ fontSize: 12, padding: "4px 10px" }}
+            title="Director (VLM): read every combine cell in reading order, group them by scene/setting, and write each cell's environment + background type. Uses your Vision provider (no Flow gen). Run AFTER ③ Combine."
+          >
+            {busy === "scenes" ? "Reading scenes…" : "🎬 Auto-scenes (environment)"}
+          </button>
         </>
       )}
 
+      {assignInfo && <p className="brief-hint" style={{ color: "#22c55e", fontSize: 11 }}>✓ {assignInfo}</p>}
       {spawnErr && <p className="brief-hint" style={{ color: "#ef4444", fontSize: 11 }}>⚠ {spawnErr}</p>}
       {status === "error" && typeof data.error === "string" && (
         <p className="brief-hint" style={{ color: "#ef4444", fontSize: 11 }}>⚠ {data.error}</p>

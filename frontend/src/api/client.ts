@@ -116,6 +116,7 @@ export type NodeStatus = "idle" | "queued" | "running" | "done" | "error";
 export interface Board {
   id: number;
   name: string;
+  kind?: string; // "manga" | "flow" — which surface owns this project
   created_at: string;
 }
 
@@ -154,14 +155,14 @@ export interface BoardDetail {
 
 // ── API methods ──────────────────────────────────────────────────────────────
 
-export function listBoards(): Promise<Board[]> {
-  return api<Board[]>("/api/boards");
+export function listBoards(kind?: string): Promise<Board[]> {
+  return api<Board[]>(`/api/boards${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`);
 }
 
-export function createBoard(name: string): Promise<Board> {
+export function createBoard(name: string, kind?: string): Promise<Board> {
   return api<Board>("/api/boards", {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(kind ? { name, kind } : { name }),
   });
 }
 
@@ -383,7 +384,7 @@ export interface AuthMe {
   // triggered when the extension pushes a Bearer token. Falls back to
   // the legacy passive sniff (extension reading userPaygateTier out of
   // outgoing Flow request bodies) if the agent fetch fails.
-  paygate_tier: "PAYGATE_TIER_ONE" | "PAYGATE_TIER_TWO" | null;
+  paygate_tier: string | null; // PAYGATE_TIER_ONE / _TWO / _TIER1P5 / … or null
   // Subscription SKU from /v1/credits — e.g. "WS_ULTRA" / "WS_PRO".
   // Available alongside paygate_tier; null until the credits fetch lands.
   sku: string | null;
@@ -429,6 +430,33 @@ export function scanExtension() {
   return api<AuthScanResult>("/api/auth/scan", { method: "POST" });
 }
 
+// One connected extension (Chrome profile / Google account). Several can be
+// connected at once; exactly one is `active` and routes all generation.
+export interface FlowConnection {
+  id: string;
+  email: string | null;
+  name: string | null;
+  picture: string | null;
+  tier: string | null; // PAYGATE_TIER_ONE / _TWO / _TIER1P5 / … or null
+  sku: string | null;
+  credits: number | null;
+  active: boolean;
+  token_age_s: number | null;
+}
+
+export function getFlowConnections() {
+  return api<{ connections: FlowConnection[] }>("/api/auth/connections")
+    .then((r) => r.connections)
+    .catch(() => [] as FlowConnection[]);
+}
+
+export function setActiveFlowConnection(id: string) {
+  return api<{ ok: boolean; connections: FlowConnection[] }>("/api/auth/active", {
+    method: "POST",
+    body: JSON.stringify({ id }),
+  });
+}
+
 export function createRequest(body: {
   type: string;
   node_id?: number;
@@ -464,6 +492,21 @@ export async function uploadComicPages(
     throw new Error(await extractErrorMessage(res));
   }
   return res.json() as Promise<RequestDTO>;
+}
+
+/**
+ * Upload a single character reference / turnaround sheet. Cached LOCALLY on the
+ * agent (no Flow) and returned as a media_id; the caller then dispatches
+ * `segment_character_sheet` to auto-crop it into face / body views.
+ */
+export async function uploadComicSheet(file: File): Promise<{ media_id: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch("/api/comic/upload-sheet", { method: "POST", body: form });
+  if (!res.ok) {
+    throw new Error(await extractErrorMessage(res));
+  }
+  return res.json() as Promise<{ media_id: string }>;
 }
 
 // ── Plans + Pipeline runs ────────────────────────────────────────────────────
@@ -506,6 +549,48 @@ export function getMediaStatus(mediaId: string): Promise<MediaStatus> {
 export function mediaUrl(mediaId: string): string {
   const clean = mediaId.replace(/^media\//, "");
   return `/media/${encodeURIComponent(clean)}`;
+}
+
+export function mediaDownloadUrl(mediaId: string, filename?: string): string {
+  const clean = mediaId.replace(/^media\//, "");
+  const params = new URLSearchParams({ download: "1" });
+  if (filename?.trim()) params.set("filename", filename.trim());
+  return `/media/${encodeURIComponent(clean)}?${params.toString()}`;
+}
+
+/** Downscaled JPEG for grids/pickers (cached). Use mediaUrl for full-res
+ *  detail views and mediaDownloadUrl for downloads. */
+export function thumbUrl(mediaId: string, w = 256): string {
+  const clean = mediaId.replace(/^media\//, "");
+  return `/api/media/${encodeURIComponent(clean)}/thumb?w=${w}`;
+}
+
+export interface FlowUsageGemini {
+  today: number;
+  total: number;
+  daily_quota: number;
+  remaining_est: number;
+}
+export interface FlowUsageSeedream {
+  today: number;
+  total: number;
+  usd_per_image: number;
+  cost_today: number; // USD spent today
+  cost_total: number; // USD spent all-time
+}
+export interface FlowUsage {
+  today: number;
+  total: number;
+  daily_quota: number;
+  remaining_est: number;
+  resets_at?: string; // ISO, server's next local midnight
+  seconds_until_reset?: number;
+  // Per-engine split (optional — absent on older agents). Gemini is quota-based;
+  // Seedream is pay-per-use, so it reports money spent instead.
+  engines?: { gemini: FlowUsageGemini; seedream: FlowUsageSeedream };
+}
+export function getFlowUsage() {
+  return api<FlowUsage>("/api/flow/usage");
 }
 
 // ── Upload ───────────────────────────────────────────────────────────────────
@@ -797,6 +882,9 @@ export interface ReferenceItem {
   // spawn skip the re-vision call entirely.
   aiBrief: string | null;
   aspectRatio: string | null;
+  // Image model that produced this (e.g. "gemini-3.1-flash-image"); null for
+  // uploads or rows saved before this field existed.
+  modelUsed: string | null;
   tags: string[];
   pinned: boolean;
   position: number;
@@ -815,6 +903,7 @@ export interface ReferenceCreateInput {
   url?: string | null;
   source_board_id?: number | null;
   source_node_short_id?: string | null;
+  model_used?: string | null;
   tags?: string[];
 }
 
@@ -834,6 +923,7 @@ interface ReferenceRowWire {
   kind: string;
   ai_brief: string | null;
   aspect_ratio: string | null;
+  model_used: string | null;
   tags: string[] | null;
   pinned: boolean;
   position: number;
@@ -864,6 +954,7 @@ function mapReferenceRow(row: ReferenceRowWire): ReferenceItem {
     kind,
     aiBrief: row.ai_brief,
     aspectRatio: row.aspect_ratio,
+    modelUsed: row.model_used,
     tags: Array.isArray(row.tags) ? row.tags : [],
     pinned: row.pinned,
     position: row.position,
@@ -877,6 +968,7 @@ export async function listReferences(params?: {
   q?: string;
   pinned_first?: boolean;
   limit?: number;
+  source_board_id?: number;
 }): Promise<ReferenceItem[]> {
   const search = new URLSearchParams();
   if (params?.q) search.set("q", params.q);
@@ -884,6 +976,9 @@ export async function listReferences(params?: {
     search.set("pinned_first", String(params.pinned_first));
   }
   if (params?.limit !== undefined) search.set("limit", String(params.limit));
+  if (params?.source_board_id !== undefined) {
+    search.set("source_board_id", String(params.source_board_id));
+  }
   const qs = search.toString();
   const rows = await api<ReferenceRowWire[]>(
     `/api/references${qs ? `?${qs}` : ""}`,

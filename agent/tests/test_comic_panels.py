@@ -93,6 +93,61 @@ def test_detect_panels_dark_background_black_gutters():
     assert sum(1 for b in boxes if b[1] >= 600) == 3
 
 
+# ── webtoon panel detection (band split + colour-aware crop) ─────────────────
+
+def _webtoon_gray_page():
+    """Tall B/W webtoon (1000x3000): 3 dense grayscale art bands + a tiny floating
+    blob. No colour ⇒ the B/W fallback keeps each dense band as one box (a white
+    caption inside band A must not split it); the tiny blob is dropped (below the
+    min-band height)."""
+    img = np.full((3000, 1000, 3), 255, np.uint8)
+    _fill(img, 100, 200, 800, 700)        # band A (y 200..900)
+    img[600:850, 150:450] = 255           # white caption inside band A
+    _fill(img, 100, 1700, 800, 600)       # band B
+    _fill(img, 100, 2500, 800, 400)       # band C
+    img[1200:1250, 400:550] = 60          # tiny floating blob in the gap
+    return img
+
+
+def _webtoon_color_page():
+    """Tall colour webtoon (1000x2200): one band with a COLOURED art panel on the
+    left and a B/W speech bubble floating to its right (its own white space). The
+    crop must keep the art and exclude the side bubble."""
+    img = np.full((2200, 1000, 3), 255, np.uint8)
+    img[300:1000, 100:500] = (0, 140, 255)   # saturated (orange) art block, left
+    img[450:800, 620:900] = 255              # white bubble, right
+    img[470:780, 640:880] = 60               # ... dark "text" inside the bubble
+    return img
+
+
+def test_detect_panels_webtoon_bw_fallback_three_bands():
+    boxes = panel_svc.detect_panels_webtoon(_webtoon_gray_page())
+    assert len(boxes) == 3, boxes  # 3 dense bands; tiny blob dropped
+    assert [b[1] for b in boxes] == sorted(b[1] for b in boxes)  # top→bottom
+    a = boxes[0]  # band A one box — the inner white caption doesn't split it
+    assert a[1] <= 210 and a[1] + a[3] >= 890, a
+
+
+def test_detect_panels_webtoon_excludes_side_bubble():
+    boxes = panel_svc.detect_panels_webtoon(_webtoon_color_page())
+    assert len(boxes) == 1, boxes
+    x, y, w, h = boxes[0]
+    assert x + w < 600, boxes        # cropped to the art; the side B/W bubble is out
+    assert x <= 110 and w >= 380     # but it does cover the colour art block
+
+
+def test_detect_boxes_webtoon_mode_matches_helper():
+    img = _webtoon_color_page()
+    assert panel_svc.detect_boxes(img, "webtoon") == panel_svc.detect_panels_webtoon(img)
+
+
+def test_detect_boxes_auto_routes_tall_pages_to_webtoon():
+    """A tall page (H/W ≥ WEBTOON_ASPECT) uses webtoon detection under 'auto' —
+    and never touches the ML backend (early return)."""
+    img = _webtoon_gray_page()  # 1000x3000 → H/W = 3.0
+    assert panel_svc.detect_boxes(img, "auto") == panel_svc.detect_panels_webtoon(img)
+
+
 def test_content_runs_and_merge_close():
     # empty mask: True = empty. content at indices 2..5 and 10..12
     mask = np.array([True, True, False, False, False, False, True, True, True, True,
@@ -171,3 +226,17 @@ async def test_handle_extract_panels_missing_folder():
 async def test_handle_extract_panels_bad_dir():
     result, err = await _handle_extract_panels({"folder": "/no/such/dir/zzz"})
     assert err and "not a directory" in err.lower()
+
+
+def test_detect_panels_webtoon_content_crop_keeps_light_region():
+    """crop='content' reaches a light/low-saturation region (e.g. bright sky) that
+    the colour crop pulls the box top past — so a whole scene stays in one box."""
+    import numpy as np
+    page = np.full((2400, 1000, 3), 255, np.uint8)     # white page
+    page[400:900] = (200, 200, 205)                    # pale "sky": not_bg but unsaturated
+    page[900:1600, 200:800] = (40, 90, 200)            # saturated colour block below
+    color = panel_svc.detect_panels_webtoon(page, crop="color")
+    content = panel_svc.detect_panels_webtoon(page, crop="content")
+    assert color and content
+    assert content[0][1] < color[0][1]                 # content box top reaches the sky
+

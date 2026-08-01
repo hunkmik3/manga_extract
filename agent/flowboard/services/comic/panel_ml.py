@@ -9,7 +9,7 @@ detector" note in the brief.
 
 Heavy deps (torch + ultralytics) are an **optional** install:
 
-    pip install -e ".[ml]"      # or: pip install ultralytics huggingface_hub
+    uv pip install --python .venv/bin/python -e ".[ml]"
 
 so the base agent stays light. Everything here is lazy: nothing is imported or
 downloaded until the first ML detection. If the deps/weights are missing,
@@ -58,7 +58,7 @@ def _load_model():
     try:
         from ultralytics import YOLO  # optional dep (pulls torch)
     except Exception as exc:  # noqa: BLE001
-        _load_failed = f"ultralytics/torch not installed ({exc}); run: pip install -e '.[ml]'"
+        _load_failed = f'ultralytics/torch not installed ({exc}); run: uv pip install --python .venv/bin/python -e ".[ml]"'
         raise MLUnavailable(_load_failed) from exc
 
     weights = os.getenv("FLOWBOARD_PANEL_MODEL")
@@ -103,3 +103,69 @@ def detect_panels_ml(bgr: np.ndarray, conf: float = _CONF, imgsz: int = _IMGSZ) 
     H = bgr.shape[0]
     boxes.sort(key=lambda b: (round(b[1] / (0.08 * H)), b[0]))
     return boxes
+
+
+# ── Speech-bubble detector (YOLO-seg) — for the Bubble Extract branch ─────────
+# A separate instance-segmentation model: gives each bubble a bbox AND a mask
+# polygon, so the crop follows the bubble's actual shape (transparent outside).
+_BUBBLE_REPO = "kitsumed/yolov8m_seg-speech-bubble"
+_BUBBLE_FILE = "model.pt"
+_BUBBLE_CONF = 0.35
+_BUBBLE_IMGSZ = 1280
+_BUBBLE_PAD = 0.08  # bbox padding fraction (each side) so the full bubble is captured
+
+_bubble_model = None
+_bubble_failed: Optional[str] = None
+
+
+def _load_bubble_model():
+    global _bubble_model, _bubble_failed
+    if _bubble_model is not None:
+        return _bubble_model
+    if _bubble_failed is not None:
+        raise MLUnavailable(_bubble_failed)
+    try:
+        from ultralytics import YOLO
+    except Exception as exc:  # noqa: BLE001
+        _bubble_failed = f'ultralytics/torch not installed ({exc}); run: uv pip install --python .venv/bin/python -e ".[ml]"'
+        raise MLUnavailable(_bubble_failed) from exc
+    weights = os.getenv("FLOWBOARD_BUBBLE_MODEL")
+    try:
+        if not weights:
+            from huggingface_hub import hf_hub_download
+            weights = hf_hub_download(_BUBBLE_REPO, _BUBBLE_FILE)
+        model = YOLO(weights)
+    except Exception as exc:  # noqa: BLE001
+        _bubble_failed = f"could not load bubble model weights ({exc})"
+        raise MLUnavailable(_bubble_failed) from exc
+    _bubble_model = model
+    logger.info("bubble ML model loaded (%s); classes=%s", weights, getattr(model, "names", {}))
+    return _bubble_model
+
+
+def detect_bubbles_ml(
+    bgr: np.ndarray, conf: float = _BUBBLE_CONF, imgsz: int = _BUBBLE_IMGSZ
+) -> list[tuple[Box, Optional[list]]]:
+    """Detect speech bubbles. Returns [((x,y,w,h), None)] — a padded rectangle
+    bbox per bubble (poly left None so it crops as a rectangle that captures the
+    WHOLE bubble plus a small margin, rather than a tight mask that can clip the
+    rim). Sorted top→bottom, left→right. Raises ``MLUnavailable`` if missing."""
+    model = _load_bubble_model()
+    res = model.predict(bgr, conf=conf, imgsz=imgsz, verbose=False)[0]
+    out: list[tuple[Box, Optional[list]]] = []
+    if res.boxes is None or len(res.boxes) == 0:
+        return out
+    H, W = bgr.shape[0], bgr.shape[1]
+    xyxy = res.boxes.xyxy.cpu().numpy()
+    for (x0, y0, x1, y1) in xyxy:
+        # Pad so the full bubble (rim, tail) is captured — extra background is fine.
+        px = (x1 - x0) * _BUBBLE_PAD
+        py = (y1 - y0) * _BUBBLE_PAD
+        nx0 = max(0, int(round(x0 - px)))
+        ny0 = max(0, int(round(y0 - py)))
+        nx1 = min(W, int(round(x1 + px)))
+        ny1 = min(H, int(round(y1 + py)))
+        if nx1 > nx0 and ny1 > ny0:
+            out.append(((nx0, ny0, nx1 - nx0, ny1 - ny0), None))
+    out.sort(key=lambda bp: (round(bp[0][1] / (0.08 * H)), bp[0][0]))
+    return out
