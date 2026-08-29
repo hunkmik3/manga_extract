@@ -1038,3 +1038,108 @@ export function getFlowSyncStatus(): Promise<SyncStatusResponse> {
 export function syncBoardsUpToFlow(): Promise<SyncUpResponse> {
   return api<SyncUpResponse>("/api/flow/projects/sync-up", { method: "POST" });
 }
+
+// ── Manga colorizer ──────────────────────────────────────────────────────────
+
+export interface ColorizeChapterSummary {
+  id: number;
+  name: string;
+  pages: number;
+  has_bible: boolean;
+  colorized: number;
+  updated_at: string | null;
+}
+export interface ColorizeChapter {
+  id: number;
+  name: string;
+  page_media_ids: string[];
+  style_ref_media_id: string | null;
+  bible: Record<string, unknown> | null;
+  outputs: Record<string, string>;
+  sheets?: Record<string, string>; // outfit_id → character-sheet media id
+  variants?: Record<string, string[]>; // page media id → candidate output media ids
+  created_at: string;
+  updated_at: string;
+}
+
+export function samPoint(mediaId: string, x: number, y: number): Promise<{ box: number[] }> {
+  return api<{ box: number[] }>("/api/colorize/sam-point", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ media_id: mediaId, x, y }),
+  });
+}
+
+export function detectColorizePanels(mediaId: string): Promise<{ panels: number[][] }> {
+  return api<{ panels: number[][] }>("/api/colorize/detect-panels", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ media_id: mediaId }),
+  });
+}
+
+export function selectColorizeVariant(
+  chapterId: number,
+  pageMediaId: string,
+  outputMediaId: string,
+): Promise<ColorizeChapter> {
+  return api<ColorizeChapter>(`/api/colorize/chapters/${chapterId}/select-variant`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ page_media_id: pageMediaId, output_media_id: outputMediaId }),
+  });
+}
+
+export function listColorizeChapters(): Promise<ColorizeChapterSummary[]> {
+  return api<ColorizeChapterSummary[]>("/api/colorize/chapters");
+}
+export function createColorizeChapter(body: {
+  name?: string;
+  page_media_ids?: string[];
+  style_ref_media_id?: string | null;
+}): Promise<ColorizeChapter> {
+  return api<ColorizeChapter>("/api/colorize/chapters", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+export function getColorizeChapter(id: number): Promise<ColorizeChapter> {
+  return api<ColorizeChapter>(`/api/colorize/chapters/${id}`);
+}
+export function patchColorizeChapter(
+  id: number,
+  body: Partial<Pick<ColorizeChapter, "name" | "page_media_ids" | "style_ref_media_id" | "bible">>,
+): Promise<ColorizeChapter> {
+  return api<ColorizeChapter>(`/api/colorize/chapters/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+export function deleteColorizeChapter(id: number): Promise<void> {
+  return api<void>(`/api/colorize/chapters/${id}`, { method: "DELETE" });
+}
+
+// ── Grok-style segment editor ────────────────────────────────────────────────
+
+export interface Segment {
+  id: number;
+  label: string;
+  box: number[]; // [ymin, xmin, ymax, xmax] normalized 0-1000
+}
+
+/** Isolate a segment's box into a transparent-PNG cutout media (grabCut). */
+export function makeCutout(mediaId: string, box: number[]): Promise<{ media_id: string }> {
+  return api<{ media_id: string }>("/api/edit/cutout", {
+    method: "POST",
+    body: JSON.stringify({ media_id: mediaId, box }),
+  });
+}
+
+/** Upload one page/style image to the LOCAL media cache (no Flow/extension). */
+export async function uploadColorizePage(file: File): Promise<{ media_id: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch("/api/colorize/upload-page", { method: "POST", body: form });
+  if (!res.ok) throw new Error(await extractErrorMessage(res));
+  return res.json() as Promise<{ media_id: string }>;
+}

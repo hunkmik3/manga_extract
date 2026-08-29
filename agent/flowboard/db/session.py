@@ -71,6 +71,22 @@ def init_db() -> None:
                 )
                 conn.commit()
 
+        # ColorizeChapter.sheets — character-sheet references (outfit_id → media
+        # id) added with the character-sheet pipeline. Idempotent ALTER so
+        # existing chapters keep their data and pick up the column on boot.
+        if insp.has_table("colorizechapter"):
+            cz_cols = {c["name"] for c in insp.get_columns("colorizechapter")}
+            if "sheets" not in cz_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE colorizechapter ADD COLUMN sheets JSON DEFAULT '{}'"
+                )
+                conn.commit()
+            if "variants" not in cz_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE colorizechapter ADD COLUMN variants JSON DEFAULT '{}'"
+                )
+                conn.commit()
+
     SQLModel.metadata.create_all(engine)
 
 

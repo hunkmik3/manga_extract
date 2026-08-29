@@ -2655,6 +2655,9 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
     if provider == "ark":
         # BytePlus Ark Seedream (versioned) ids, e.g. "dola-seedream-5-0-pro-260628".
         image_model = image_model or "dola-seedream-5-0-pro-260628"
+    elif provider == "avis":
+        # Avis model ids — e.g. Grok "grok-imagine-image-quality" (faithful edit).
+        image_model = image_model or "grok-imagine-image-quality"
     elif not image_model.startswith("gemini-"):
         # The Gemini and Atrium engines both speak Gemini model ids.
         image_model = "gemini-2.5-flash-image"
@@ -2726,6 +2729,11 @@ async def _handle_flow_gen_image(params: dict) -> tuple[dict, Optional[str]]:
                     prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
                     on_progress=_progress,
                 )
+        elif provider == "avis":
+            outs = await _flow_gen_avis(
+                prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
+                on_progress=_progress,
+            )
         elif provider == "ark":
             outs = await _flow_gen_ark(
                 prompt, image_model, aspect, image_size, variant_count, ref_ids, source_id,
@@ -2864,6 +2872,51 @@ async def _flow_gen_ark(
     )
 
 
+async def _flow_gen_avis(
+    prompt: str, image_model: str, aspect: str, image_size: Optional[str],
+    variant_count: int, ref_ids: list, source_id: Optional[str],
+    on_progress=None,
+) -> list[bytes]:
+    """Avis engine (Grok faithful edit / Seedream) — source + reference images
+    sent INLINE as base64, so refs and edit work fully locally. For Grok, don't
+    force a size — it follows the input image (faithful edit)."""
+    from flowboard.services.comic import avis_api
+
+    if not avis_api.is_configured():
+        raise _FlowGenError("avis_not_configured: set AVIS_API_KEY in .env")
+
+    def _load(mid: str) -> Optional[bytes]:
+        p = media_service.cached_path(mid)
+        if p is None:
+            return None
+        try:
+            b = p.read_bytes()
+        except OSError:
+            return None
+        return b or None
+
+    def _load_all() -> tuple[Optional[bytes], list[bytes]]:
+        src = _load(source_id) if source_id else None
+        refs = [b for b in (_load(r) for r in ref_ids) if b]
+        return src, refs
+
+    source_bytes, ref_bytes = await asyncio.to_thread(_load_all)
+    if source_id and source_bytes is None:
+        raise _FlowGenError("source_not_found")
+
+    is_grok = "grok" in (image_model or "").lower()
+    images = ([source_bytes] if source_bytes else []) + ref_bytes
+    return await avis_api.generate_image_variants(
+        prompt, images or None,
+        image_model=image_model,
+        aspect_ratio="" if (source_id or is_grok) else aspect,
+        variant_count=variant_count,
+        # Grok (edit) follows the input; only Seedream uses the sized band.
+        image_size=None if (source_id or is_grok) else image_size,
+        on_progress=on_progress,
+    )
+
+
 def _atrium_input_url(media_id: str) -> Optional[str]:
     """Public URL for an Atrium input image — prefer R2 (upload the file and use
     its r2.dev url), else a tunnel (PUBLIC_MEDIA_BASE_URL → /media). Sync (boto3
@@ -2933,8 +2986,662 @@ async def _flow_gen_atrium(
             await asyncio.to_thread(_cleanup)
 
 
+# ── Manga colorizer (read-first, color-locked) ──────────────────────────────
+
+def _load_media_bytes(mid: object) -> Optional[bytes]:
+    p = media_service.cached_path(mid) if isinstance(mid, str) and mid else None
+    if p is None:
+        return None
+    try:
+        return p.read_bytes() or None
+    except OSError:
+        return None
+
+
+def _colorize_page_key(i: int) -> str:
+    """Ordinal page name used as the bible key for the i-th uploaded page."""
+    return f"page_{i + 1:03d}"
+
+
+async def _handle_colorize_build_bible(params: dict) -> tuple[dict, Optional[str]]:
+    """PASS 1 — a vision model reads the whole chapter → bible, saved on the row."""
+    from flowboard.db.models import ColorizeChapter
+    from flowboard.services.colorize import reader
+
+    try:
+        cid = int(params.get("chapter_id"))
+    except (TypeError, ValueError):
+        return {}, "missing_chapter_id"
+
+    with get_session() as s:
+        ch = s.get(ColorizeChapter, cid)
+        if ch is None:
+            return {}, "chapter_not_found"
+        name = ch.name or ""
+        page_ids = list(ch.page_media_ids or [])
+        style_id = ch.style_ref_media_id
+    if not page_ids:
+        return {}, "no_pages"
+
+    pages = [(_colorize_page_key(i), mid) for i, mid in enumerate(page_ids)]
+    try:
+        bible = await reader.build_bible(pages, chapter=name, style_ref_id=style_id)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"bible_failed: {type(exc).__name__}: {exc}"[:200]
+
+    bdict = bible.model_dump()
+    with get_session() as s:
+        ch = s.get(ColorizeChapter, cid)
+        if ch is None:
+            return {}, "chapter_not_found"
+        ch.bible = bdict
+        ch.updated_at = datetime.now(timezone.utc)
+        s.add(ch)
+        s.commit()
+    return {"bible": bdict, "summary": bible.summary(), "chapter_id": cid}, None
+
+
+_AUTO_COLORREF_CACHE: dict[tuple, Optional[str]] = {}
+
+
+def _auto_color_ref(page_ids: list[str]) -> Optional[str]:
+    """Pick the most colourful page in the chapter (a colour cover / splash page)
+    to feed as an IMAGE style reference. Real colours from an actual coloured page
+    anchor the whole chapter's palette far more strongly than any text prompt.
+    Cached per page-set. Returns None when every page is essentially black-and-white
+    (so no false reference is sent). CPU-light — call via a thread."""
+    key = tuple(page_ids)
+    if key in _AUTO_COLORREF_CACHE:
+        return _AUTO_COLORREF_CACHE[key]
+    best_mid: Optional[str] = None
+    best_sat = 0.0
+    try:
+        import cv2
+        import numpy as np
+
+        for mid in page_ids:
+            b = _load_media_bytes(mid)
+            if not b:
+                continue
+            arr = cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+            if arr is None:
+                continue
+            h, w = arr.shape[:2]
+            sc = 200.0 / max(h, w)
+            small = cv2.resize(arr, (max(1, int(w * sc)), max(1, int(h * sc))))
+            sat = float(cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[:, :, 1].mean())  # 0-255
+            if sat > best_sat:
+                best_sat, best_mid = sat, mid
+    except Exception:  # noqa: BLE001
+        best_mid = None
+    # B&W pages sit around mean-saturation < ~12; a real colour page is much higher.
+    ref = best_mid if best_sat >= 25.0 else None
+    _AUTO_COLORREF_CACHE[key] = ref
+    return ref
+
+
+def _colorize_engine():
+    """Return (engine module, default model, provider) per COLORIZE_PROVIDER.
+
+    Default is DanceSee B2B (content-filter-disabled Seedream). ``avis`` is the
+    moderated Avis path; ``ark`` is BytePlus Ark direct.
+    """
+    provider = os.getenv("COLORIZE_PROVIDER", "").strip().lower() or "dancesee"
+    if provider in ("b2b", "dancesee"):
+        from flowboard.services.comic import dancesee_api as engine
+        return engine, "dola-seedream-5-0-pro", "dancesee"
+    if provider == "ark":
+        from flowboard.services.comic import ark_api as engine
+        return engine, "dola-seedream-5-0-pro-260628", provider
+    from flowboard.services.comic import avis_api as engine
+    return engine, "dola-seedream-5-0-pro", "avis"
+
+
+def _downscale_jpeg(b: Optional[bytes], edge: int = 2560) -> tuple[Optional[bytes], Optional[tuple]]:
+    if not b:
+        return None, None
+    try:
+        import io as _io
+        from PIL import Image
+        im = Image.open(_io.BytesIO(b)).convert("RGB")
+        w, h = im.size
+        m = max(w, h)
+        if m > edge:
+            s = edge / m
+            im = im.resize((max(1, round(w * s)), max(1, round(h * s))))
+        buf = _io.BytesIO()
+        im.save(buf, "JPEG", quality=92)
+        return buf.getvalue(), im.size
+    except Exception:  # noqa: BLE001
+        return b, None
+
+
+def _sheet_source_index(bible, outfit_id: str) -> Optional[int]:
+    """Pick the page index to build an outfit's character sheet from: a page where
+    that (char, outfit) appears — preferring one where the character is ALONE so
+    the character crop is unambiguous."""
+    import re
+
+    o = bible.outfits.get(outfit_id)
+    if not o:
+        return None
+    order = list(bible.meta.page_order) or list(bible.pages.keys())
+    cands: list[tuple[int, int, str]] = []  # (num_chars_present, position, page_key)
+    for pos, pg in enumerate(order):
+        page = bible.pages.get(pg)
+        if not page:
+            continue
+        if any(pr.char == o.char and pr.outfit == outfit_id for pr in page.present):
+            cands.append((len({pr.char for pr in page.present}), pos, pg))
+    if not cands:
+        return None
+    cands.sort(key=lambda t: (t[0], t[1]))  # fewest characters, then earliest
+    pg = cands[0][2]
+    m = re.search(r"(\d+)", pg)
+    return (int(m.group(1)) - 1) if m else cands[0][1]
+
+
+def _crop_largest_person(img_bytes: bytes) -> bytes:
+    """Crop the biggest detected person from a colored page → a clean character
+    sheet. Falls back to the whole image if detection is unavailable/fails."""
+    try:
+        import cv2
+        import numpy as np
+
+        from flowboard.services import gdino
+
+        if not gdino.available():
+            return img_bytes
+        persons = [d for d in gdino.detect_parts(img_bytes) if d.get("label") == "person"]
+        if not persons:
+            return img_bytes
+        best = max(persons, key=lambda d: (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]))
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return img_bytes
+        h, w = img.shape[:2]
+        ymin, xmin, ymax, xmax = best["box"]
+        pad = 0.06
+        y0 = max(0, int((ymin / 1000 - pad) * h)); y1 = min(h, int((ymax / 1000 + pad) * h))
+        x0 = max(0, int((xmin / 1000 - pad) * w)); x1 = min(w, int((xmax / 1000 + pad) * w))
+        if y1 - y0 < 24 or x1 - x0 < 24:
+            return img_bytes
+        ok, buf = cv2.imencode(".png", img[y0:y1, x0:x1])
+        return buf.tobytes() if ok else img_bytes
+    except Exception:  # noqa: BLE001
+        return img_bytes
+
+
+def _enhance_colors(img_bytes: bytes, sat: float, contrast: float) -> bytes:
+    """Deterministically make colours pop: scale LAB a*/b* chroma by ``sat``
+    (hue-preserving vibrance) AND add a gentle S-curve contrast on L by
+    ``contrast`` (deepens shadows/midtones so high-key, washed-out model output
+    reads with more body). 1.0 = no-op for each. Pure saturation can't add colour
+    to near-white areas — the contrast is what fixes the "pale" look there."""
+    if (abs(sat - 1.0) < 1e-3) and (abs(contrast - 1.0) < 1e-3):
+        return img_bytes
+    try:
+        import cv2
+        import numpy as np
+
+        arr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if arr is None:
+            return img_bytes
+        lab = cv2.cvtColor(arr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        if abs(sat - 1.0) >= 1e-3:
+            lab[:, :, 1] = np.clip((lab[:, :, 1] - 128.0) * sat + 128.0, 0, 255)
+            lab[:, :, 2] = np.clip((lab[:, :, 2] - 128.0) * sat + 128.0, 0, 255)
+        if abs(contrast - 1.0) >= 1e-3:
+            # Contrast around mid-grey (L=~128 in 0-255 LAB), kept gentle.
+            lab[:, :, 0] = np.clip((lab[:, :, 0] - 128.0) * contrast + 128.0, 0, 255)
+        out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        ok, buf = cv2.imencode(".png", out)
+        return buf.tobytes() if ok else img_bytes
+    except Exception:  # noqa: BLE001
+        return img_bytes
+
+
+async def _handle_colorize_build_sheets(params: dict) -> tuple[dict, Optional[str]]:
+    """Build a character sheet (colorized, character-cropped reference) for each
+    outfit version in the bible. These become image references for PASS 2 so a
+    character's multi-layer clothing + chibi stay consistent across pages."""
+    from flowboard.db.models import ColorizeChapter
+    from flowboard.services.colorize import bible as bible_mod, prompt as prompt_mod
+
+    engine, default_model, provider = _colorize_engine()
+    logger.info("colorize sheets via %s model=%s", provider, os.getenv("COLORIZE_MODEL", "").strip() or default_model)
+    if not engine.is_configured():
+        return {}, f"{provider}_not_configured"
+    try:
+        cid = int(params.get("chapter_id"))
+    except (TypeError, ValueError):
+        return {}, "bad_params"
+    only = params.get("outfit_ids") if isinstance(params.get("outfit_ids"), list) else None
+
+    with get_session() as s:
+        ch = s.get(ColorizeChapter, cid)
+        if ch is None:
+            return {}, "chapter_not_found"
+        page_ids = list(ch.page_media_ids or [])
+        raw_bible = ch.bible
+        existing = dict(ch.sheets or {})
+    if raw_bible is None:
+        return {}, "no_bible: build the bible first"
+    try:
+        bible = bible_mod.parse_bible(raw_bible)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"bad_bible: {exc}"[:200]
+
+    cover_ref = await asyncio.to_thread(_auto_color_ref, page_ids) if os.getenv("COLORIZE_AUTO_COLORREF", "1") != "0" else None
+    cover_bytes, _ = await asyncio.to_thread(_downscale_jpeg, _load_media_bytes(cover_ref) if cover_ref else None)
+
+    model = os.getenv("COLORIZE_MODEL", "").strip() or os.getenv("SEEDREAM_MODEL", "").strip() or default_model
+    outfit_ids = only or list(bible.outfits.keys())
+    # MAIN-CAST only (unless a subset is explicitly requested): a turnaround sheet
+    # for a 6-page eunuch is waste, and minors aren't on the cover so their sheet
+    # would be garbage. Keep characters appearing on >= COLORIZE_SHEET_MIN_RATIO of
+    # pages (default 25%), with a small absolute floor.
+    if only is None:
+        npages = max(1, len(bible.pages))
+        min_pages = max(3, int(npages * float(os.getenv("COLORIZE_SHEET_MIN_RATIO", "0.25"))))
+        appear: dict[str, int] = {}
+        for pg in bible.pages.values():
+            for pr in pg.present:
+                appear[pr.char] = appear.get(pr.char, 0) + 1
+        outfit_ids = [
+            oid for oid in outfit_ids
+            if (o := bible.outfits.get(oid)) is not None and appear.get(o.char, 0) >= min_pages
+        ]
+    if not outfit_ids:
+        return {}, "no_outfits: no character appears on enough pages for a sheet"
+    sheet_size = engine.size_for_dims(2560, 1536)  # landscape model-sheet canvas
+    sem = asyncio.Semaphore(int(os.getenv("COLORIZE_SHEET_CONCURRENCY", "3")))
+
+    async def _one(oid: str) -> tuple[str, Optional[str], Optional[str]]:
+        async with sem:
+            o = bible.outfits.get(oid)
+            char_id = o.char if o else ""
+            # Design reference — PREFER the colour cover (real, ground-truth colours
+            # for the leads). Only when there's no colour page do we fall back to
+            # colorizing a source panel and cropping the character.
+            ref_colored = bool(cover_bytes)
+            if cover_bytes:
+                ref_ds: Optional[bytes] = cover_bytes
+            else:
+                idx = _sheet_source_index(bible, oid)
+                if idx is None or not (0 <= idx < len(page_ids)):
+                    return oid, None, "no source page for outfit"
+                page_bytes, dims = await asyncio.to_thread(_downscale_jpeg, _load_media_bytes(page_ids[idx]))
+                if page_bytes is None:
+                    return oid, None, "source page not cached"
+                page_text = prompt_mod.build_prompt(bible, _colorize_page_key(idx))
+                psize = engine.size_for_dims(*dims) if dims else None
+                try:
+                    colored = await engine.generate_image_variants(
+                        page_text, [page_bytes], image_model=model, variant_count=1, size_override=psize)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("sheet ref colorize failed %s: %s", oid, exc)
+                    return oid, None, str(exc)[:160]
+                if not colored:
+                    return oid, None, "no image from ref colorize"
+                ref = await asyncio.to_thread(_crop_largest_person, colored[0])
+                ref_ds, _ = await asyncio.to_thread(_downscale_jpeg, ref)
+            # Generate the turnaround MODEL SHEET from the reference.
+            sheet_text = prompt_mod.build_sheet_prompt(bible, char_id, oid, ref_is_colored=ref_colored)
+            try:
+                sheet = await engine.generate_image_variants(
+                    sheet_text, [ref_ds] if ref_ds else [], image_model=model,
+                    variant_count=1, size_override=sheet_size)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("sheet turnaround failed %s: %s", oid, exc)
+                return oid, None, str(exc)[:160]
+            if not sheet:
+                return oid, None, "no image from turnaround"
+            mid = await asyncio.to_thread(_ingest_png, sheet[0])
+            return oid, mid, None
+
+    results = await asyncio.gather(*[_one(o) for o in outfit_ids])
+    built: dict[str, str] = {oid: mid for oid, mid, _err in results if mid}
+    failures = [f"{oid}: {err}" for oid, mid, err in results if not mid and err]
+
+    if built:
+        with get_session() as s:
+            ch = s.get(ColorizeChapter, cid)
+            if ch is not None:
+                ch.sheets = {**existing, **built}
+                ch.updated_at = datetime.now(timezone.utc)
+                s.add(ch)
+                s.commit()
+    payload = {"sheets": built, "count": len(built), "failures": failures}
+    if not built:
+        hint = failures[0] if failures else "all outfits failed"
+        return payload, f"sheets_failed ({provider}): {hint}"[:200]
+    return payload, None
+
+
+async def _handle_colorize_page(params: dict) -> tuple[dict, Optional[str]]:
+    """PASS 2 — colorize ONE page: COLOR-LOCK prompt from the bible + Seedream."""
+    from flowboard.db.models import ColorizeChapter
+    from flowboard.services.colorize import bible as bible_mod, prompt as prompt_mod
+
+    # Seedream engine: DanceSee B2B (default, unmoderated), Avis, or Ark-direct.
+    # Same generate_image_variants interface; pick via COLORIZE_PROVIDER.
+    engine, default_model, provider = _colorize_engine()
+    logger.info("colorize page via %s model=%s", provider, os.getenv("COLORIZE_MODEL", "").strip() or default_model)
+
+    try:
+        cid = int(params.get("chapter_id"))
+        page_index = int(params.get("page_index"))
+    except (TypeError, ValueError):
+        return {}, "bad_params"
+    if not engine.is_configured():
+        return {}, f"{provider}_not_configured"
+
+    with get_session() as s:
+        ch = s.get(ColorizeChapter, cid)
+        if ch is None:
+            return {}, "chapter_not_found"
+        page_ids = list(ch.page_media_ids or [])
+        style_id = ch.style_ref_media_id
+        raw_bible = ch.bible
+        sheets = dict(ch.sheets or {})
+    if raw_bible is None:
+        return {}, "no_bible: build the bible first"
+    if page_index < 0 or page_index >= len(page_ids):
+        return {}, "bad_page_index"
+    try:
+        bible = bible_mod.parse_bible(raw_bible)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"bad_bible: {exc}"[:200]
+
+    page_key = _colorize_page_key(page_index)
+
+    # Reference images, best → worst: the character SHEET for each (char, outfit)
+    # present on THIS page (locks multi-layer clothing + chibi), else a human style
+    # ref, else the auto colour-page (cover/splash).
+    ref_ids: list[str] = []
+    page_obj = bible.pages.get(page_key)
+    if page_obj:
+        seen: set[str] = set()
+        for pr in page_obj.present:
+            sid = sheets.get(pr.outfit) if pr.outfit else None
+            if sid and sid not in seen:
+                seen.add(sid)
+                ref_ids.append(sid)
+    used_sheets = bool(ref_ids)  # refs are character sheets → outfit-only role
+    if not ref_ids:
+        if not style_id and os.getenv("COLORIZE_AUTO_COLORREF", "1") != "0":
+            style_id = await asyncio.to_thread(_auto_color_ref, page_ids)
+        if style_id:
+            ref_ids = [style_id]
+    ref_ids = ref_ids[:3]  # cap references sent to the engine
+
+    page_mid = page_ids[page_index]
+
+    def _prep() -> tuple[Optional[bytes], list, Optional[tuple]]:
+        # Pages can be huge (e.g. 72 MP scans). Downscale INPUT + refs to ~2.5K
+        # long edge before sending — output is capped ~2K anyway.
+        pb, pdims = _downscale_jpeg(_load_media_bytes(page_mid))
+        refs: list = []
+        for rid in ref_ids:
+            rb, _ = _downscale_jpeg(_load_media_bytes(rid))
+            if rb:
+                refs.append(rb)
+        return pb, refs, pdims
+
+    page_bytes, ref_bytes, dims = await asyncio.to_thread(_prep)
+    if page_bytes is None:
+        return {}, "page_not_cached"
+
+    text = prompt_mod.build_prompt(bible, page_key, sheet_refs=used_sheets)
+    size = engine.size_for_dims(*dims) if dims else None
+    images = [page_bytes] + ref_bytes
+    model = os.getenv("COLORIZE_MODEL", "").strip() or os.getenv("SEEDREAM_MODEL", "").strip() or default_model
+    try:
+        n_variants = max(1, min(int(params.get("variant_count", 1)), 4))
+    except (TypeError, ValueError):
+        n_variants = 1
+    try:
+        outs = await engine.generate_image_variants(
+            text, images, image_model=model, variant_count=n_variants, size_override=size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"colorize_failed: {type(exc).__name__}: {exc}"[:200]
+    if not outs:
+        return {}, "no_image_generated"
+
+    # Deterministic vibrance — guarantees richer colour than the prompt alone.
+    # Saturation adds chroma; contrast gives high-key/washed output more body.
+    # Tunable via COLORIZE_SATURATION / COLORIZE_CONTRAST (1.0 = off).
+    sat = float(os.getenv("COLORIZE_SATURATION", "1.0"))
+    contrast = float(os.getenv("COLORIZE_CONTRAST", "1.0"))
+    if abs(sat - 1.0) > 1e-3 or abs(contrast - 1.0) > 1e-3:
+        outs = [await asyncio.to_thread(_enhance_colors, o, sat, contrast) for o in outs]
+
+    out_ids = [m for m in await asyncio.to_thread(_ingest_pngs, outs) if m]
+    out_mid = out_ids[0] if out_ids else None
+    with get_session() as s:
+        ch = s.get(ColorizeChapter, cid)
+        if ch is not None and out_mid:
+            outputs = dict(ch.outputs or {})
+            outputs[page_mid] = out_mid  # chosen output defaults to the first variant
+            ch.outputs = outputs
+            variants = dict(ch.variants or {})
+            variants[page_mid] = out_ids  # keep every candidate for the picker
+            ch.variants = variants
+            ch.updated_at = datetime.now(timezone.utc)
+            s.add(ch)
+            s.commit()
+    return {"output_media_id": out_mid, "variant_media_ids": out_ids,
+            "page_index": page_index, "page_media_id": page_mid}, None
+
+
+async def _handle_colorize_fix_region(params: dict) -> tuple[dict, Optional[str]]:
+    """Re-colorize just ONE region of an already-colorized page and composite it
+    back — for fixing a single broken panel/object without redoing the whole page.
+
+    params: chapter_id, page_index, box=[ymin,xmin,ymax,xmax] (0-1000), use_mask
+    (bool — True = SAM-mask blend for a tight object; False = rectangle for a panel).
+    """
+    import cv2
+    import numpy as np
+
+    from flowboard.db.models import ColorizeChapter
+    from flowboard.services import sam
+    from flowboard.services.colorize import bible as bible_mod, prompt as prompt_mod
+
+    engine, default_model, provider = _colorize_engine()
+    if not engine.is_configured():
+        return {}, f"{provider}_not_configured"
+    try:
+        cid = int(params.get("chapter_id"))
+        page_index = int(params.get("page_index"))
+        box = [int(v) for v in params.get("box")]
+        assert len(box) == 4
+    except (TypeError, ValueError, AssertionError):
+        return {}, "bad_params (need chapter_id, page_index, box[4])"
+    use_mask = bool(params.get("use_mask"))
+    edit_prompt = (params.get("prompt") or "").strip()  # free-text edit; empty = plain re-colorize
+
+    with get_session() as s:
+        ch = s.get(ColorizeChapter, cid)
+        if ch is None:
+            return {}, "chapter_not_found"
+        page_ids = list(ch.page_media_ids or [])
+        outputs = dict(ch.outputs or {})
+        sheets = dict(ch.sheets or {})
+        raw_bible = ch.bible
+    if not (0 <= page_index < len(page_ids)):
+        return {}, "bad_page_index"
+    if raw_bible is None:
+        return {}, "no_bible"
+    page_mid = page_ids[page_index]
+    cur_out = outputs.get(page_mid)
+    if not cur_out:
+        return {}, "page_not_colorized_yet"
+    try:
+        bible = bible_mod.parse_bible(raw_bible)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"bad_bible: {exc}"[:150]
+
+    page_key = _colorize_page_key(page_index)
+    # Sheet references for the characters present on this page (outfit colours).
+    ref_ids: list[str] = []
+    page_obj = bible.pages.get(page_key)
+    if page_obj:
+        for pr in page_obj.present:
+            sid = sheets.get(pr.outfit) if pr.outfit else None
+            if sid and sid not in ref_ids:
+                ref_ids.append(sid)
+    used_sheets = bool(ref_ids)
+    ref_ids = ref_ids[:3]
+
+    bw_bytes = _load_media_bytes(page_mid)
+    out_bytes = _load_media_bytes(cur_out)
+    if not bw_bytes or not out_bytes:
+        return {}, "media_not_cached"
+
+    # Re-colorize crops the B&W page; prompt-EDIT crops the current COLOURED output
+    # (so the edit works on what you see, then composites back in place).
+    crop_src_bytes = out_bytes if edit_prompt else bw_bytes
+
+    def _prep() -> tuple:
+        src = cv2.imdecode(np.frombuffer(crop_src_bytes, np.uint8), cv2.IMREAD_COLOR)
+        out = cv2.imdecode(np.frombuffer(out_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if src is None or out is None:
+            return None
+        hb, wb = src.shape[:2]
+        bx0 = max(0, int(box[1] / 1000 * wb)); bx1 = min(wb, int(box[3] / 1000 * wb))
+        by0 = max(0, int(box[0] / 1000 * hb)); by1 = min(hb, int(box[2] / 1000 * hb))
+        if bx1 - bx0 < 8 or by1 - by0 < 8:
+            return None
+        crop = src[by0:by1, bx0:bx1]
+        ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cb, dims = _downscale_jpeg(buf.tobytes())
+        refs = []
+        for rid in ref_ids:
+            rb, _ = _downscale_jpeg(_load_media_bytes(rid))
+            if rb:
+                refs.append(rb)
+        return out, (bx0, by0, bx1, by1), cb, dims, refs
+
+    prepped = await asyncio.to_thread(_prep)
+    if prepped is None:
+        return {}, "bad_crop"
+    out_img, (bx0, by0, bx1, by1), crop_bytes, dims, ref_bytes = prepped
+
+    if edit_prompt:
+        # Free-text edit of the coloured crop — keep it in place, anime style.
+        text = (
+            f"Edit ONLY this manga panel/region as instructed: {edit_prompt}. "
+            "Keep the same composition, framing, line art, character identity and "
+            "everything not mentioned unchanged. Clean 2D anime cel colouring, flat "
+            "solid colours, match the surrounding page's palette. No text, no bubbles."
+        )
+    else:
+        text = prompt_mod.build_prompt(bible, page_key, sheet_refs=used_sheets)
+    size = engine.size_for_dims(*dims) if dims else None
+    model = os.getenv("COLORIZE_MODEL", "").strip() or os.getenv("SEEDREAM_MODEL", "").strip() or default_model
+    # For a prompt-edit the crop itself is the reference; for re-colorize add sheets.
+    gen_images = [crop_bytes] if edit_prompt else [crop_bytes] + ref_bytes
+    try:
+        outs = await engine.generate_image_variants(
+            text, gen_images, image_model=model, variant_count=1, size_override=size)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"fix_failed: {type(exc).__name__}: {exc}"[:180]
+    if not outs:
+        return {}, "no_image_generated"
+
+    def _composite() -> Optional[bytes]:
+        ho, wo = out_img.shape[:2]
+        # map the box into the OUTPUT image coordinates
+        ox0 = max(0, int(box[1] / 1000 * wo)); ox1 = min(wo, int(box[3] / 1000 * wo))
+        oy0 = max(0, int(box[0] / 1000 * ho)); oy1 = min(ho, int(box[2] / 1000 * ho))
+        tw, th = ox1 - ox0, oy1 - oy0
+        if tw < 4 or th < 4:
+            return None
+        colored = cv2.imdecode(np.frombuffer(outs[0], np.uint8), cv2.IMREAD_COLOR)
+        colored = cv2.resize(colored, (tw, th), interpolation=cv2.INTER_CUBIC)
+        result = out_img.copy()
+        if use_mask:
+            # SAM mask of the object within the box → feathered blend so only the
+            # object is replaced (background of the box stays untouched). Mask from
+            # the same image we cropped (coloured output for edits, B&W otherwise).
+            cut = sam.cutout_box(crop_src_bytes, box,
+                                 media_id=(cur_out if edit_prompt else page_mid)) if sam.available() else None
+            alpha = None
+            if cut:
+                a = cv2.imdecode(np.frombuffer(cut, np.uint8), cv2.IMREAD_UNCHANGED)
+                if a is not None and a.ndim == 3 and a.shape[2] == 4:
+                    alpha = cv2.resize(a[:, :, 3], (tw, th), interpolation=cv2.INTER_LINEAR)
+            if alpha is None:
+                alpha = np.full((th, tw), 255, np.uint8)
+            alpha = cv2.GaussianBlur(alpha, (0, 0), 2).astype(np.float32) / 255.0
+            roi = result[oy0:oy1, ox0:ox1].astype(np.float32)
+            blended = colored.astype(np.float32) * alpha[..., None] + roi * (1 - alpha[..., None])
+            result[oy0:oy1, ox0:ox1] = blended.astype(np.uint8)
+        else:
+            result[oy0:oy1, ox0:ox1] = colored
+        ok, buf = cv2.imencode(".png", result)
+        return buf.tobytes() if ok else None
+
+    new_png = await asyncio.to_thread(_composite)
+    if not new_png:
+        return {}, "composite_failed"
+    new_mid = await asyncio.to_thread(_ingest_png, new_png)
+    with get_session() as s:
+        ch = s.get(ColorizeChapter, cid)
+        if ch is not None and new_mid:
+            outs_map = dict(ch.outputs or {})
+            outs_map[page_mid] = new_mid
+            ch.outputs = outs_map
+            variants = dict(ch.variants or {})
+            variants[page_mid] = (variants.get(page_mid) or []) + [new_mid]
+            ch.variants = variants
+            ch.updated_at = datetime.now(timezone.utc)
+            s.add(ch)
+            s.commit()
+    return {"output_media_id": new_mid, "page_index": page_index, "page_media_id": page_mid}, None
+
+
+async def _handle_detect_objects(params: dict) -> tuple[dict, Optional[str]]:
+    """Grok-style editor — detect the editable parts of an image → segments
+    ``[{id,label,box}]`` (box is [ymin,xmin,ymax,xmax] normalized 0-1000)."""
+    from flowboard.services import detect
+
+    mid = params.get("media_id")
+    if not isinstance(mid, str) or not mid:
+        return {}, "missing_media_id"
+    if media_service.cached_path(mid) is None:
+        return {}, "media_not_found"
+    try:
+        segs = await detect.detect_objects(mid)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"detect_failed: {type(exc).__name__}: {exc}"[:200]
+    out = [{"id": i, "label": s["label"], "box": s["box"]} for i, s in enumerate(segs)]
+    # Warm the MobileSAM embedding for this image now, so the user's FIRST
+    # segment click returns its mask instantly (~30ms) instead of paying the
+    # one-time ~0.35s encode. Best-effort; never blocks detection.
+    try:
+        from flowboard.services import sam
+
+        if sam.available() and out:
+            p = media_service.cached_path(mid)
+            if p is not None:
+                raw = await asyncio.to_thread(p.read_bytes)
+                await asyncio.to_thread(sam.cutout_box, raw, out[0]["box"], media_id=mid)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"segments": out, "media_id": mid}, None
+
+
 _DEFAULT_HANDLERS: dict[str, Handler] = {
     "proxy": _handle_proxy,
+    "colorize_build_bible": _handle_colorize_build_bible,
+    "colorize_page": _handle_colorize_page,
+    "colorize_build_sheets": _handle_colorize_build_sheets,
+    "colorize_fix_region": _handle_colorize_fix_region,
+    "detect_objects": _handle_detect_objects,
     "create_project": _handle_create_project,
     "gen_image": _handle_gen_image,
     "flow_gen_image": _handle_flow_gen_image,

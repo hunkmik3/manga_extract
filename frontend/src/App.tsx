@@ -9,6 +9,8 @@ import { Toaster } from "./components/Toaster";
 import { useBoardStore } from "./store/board";
 import { useAppModeStore } from "./store/appMode";
 import { FlowApp } from "./flow/FlowApp";
+import { ColorizeApp } from "./colorize/ColorizeApp";
+import { EditApp } from "./edit/EditApp";
 
 // Three top-level branches share this app (see store/appMode):
 //   - "manga"  → node board, splits pages into PANELS.
@@ -41,6 +43,8 @@ export function App() {
   }, [syncFromUrl]);
 
   if (mode === "flow") return <FlowApp />;
+  if (mode === "colorize") return <ColorizeApp />;
+  if (mode === "edit") return <EditApp />;
 
   return (
     <div className="app">
@@ -76,6 +80,22 @@ export function App() {
               title="Open GiantFlow — generate Google Flow-style images via API"
             >
               ✦ GiantFlow
+            </button>
+            <button
+              type="button"
+              className="mode-switch"
+              onClick={() => setMode("colorize")}
+              title="Open Manga Colorizer — color-locked chapter colorization"
+            >
+              🎨 Colorizer
+            </button>
+            <button
+              type="button"
+              className="mode-switch"
+              onClick={() => setMode("edit")}
+              title="Open Grok Editor — select a part, cut it out, edit via Grok"
+            >
+              🪄 Grok Editor
             </button>
           </div>
           {loading && boardId === null ? (

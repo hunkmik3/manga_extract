@@ -176,3 +176,30 @@ class BoardFlowProject(SQLModel, table=True):
     board_id: int = Field(primary_key=True, foreign_key="board.id")
     flow_project_id: str
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ColorizeChapter(SQLModel, table=True):
+    """A manga-colorizer chapter: an ordered set of uploaded B&W page media ids,
+    an optional style reference, and the (VLM-built, human-edited) colour bible.
+
+    ``page_media_ids`` order IS the reading order. ``bible`` is null until PASS 1
+    runs; once present it's the source of truth for PASS 2's COLOR LOCK prompts.
+    ``outputs`` maps a page media id → its colorized output media id."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = ""
+    page_media_ids: list = Field(default_factory=list, sa_column=Column(JSON))
+    style_ref_media_id: Optional[str] = None
+    bible: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    outputs: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # Character sheets: outfit_id (e.g. "char_02__A") → colorized reference media
+    # id. Built from the bible's page→outfit map, human-approved, then fed as an
+    # image reference when colorizing every page where that (char, outfit) appears
+    # — locks multi-layer clothing + chibi colours that flat hex can't.
+    sheets: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # Per-page candidate variants: page media id → [output media id, ...]. When a
+    # page is colorized with variant_count > 1 all candidates are kept here and
+    # ``outputs[page]`` points at the chosen one (defaults to the first).
+    variants: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)

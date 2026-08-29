@@ -1,4 +1,6 @@
 import asyncio
+import os
+import threading
 import hmac
 import logging
 from contextlib import asynccontextmanager
@@ -9,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from flowboard.config import WS_HOST
 from flowboard.db import get_session, init_db
 from flowboard.db.models import Request
-from flowboard.routes import activity, auth, boards, chat, comic, edges, flow_projects, flow_usage, llm, media, nodes, plans, projects, prompt, upload, vision
+from flowboard.routes import activity, auth, boards, chat, colorize, comic, edit as edit_route, edges, flow_projects, flow_usage, llm, media, nodes, plans, projects, prompt, upload, vision
 from flowboard.routes import references as references_route
 from flowboard.routes import requests as requests_route
 from flowboard.services.flow_client import flow_client
@@ -59,6 +61,20 @@ async def lifespan(app: FastAPI):
     ws_task = asyncio.create_task(run_ws_server(), name="ext-ws-server")
     worker_task = asyncio.create_task(worker.start(), name="request-worker")
     logger.info("flowboard agent started (ws:9223 + worker)")
+
+    # Warm the segment-editor models in the background so the first Detect is
+    # fast (Grounding DINO ~700 MB + MobileSAM). Non-blocking — boot never waits.
+    def _warm_editor_models() -> None:
+        try:
+            from flowboard.services import gdino, sam
+
+            sam.warm()
+            gdino.warm()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("editor model warm skipped: %s", exc)
+
+    if os.getenv("EDITOR_WARM", "1") != "0":
+        threading.Thread(target=_warm_editor_models, name="editor-warm", daemon=True).start()
     try:
         yield
     finally:
@@ -102,6 +118,8 @@ app.include_router(auth.router)
 app.include_router(llm.router)
 app.include_router(activity.router)
 app.include_router(comic.router)
+app.include_router(colorize.router)
+app.include_router(edit_route.router)
 
 
 @app.get("/api/health")
